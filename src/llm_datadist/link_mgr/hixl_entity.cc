@@ -36,10 +36,13 @@ ge::Status HixlEntity::Initialize(int32_t timeout_ms) {
   header.magic = hixl::kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(hixl::CtrlMsgType));
   auto msg_type = hixl::CtrlMsgType::kGetCacheTableReq;
-  LLM_CHK_HIXL_RET(hixl::CtrlMsgPlugin::Send(client_fd, &header, static_cast<uint64_t>(sizeof(header))),
-                   "Failed to send cache table header");
-  LLM_CHK_HIXL_RET(hixl::CtrlMsgPlugin::Send(client_fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))),
-                   "Failed to send cache table type");
+  const uint32_t send_timeout_ms = static_cast<uint32_t>(timeout_ms);
+  LLM_CHK_HIXL_RET(
+      hixl::CtrlMsgPlugin::Send(client_fd, &header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms),
+      "Failed to send cache table header");
+  LLM_CHK_HIXL_RET(
+      hixl::CtrlMsgPlugin::Send(client_fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms),
+      "Failed to send cache table type");
   CacheTableInfo info{};
   LLM_CHK_STATUS_RET(RecvCacheTableResp(client_fd, info, timeout_ms), "Failed to recv cache table info");
   auto &remote_mems = GetRemoteMems();

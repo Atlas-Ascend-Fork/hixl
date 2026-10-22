@@ -223,33 +223,110 @@ Status CtrlMsgPlugin::Accept(int32_t listen_fd, int32_t &conn_fd) {
   return SUCCESS;
 }
 
-Status CtrlMsgPlugin::Send(int32_t fd, const void *buf, size_t len) {
-  int32_t err_no = 0;
-  return Send(fd, buf, len, err_no);
+namespace {
+int64_t ElapsedMs(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
-Status CtrlMsgPlugin::Send(int32_t fd, const void *buf, size_t len, int32_t &err_no) {
+int PollWaitMs(int64_t remaining_ms) {
+  constexpr int64_t kMaxPollWaitMs = std::numeric_limits<int>::max();
+  if (remaining_ms > kMaxPollWaitMs) {
+    return static_cast<int>(kMaxPollWaitMs);
+  }
+  return static_cast<int>(remaining_ms);
+}
+
+Status WaitUntilWritable(int32_t fd, int64_t remaining_ms, bool &retry) {
+  retry = false;
+  struct pollfd pfd = {};
+  pfd.fd = fd;
+  pfd.events = POLLOUT;
+  const int ret = poll(&pfd, 1, PollWaitMs(remaining_ms));
+  if (ret == 0) {
+    HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT, "Call api:poll timed out, ret:%d, fd:%d, remaining_timeout:%ld ms", ret,
+                             fd, remaining_ms);
+  }
+  if (ret < 0) {
+    const int32_t saved_errno = errno;
+    if (saved_errno == EINTR) {
+      retry = true;
+      return SUCCESS;
+    }
+    HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
+                             "Call api:poll failed, ret:%d, fd:%d, remaining_timeout:%ld ms, errno:%d, "
+                             "error_msg:%s",
+                             ret, fd, remaining_ms, saved_errno, strerror(saved_errno));
+  }
+  return SUCCESS;
+}
+
+Status WriteSome(int32_t fd, const char *&pos, ssize_t &nbytes, int32_t &err_no, bool &retry) {
+  retry = false;
+  // 不等待内核阻塞：poll 负责等待，SO_SNDTIMEO 只约束阻塞 send。
+  const auto rc = send(fd, pos, static_cast<size_t>(nbytes), MSG_DONTWAIT);
+  const int32_t saved_errno = errno;
+  if (rc < 0 && (saved_errno == EAGAIN || saved_errno == EINTR)) {
+    HIXL_LOGD("Socket write needs retry, fd:%d, errno:%d", fd, saved_errno);
+    retry = true;
+    return SUCCESS;
+  }
+  if (rc <= 0) {
+    err_no = saved_errno;
+    HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
+                             "Call api:send failed, ret:%ld, fd:%d, remaining_size:%ld bytes, errno:%d, "
+                             "error_msg:%s",
+                             rc, fd, nbytes, err_no, strerror(err_no));
+  }
+  pos += rc;
+  nbytes -= rc;
+  return SUCCESS;
+}
+}  // namespace
+
+Status CtrlMsgPlugin::Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms) {
+  int32_t err_no = 0;
+  return Send(fd, buf, len, timeout_ms, err_no);
+}
+
+Status CtrlMsgPlugin::Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no) {
   err_no = 0;
   HIXL_CHK_BOOL_RET_STATUS(len <= kMaxTransferSize, PARAM_INVALID,
                            "Socket write length exceeds ssize_t max, len:%zu bytes, max:%zu bytes", len,
                            kMaxTransferSize);
-  HIXL_LOGI("Socket write begin: %zu bytes, fd:%d", len, fd);
+  HIXL_LOGI("Socket write begin: %zu bytes, fd:%d, timeout:%u ms", len, fd, timeout_ms);
+  if (len > 0U && fd < 0) {
+    err_no = EBADF;
+    HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
+                             "Call api:send failed, ret:-1, fd:%d, remaining_size:%zu bytes, errno:%d, error_msg:%s",
+                             fd, len, err_no, strerror(err_no));
+  }
   const char *pos = static_cast<const char *>(buf);
   auto nbytes = static_cast<ssize_t>(len);
+  const auto start_time = std::chrono::steady_clock::now();
   while (nbytes > 0) {
-    auto rc = write(fd, pos, static_cast<size_t>(nbytes));
-    if (rc < 0 && (errno == EAGAIN || errno == EINTR)) {
-      HIXL_LOGI("Socket write returned EAGAIN, need to retry");
-      continue;
-    } else if (rc <= 0) {
-      err_no = errno;
-      HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
-                               "Call api:write failed, ret:%ld, fd:%d, remaining_size:%ld bytes, errno:%d, "
-                               "error_msg:%s",
-                               rc, fd, nbytes, err_no, strerror(err_no));
+    const int64_t elapsed_ms = ElapsedMs(start_time);
+    const int64_t remaining_ms = static_cast<int64_t>(timeout_ms) - elapsed_ms;
+    if (remaining_ms <= 0) {
+      HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT,
+                               "Call api:send timed out, fd:%d, size:%zu bytes, remaining_size:%ld bytes, "
+                               "elapsed:%ld ms, timeout:%u ms",
+                               fd, len, nbytes, elapsed_ms, timeout_ms);
     }
-    pos += rc;
-    nbytes -= rc;
+    bool retry = false;
+    const Status wait_ret = WaitUntilWritable(fd, remaining_ms, retry);
+    if (wait_ret != SUCCESS) {
+      return wait_ret;
+    }
+    if (retry) {
+      continue;
+    }
+    const Status write_ret = WriteSome(fd, pos, nbytes, err_no, retry);
+    if (write_ret != SUCCESS) {
+      return write_ret;
+    }
+    if (retry) {
+      continue;
+    }
   }
   HIXL_LOGI("Socket write completed: %zu bytes, fd:%d", len, fd);
   return SUCCESS;
@@ -331,6 +408,19 @@ Status CtrlMsgPlugin::SetTcpKeepAlive(int32_t fd) {
   HIXL_EVENT("[HixlServer] set tcp keep alive success, fd:%d, keep_idle:%d, keep_intvl:%d, keep_cnt:%d", fd,
              kTcpKeepIdle, kTcpKeepIntvl, kTcpKeepCnt);
 
+  return SUCCESS;
+}
+
+Status CtrlMsgPlugin::SetSendTimeout(int32_t fd, uint32_t timeout_ms) {
+  HIXL_CHK_BOOL_RET_STATUS(fd >= 0, FAILED, "Invalid fd:%d", fd);
+  constexpr int64_t kTimeInSec = 1000;
+  struct timeval socket_timeout;
+  socket_timeout.tv_sec = static_cast<int64_t>(timeout_ms) / kTimeInSec;
+  socket_timeout.tv_usec = (static_cast<int64_t>(timeout_ms) % kTimeInSec) * kTimeInSec;
+  const auto socket_ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &socket_timeout, sizeof(socket_timeout));
+  HIXL_CHK_BOOL_RET_STATUS(socket_ret == 0, FAILED,
+                           "Failed to set SO_SNDTIMEO, fd:%d, timeout:%u ms, socket_ret:%d, error msg:%s, errno:%d", fd,
+                           timeout_ms, socket_ret, strerror(errno), errno);
   return SUCCESS;
 }
 }  // namespace hixl

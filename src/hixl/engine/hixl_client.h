@@ -126,7 +126,7 @@ class HixlClient {
   const std::string &GetRemoteEngine() const;
 
  private:
-  Status SendEndpointInfoReq(int32_t fd, CtrlMsgType msg_type) const;
+  Status SendEndpointInfoReq(int32_t fd, CtrlMsgType msg_type, uint32_t timeout_ms) const;
   Status RecvEndpointInfoResp(int32_t fd, std::vector<EndpointConfig> &remote_endpoint_list, uint32_t timeout_ms) const;
   Status RecvNotifyAck(int32_t fd, int32_t timeout_ms) const;
   void CloseCtrlSocket();

@@ -1201,7 +1201,7 @@ TEST_F(HixlCSTest, CtrlMsgPluginSendEpipe) {
   header.magic = kMagicNumber;
   header.body_size = sizeof(CtrlMsgType);
   int32_t err_no = 0;
-  Status ret = CtrlMsgPlugin::Send(fds[0], &header, sizeof(header), err_no);
+  Status ret = CtrlMsgPlugin::Send(fds[0], &header, sizeof(header), CtrlMsgPlugin::kDefaultCtrlTimeoutMs, err_no);
   EXPECT_EQ(ret, FAILED);
   EXPECT_EQ(err_no, EPIPE);
 

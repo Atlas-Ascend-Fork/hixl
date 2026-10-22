@@ -59,7 +59,7 @@ Status HixlClient::Initialize(const std::vector<EndpointConfig> &local_endpoint_
   HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Connect(server_ip_, server_port_, ctrl_socket_, timeout_ms),
                       "Connect socket failed");
   HIXL_DISMISSABLE_GUARD(close_ctrl_socket, [this] { CloseCtrlSocket(); });
-  HIXL_CHK_STATUS_RET(SendEndpointInfoReq(ctrl_socket_, CtrlMsgType::kGetEndpointInfoReq),
+  HIXL_CHK_STATUS_RET(SendEndpointInfoReq(ctrl_socket_, CtrlMsgType::kGetEndpointInfoReq, timeout_ms),
                       "HixlClient send GetEndpointInfoReq failed, socket:%d", ctrl_socket_);
   HIXL_CHK_STATUS_RET(RecvEndpointInfoResp(ctrl_socket_, remote_endpoint_list, timeout_ms),
                       "HixlClient receive GetEndpointInfoResp failed, socket:%d", ctrl_socket_);
@@ -101,13 +101,13 @@ Status HixlClient::Initialize(const std::vector<EndpointConfig> &local_endpoint_
   return SUCCESS;
 }
 
-Status HixlClient::SendEndpointInfoReq(int32_t fd, CtrlMsgType msg_type) const {
+Status HixlClient::SendEndpointInfoReq(int32_t fd, CtrlMsgType msg_type, uint32_t timeout_ms) const {
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))),
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header)), timeout_ms),
                       "HixlClient send header failed, fd:%d", fd);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))),
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), timeout_ms),
                       "HixlClient send msg_type failed, fd:%d", fd);
   return SUCCESS;
 }
@@ -396,7 +396,8 @@ Status HixlClient::CheckAliveLocked() {
   }
 
   int32_t err_no = 0;
-  Status ret = CtrlMsgPlugin::Send(ctrl_socket_, heartbeat_msg.data(), heartbeat_msg.size(), err_no);
+  Status ret = CtrlMsgPlugin::Send(ctrl_socket_, heartbeat_msg.data(), heartbeat_msg.size(),
+                                   CtrlMsgPlugin::kDefaultCtrlTimeoutMs, err_no);
   if (ret != SUCCESS) {
     if (IsSocketDisconnectedErrno(err_no)) {
       HIXL_LOGE(FAILED, "HixlClient CheckAlive send heartbeat failed, peer_ip:%s, peer_port:%u, fd=%d, errno=%d",
@@ -448,12 +449,16 @@ Status HixlClient::SendNotify(const NotifyDesc &notify, int32_t timeout_ms) cons
   HIXL_CHK_BOOL_RET_STATUS(ctrl_socket_ >= 0, FAILED, "HixlClient SendNotify failed, ctrl socket is invalid, fd:%d",
                            ctrl_socket_);
 
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(ctrl_socket_, &header, static_cast<uint64_t>(sizeof(header))),
-                      "HixlClient send NotifyMsg header failed, socket:%d", ctrl_socket_);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(ctrl_socket_, &msg_type, static_cast<uint64_t>(sizeof(msg_type))),
-                      "HixlClient send NotifyMsg msg_type failed, socket:%d", ctrl_socket_);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(ctrl_socket_, msg_str.c_str(), static_cast<uint64_t>(msg_str.size())),
-                      "HixlClient send NotifyMsg body failed, socket:%d", ctrl_socket_);
+  const uint32_t send_timeout_ms = static_cast<uint32_t>(timeout_ms);
+  HIXL_CHK_STATUS_RET(
+      CtrlMsgPlugin::Send(ctrl_socket_, &header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms),
+      "HixlClient send NotifyMsg header failed, socket:%d", ctrl_socket_);
+  HIXL_CHK_STATUS_RET(
+      CtrlMsgPlugin::Send(ctrl_socket_, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms),
+      "HixlClient send NotifyMsg msg_type failed, socket:%d", ctrl_socket_);
+  HIXL_CHK_STATUS_RET(
+      CtrlMsgPlugin::Send(ctrl_socket_, msg_str.c_str(), static_cast<uint64_t>(msg_str.size()), send_timeout_ms),
+      "HixlClient send NotifyMsg body failed, socket:%d", ctrl_socket_);
 
   HIXL_LOGI("HixlClient sent NotifyMsg, name:%s, socket:%d", notify_msg.name.c_str(), ctrl_socket_);
   HIXL_CHK_STATUS_RET(RecvNotifyAck(ctrl_socket_, timeout_ms),

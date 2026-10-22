@@ -243,8 +243,9 @@ hixl::Status ParseGetRemoteMemJson(const char *json_ptr, size_t json_len, std::v
 namespace hixl {
 
 Status MemMsgHandler::SendGetRemoteMemRequest(int32_t socket, uint64_t endpoint_handle, uint32_t timeout_ms) {
-  HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest start. socket: %d, endpoint_handle: %lu", socket, endpoint_handle);
-  (void)timeout_ms;
+  HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest start. socket: %d, endpoint_handle: %lu, timeout:%u ms", socket,
+             endpoint_handle, timeout_ms);
+  const uint32_t send_timeout_ms = timeout_ms == 0U ? CtrlMsgPlugin::kDefaultCtrlTimeoutMs : timeout_ms;
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(GetRemoteMemReq));
@@ -254,9 +255,9 @@ Status MemMsgHandler::SendGetRemoteMemRequest(int32_t socket, uint64_t endpoint_
   GetRemoteMemReq body{};
   body.dst_ep_handle = endpoint_handle;
 
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &header, static_cast<uint64_t>(sizeof(header))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &body, static_cast<uint64_t>(sizeof(body))));
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms));
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms));
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &body, static_cast<uint64_t>(sizeof(body)), send_timeout_ms));
   HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest success. fd=%d", socket);
   return SUCCESS;
 }

@@ -27,16 +27,22 @@ class CtrlMsgPlugin {
  public:
   CtrlMsgPlugin() = default;
   ~CtrlMsgPlugin() = default;
+  static constexpr uint32_t kDefaultCtrlTimeoutMs = 1000U;
+
   static void Initialize();
   static Status Connect(const std::string &ip, uint32_t port, int32_t &conn_fd, int32_t timeout);
-  static Status Send(int32_t fd, const void *buf, size_t len);
-  static Status Send(int32_t fd, const void *buf, size_t len, int32_t &err_no);
+  // 第四参只表示超时。需要 errno 时放在 timeout_ms 之后。
+  // 删除第四参为 int32_t 左值的重载，避免超时被精确匹配成 err_no。
+  static Status Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms = kDefaultCtrlTimeoutMs);
+  static Status Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no);
+  static Status Send(int32_t fd, const void *buf, size_t len, int32_t &) = delete;
   static Status Recv(int32_t fd, void *buf, size_t len, uint32_t timeout_ms);
   static Status Listen(const std::string &ip, uint32_t listen_port, int32_t backlog, int32_t &listen_fd);
   static Status AddFdToEpoll(int32_t &epoll_fd, int32_t fd, uint32_t events = EPOLLIN | EPOLLRDHUP);
   static Status Accept(int32_t listen_fd, int32_t &conn_fd);
   static Status SetTcpNoDelay(int32_t fd);
   static Status SetTcpKeepAlive(int32_t fd);
+  static Status SetSendTimeout(int32_t fd, uint32_t timeout_ms);
 
  private:
   static Status DoConnect(const struct ::addrinfo *addr, int32_t &conn_fd, int32_t &err_no, int32_t timeout);

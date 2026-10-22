@@ -691,6 +691,9 @@ Status HixlCSServer::DoWait() {
       HIXL_CHK_STATUS_RET(CtrlMsgPlugin::SetTcpNoDelay(connect_fd), "Failed to set tcp nodelay, fd:%d", connect_fd);
       HIXL_CHK_STATUS_RET(CtrlMsgPlugin::SetTcpKeepAlive(connect_fd), "Failed to set tcp keep alive, fd:%d",
                           connect_fd);
+      HIXL_CHK_STATUS_RET(CtrlMsgPlugin::SetSendTimeout(connect_fd, CtrlMsgPlugin::kDefaultCtrlTimeoutMs),
+                          "Failed to set SO_SNDTIMEO, fd:%d, timeout:%u ms", connect_fd,
+                          CtrlMsgPlugin::kDefaultCtrlTimeoutMs);
       HIXL_CHK_STATUS_RET(CtrlMsgPlugin::AddFdToEpoll(epoll_fd_, connect_fd), "Failed to add connect fd to epoll");
       HIXL_EVENT("[HixlServer] accept socket success, client fd:%d", connect_fd);
       auto receiver = MakeShared<MsgReceiver>(connect_fd);

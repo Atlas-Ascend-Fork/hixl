@@ -118,9 +118,9 @@ Status FetchRemoteMemInfo(int32_t sock, uint32_t timeout_ms, std::vector<MemInfo
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType));
   CtrlMsgType req_type = CtrlMsgType::kGetMemInfoReq;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(sock, &header, sizeof(header)),
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(sock, &header, sizeof(header), timeout_ms),
                       "[UbClientHandler] Failed to send mem info header, fd:%d", sock);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(sock, &req_type, sizeof(req_type)),
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(sock, &req_type, sizeof(req_type), timeout_ms),
                       "[UbClientHandler] Failed to send GetMemInfoReq, fd:%d", sock);
 
   CtrlMsgHeader resp_header{};
