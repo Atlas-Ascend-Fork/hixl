@@ -451,16 +451,16 @@ std::string EndpointToString(const EndpointDesc &ep) {
 
 TemporaryRtContext::TemporaryRtContext(aclrtContext context) {
   (void)aclrtGetCurrentContext(&prev_context_);
-  HIXL_LOGI("Get current aclrt ctx:%p", prev_context_);
+  HIXL_LOGD("Get current aclrt ctx:%p", prev_context_);
   if (context != nullptr && prev_context_ != context) {
-    HIXL_LOGI("Set new current aclrt ctx:%p", context);
+    HIXL_LOGD("Set new current aclrt ctx:%p", context);
     HIXL_CHK_ACL(aclrtSetCurrentContext(context));
   }
 }
 
 TemporaryRtContext::~TemporaryRtContext() {
   if (prev_context_ != nullptr) {
-    HIXL_LOGI("Restore previous aclrt ctx:%p", prev_context_);
+    HIXL_LOGD("Restore previous aclrt ctx:%p", prev_context_);
     HIXL_CHK_STATUS(aclrtSetCurrentContext(prev_context_));
   }
 }

@@ -11,7 +11,9 @@
 #ifndef CANN_HIXL_SRC_HIXL_ENGINE_DIRECT_MULTI_CHANNEL_HANDLER_H_
 #define CANN_HIXL_SRC_HIXL_ENGINE_DIRECT_MULTI_CHANNEL_HANDLER_H_
 
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>

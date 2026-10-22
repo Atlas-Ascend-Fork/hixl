@@ -16,12 +16,14 @@
 #include <thread>
 #include <vector>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "ascendcl_stub.h"
 #include "common/ctrl_msg.h"
 #include "common/ctrl_msg_plugin.h"
 #include "common/hixl_inner_types.h"
+#include "common/scope_guard.h"
 #include "cs/ubmem/ubmem_virtual_memory_manager.h"
 #include "depends/sys_api/src/sys_api_wrap.h"
 #include "engine/client_handler.h"
@@ -215,6 +217,16 @@ class ClientHandlerFactoryUbUt : public ::testing::Test {
 TEST_F(ClientHandlerFactoryUbUt, WorkersGreaterThanOneCreatesUbMultiChannelHandler) {
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  // 失败路径快速退出：recv 超时 + fd 统一回收，避免回归时挂起
+  const struct timeval rcv_timeout = {5, 0};
+  ASSERT_EQ(setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout)), 0);
+  ASSERT_EQ(setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout)), 0);
+  auto close_fds = [&fds]() {
+    close(fds[0]);
+    close(fds[1]);
+  };
+  HIXL_DISMISSABLE_GUARD(fd_guard, close_fds);
+
   std::thread server([fd = fds[1]]() { ServeGetMemInfo(fd); });
 
   std::unique_ptr<IClientHandler> handler;
@@ -226,14 +238,22 @@ TEST_F(ClientHandlerFactoryUbUt, WorkersGreaterThanOneCreatesUbMultiChannelHandl
   ASSERT_NE(handler, nullptr);
   EXPECT_NE(dynamic_cast<UbMultiChannelHandler *>(handler.get()), nullptr);
   EXPECT_EQ(handler->Finalize(), SUCCESS);
-
-  close(fds[0]);
-  close(fds[1]);
+  // fd_guard 在作用域退出时统一关闭 fds（成功/失败路径均覆盖）
 }
 
 TEST_F(ClientHandlerFactoryUbUt, SingleWorkerFallsBackToUbClientHandler) {
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  // 失败路径快速退出：recv 超时 + fd 统一回收，避免回归时挂起
+  const struct timeval rcv_timeout = {5, 0};
+  ASSERT_EQ(setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout)), 0);
+  ASSERT_EQ(setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout)), 0);
+  auto close_fds = [&fds]() {
+    close(fds[0]);
+    close(fds[1]);
+  };
+  HIXL_DISMISSABLE_GUARD(fd_guard, close_fds);
+
   std::thread server([fd = fds[1]]() { ServeGetMemInfo(fd); });
 
   std::unique_ptr<IClientHandler> handler;
@@ -246,8 +266,6 @@ TEST_F(ClientHandlerFactoryUbUt, SingleWorkerFallsBackToUbClientHandler) {
   EXPECT_EQ(dynamic_cast<UbMultiChannelHandler *>(handler.get()), nullptr);
   EXPECT_NE(dynamic_cast<UbClientHandler *>(handler.get()), nullptr);
   EXPECT_EQ(handler->Finalize(), SUCCESS);
-
-  close(fds[0]);
-  close(fds[1]);
+  // fd_guard 在作用域退出时统一关闭 fds（成功/失败路径均覆盖）
 }
 }  // namespace hixl
