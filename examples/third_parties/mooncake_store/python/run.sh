@@ -19,4 +19,4 @@ export ASCEND_HOST_LOG_FILE_NUM=500
 export MC_LOG_LEVEL=ERROR
 # export ASCEND_ENABLE_USE_FABRIC_MEM=1
 
-python3 $@
+python3 "$@"
