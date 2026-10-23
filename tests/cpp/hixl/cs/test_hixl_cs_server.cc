@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <atomic>
 #include <memory>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -28,6 +29,7 @@
 #include "common/ctrl_msg.h"
 #include "common/ctrl_msg_plugin.h"
 #include "common/hixl_inner_types.h"
+#include "common/scope_guard.h"
 #include "engine/endpoint_test_utils.h"
 #include "slog_stub.h"
 #include "hccl_stub.h"
@@ -256,6 +258,98 @@ TEST_F(HixlCSTest, TestHixlCSServer) {
   EXPECT_EQ(ret, SUCCESS);
   ret = HixlCSServerDestroy(server_handle);
   EXPECT_EQ(ret, SUCCESS);
+}
+
+TEST_F(HixlCSTest, RepeatedListenPreservesSocketAndDoesNotCloseOtherFd) {
+  HixlServerConfig config{};
+  HixlServerDesc desc{};
+  desc.server_ip = "127.0.0.1";
+  desc.server_port = kPort;
+  desc.endpoint_list = &default_eps[0];
+  desc.endpoint_list_num = default_eps.size();
+  HixlServerHandle server_handle = nullptr;
+  ASSERT_EQ(HixlCSServerCreate(&desc, &config, &server_handle), SUCCESS);
+  HIXL_MAKE_GUARD(destroy_server, ([&server_handle]() {
+                    if (server_handle != nullptr) {
+                      (void)HixlCSServerDestroy(server_handle);
+                    }
+                  }));
+  ASSERT_EQ(HixlCSServerListen(server_handle, kBackLog), SUCCESS);
+  auto *server = static_cast<HixlCSServer *>(server_handle);
+  const int32_t listen_fd = server->listen_fd_;
+
+  EXPECT_EQ(HixlCSServerListen(server_handle, kBackLog), HIXL_FAILED);
+  EXPECT_EQ(server->listen_fd_, listen_fd);
+  int32_t client_fd = -1;
+  ASSERT_EQ(CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1), SUCCESS);
+  (void)close(client_fd);
+
+  const int32_t probe_fd = open("/dev/null", O_RDONLY);
+  ASSERT_GE(probe_fd, 0);
+  HIXL_MAKE_GUARD(close_probe, ([probe_fd]() { (void)close(probe_fd); }));
+  EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
+  server_handle = nullptr;
+  EXPECT_NE(fcntl(probe_fd, F_GETFD), -1);
+
+  int32_t rebound_fd = -1;
+  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", kPort, kBackLog, rebound_fd), SUCCESS);
+  HIXL_MAKE_GUARD(close_rebound, ([rebound_fd]() { (void)close(rebound_fd); }));
+}
+
+TEST_F(HixlCSTest, FailedInitialListenDoesNotCloseOtherFd) {
+  int32_t occupied_fd = -1;
+  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", kPort, kBackLog, occupied_fd), SUCCESS);
+  HIXL_MAKE_GUARD(close_occupied, ([occupied_fd]() { (void)close(occupied_fd); }));
+  HixlServerConfig config{};
+  HixlServerDesc desc{};
+  desc.server_ip = "127.0.0.1";
+  desc.server_port = kPort;
+  desc.endpoint_list = &default_eps[0];
+  desc.endpoint_list_num = default_eps.size();
+  HixlServerHandle server_handle = nullptr;
+  ASSERT_EQ(HixlCSServerCreate(&desc, &config, &server_handle), SUCCESS);
+  HIXL_MAKE_GUARD(destroy_server, ([&server_handle]() {
+                    if (server_handle != nullptr) {
+                      (void)HixlCSServerDestroy(server_handle);
+                    }
+                  }));
+  EXPECT_EQ(HixlCSServerListen(server_handle, kBackLog), HIXL_FAILED);
+  EXPECT_EQ(static_cast<HixlCSServer *>(server_handle)->listen_fd_, -1);
+
+  const int32_t probe_fd = open("/dev/null", O_RDONLY);
+  ASSERT_GE(probe_fd, 0);
+  HIXL_MAKE_GUARD(close_probe, ([probe_fd]() { (void)close(probe_fd); }));
+  EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
+  server_handle = nullptr;
+  EXPECT_NE(fcntl(probe_fd, F_GETFD), -1);
+}
+
+TEST_F(HixlCSTest, FailedEpollRegistrationClosesListenSocket) {
+  HixlServerConfig config{};
+  HixlServerDesc desc{};
+  desc.server_ip = "127.0.0.1";
+  desc.server_port = kPort;
+  desc.endpoint_list = &default_eps[0];
+  desc.endpoint_list_num = default_eps.size();
+  HixlServerHandle server_handle = nullptr;
+  ASSERT_EQ(HixlCSServerCreate(&desc, &config, &server_handle), SUCCESS);
+  HIXL_MAKE_GUARD(destroy_server, ([&server_handle]() {
+                    if (server_handle != nullptr) {
+                      (void)HixlCSServerDestroy(server_handle);
+                    }
+                  }));
+  auto *server = static_cast<HixlCSServer *>(server_handle);
+  server->epoll_fd_ = open("/dev/null", O_RDONLY);
+  ASSERT_GE(server->epoll_fd_, 0);
+
+  EXPECT_EQ(HixlCSServerListen(server_handle, kBackLog), HIXL_FAILED);
+  EXPECT_EQ(server->listen_fd_, -1);
+  EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
+  server_handle = nullptr;
+
+  int32_t rebound_fd = -1;
+  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", kPort, kBackLog, rebound_fd), SUCCESS);
+  HIXL_MAKE_GUARD(close_rebound, ([rebound_fd]() { (void)close(rebound_fd); }));
 }
 
 TEST_F(HixlCSTest, RegisterDeviceMemForUbEndpointsSkipsHostEndpoint) {

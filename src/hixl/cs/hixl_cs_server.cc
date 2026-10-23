@@ -607,9 +607,15 @@ Status HixlCSServer::ExportMem(int32_t fd, const char *msg, uint64_t msg_len) co
 Status HixlCSServer::Listen(uint32_t backlog) {
   auto ctx_guard = GetContextGuard();
   (void)ctx_guard;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Listen(ip_, port_, backlog, listen_fd_), "Failed to server listen, ip:%s, port:%u",
+  HIXL_CHK_BOOL_RET_STATUS(listen_fd_ == -1 && !listener_.joinable(), FAILED,
+                           "Server is already listening, ip:%s, port:%u", ip_.c_str(), port_);
+  int32_t fd = -1;
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Listen(ip_, port_, backlog, fd), "Failed to server listen, ip:%s, port:%u",
                       ip_.c_str(), port_);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::AddFdToEpoll(epoll_fd_, listen_fd_), "Failed to add listen fd to epoll");
+  HIXL_DISMISSABLE_GUARD(close_fd, ([fd]() { (void)close(fd); }));
+  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::AddFdToEpoll(epoll_fd_, fd), "Failed to add listen fd to epoll");
+  listen_fd_ = fd;
+  HIXL_DISMISS_GUARD(close_fd);
   HIXL_EVENT("[HixlServer] start to listen on %s:%u", ip_.c_str(), port_);
   listener_running_ = true;
   listener_ = std::thread([this]() {

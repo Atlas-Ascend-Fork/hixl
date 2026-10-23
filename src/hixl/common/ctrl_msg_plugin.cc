@@ -153,9 +153,9 @@ Status CtrlMsgPlugin::SockAddrInit(const std::string &ip, uint32_t listen_port, 
 Status CtrlMsgPlugin::Listen(const std::string &ip, uint32_t listen_port, int32_t backlog, int32_t &listen_fd) {
   int32_t ai_family = 0;
   HIXL_CHK_STATUS_RET(GetAiFamily(ip, ai_family), "Failed to get ai_family, ip:%s", ip.c_str());
-  listen_fd = socket(ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
-  HIXL_CHK_BOOL_RET_STATUS(listen_fd >= 0, FAILED, "Failed to create socket.");
-  HIXL_DISMISSABLE_GUARD(fail_guard, ([listen_fd]() { (void)close(listen_fd); }));
+  const int32_t fd = socket(ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  HIXL_CHK_BOOL_RET_STATUS(fd >= 0, FAILED, "Failed to create socket.");
+  HIXL_DISMISSABLE_GUARD(fail_guard, ([fd]() { (void)close(fd); }));
 
   struct sockaddr_storage server_addr;
   socklen_t addr_len;
@@ -164,27 +164,28 @@ Status CtrlMsgPlugin::Listen(const std::string &ip, uint32_t listen_port, int32_
 
   if (ai_family == AF_INET6) {
     int v6only = 1;
-    (void)setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
   }
   struct timeval timeout;
   timeout.tv_sec = 1;
   timeout.tv_usec = 0;
-  auto socket_ret = setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  auto socket_ret = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   HIXL_CHK_BOOL_RET_STATUS(socket_ret == 0, FAILED,
                            "Failed to set socket opt timeout, socket_ret:%d, error msg:%s, errno:%d", socket_ret,
                            strerror(errno), errno);
   int32_t on = 1;
-  socket_ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  socket_ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
   HIXL_CHK_BOOL_RET_STATUS(socket_ret == 0, FAILED,
                            "Failed to set socket opt SO_REUSEADDR, socket_ret:%d, error msg:%s, errno:%d", socket_ret,
                            strerror(errno), errno);
-  HIXL_CHK_BOOL_RET_STATUS(bind(listen_fd, reinterpret_cast<sockaddr *>(&server_addr), addr_len) >= 0, FAILED,
+  HIXL_CHK_BOOL_RET_STATUS(bind(fd, reinterpret_cast<sockaddr *>(&server_addr), addr_len) >= 0, FAILED,
                            "Failed to bind port:%u, error msg:%s, errno:%d.", listen_port, strerror(errno), errno);
-  socket_ret = listen(listen_fd, backlog);
+  socket_ret = listen(fd, backlog);
   HIXL_CHK_BOOL_RET_STATUS(socket_ret == 0, FAILED, "Failed to listen, socket_ret:%d, error msg:%s, errno:%d",
                            socket_ret, strerror(errno), errno);
   HIXL_DISMISS_GUARD(fail_guard);
-  HIXL_EVENT("listen on %s:%d success, listen_fd:%d", ip.c_str(), listen_port, listen_fd);
+  listen_fd = fd;
+  HIXL_EVENT("listen on %s:%d success, listen_fd:%d", ip.c_str(), listen_port, fd);
   return SUCCESS;
 }
 

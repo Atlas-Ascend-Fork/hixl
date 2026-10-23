@@ -333,6 +333,7 @@ HixlStatus HixlCSServerListen(HixlServerHandle server_handle, uint32_t backlog);
 **约束说明**
 
 在client调用HixlCSClientConnect与本端建链之前需要完成侦听。
+同一 Server 已在侦听时再次调用本接口会返回失败，原有侦听保持可用。
 
 ### HixlCSServerUnregMem
 

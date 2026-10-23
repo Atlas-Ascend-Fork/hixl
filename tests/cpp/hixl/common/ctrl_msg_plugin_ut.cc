@@ -15,6 +15,7 @@
 #include <limits>
 #include <vector>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -143,5 +144,18 @@ TEST(CtrlMsgPluginTest, SetSendTimeoutRejectsInvalidFdAndStoresTimeout) {
   ASSERT_EQ(getsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &actual, &actual_len), 0);
   EXPECT_EQ(actual.tv_sec, 1);
   EXPECT_EQ(actual.tv_usec, 500 * 1000);
+}
+
+TEST(CtrlMsgPluginTest, FailedListenPreservesOutputFd) {
+  int32_t listen_fd = -1;
+  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", 0, 8, listen_fd), SUCCESS);
+  HIXL_MAKE_GUARD(close_listen_fd, ([listen_fd]() { (void)close(listen_fd); }));
+  sockaddr_in addr{};
+  socklen_t addr_len = sizeof(addr);
+  ASSERT_EQ(getsockname(listen_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len), 0);
+
+  int32_t output_fd = listen_fd;
+  EXPECT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", ntohs(addr.sin_port), 8, output_fd), FAILED);
+  EXPECT_EQ(output_fd, listen_fd);
 }
 }  // namespace hixl
