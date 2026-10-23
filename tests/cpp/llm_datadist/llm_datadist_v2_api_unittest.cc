@@ -8,11 +8,15 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <arpa/inet.h>
 #include <memory>
+#include <netinet/in.h>
 #include <vector>
 #include <cstdlib>
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "llm_datadist/llm_datadist.h"
 #include "dlog_pub.h"
@@ -26,6 +30,23 @@ using namespace ge;
 using namespace ::testing;
 using ::testing::Invoke;
 using ::testing::Mock;
+
+namespace {
+bool CanConnectToListen(const std::string &ip, uint16_t port) {
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return false;
+  }
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  const bool valid_ip = inet_pton(AF_INET, ip.c_str(), &address.sin_addr) == 1;
+  const bool connected = valid_ip && connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == 0;
+  close(fd);
+  return connected;
+}
+}  // namespace
+
 namespace llm_datadist {
 class LlmDataDistUTest : public ::testing::Test {
  protected:
@@ -497,6 +518,11 @@ TEST_F(LlmDataDistUTest, LocalCommResSwitchRoleSuccess) {
   EXPECT_EQ(llm_datadist.SetRole(LlmRole::kPrompt, switch_options), ge::SUCCESS);
   // listen same port
   EXPECT_EQ(llm_datadist.SetRole(LlmRole::kDecoder, switch_options), ge::SUCCESS);
+  EXPECT_TRUE(CanConnectToListen("127.0.0.1", 26001));
+  switch_options[llm_datadist::OPTION_LISTEN_IP_INFO] = "127.0.0.2:26001";
+  EXPECT_EQ(llm_datadist.SetRole(LlmRole::kDecoder, switch_options), ge::SUCCESS);
+  EXPECT_FALSE(CanConnectToListen("127.0.0.1", 26001));
+  EXPECT_TRUE(CanConnectToListen("127.0.0.2", 26001));
   EXPECT_EQ(llm_datadist.SetRole(LlmRole::kMix, {}), ge::SUCCESS);
   EXPECT_EQ(llm_datadist.SetRole(LlmRole::kPrompt, switch_options), ge::SUCCESS);
   EXPECT_EQ(llm_datadist.SetRole(LlmRole::kPrompt), ge::SUCCESS);                   // close listen

@@ -42,6 +42,7 @@ class LLMLinkManager : public CommLinkManager {
   LinkMsgHandler msg_handler_;
   std::mutex mutex_;
   std::string listen_port_;
+  std::string listen_ip_;
   CommEntityManager *comm_entity_manager_;
 };
 }  // namespace llm

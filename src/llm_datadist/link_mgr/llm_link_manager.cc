@@ -35,6 +35,7 @@ ge::Status LLMLinkManager::Initialize(const std::map<ge::AscendString, ge::Ascen
                        kLlmOptionListenPort, iter->second.GetString());
     LLM_CHK_STATUS_RET(msg_handler_.StartDaemon(ip, port), "Failed to start listen daemon, port = %u", port);
     listen_port_ = iter->second.GetString();
+    listen_ip_ = ip;
     LLMEVENT("start daemon success, listen on port:%u", port);
   }
   return ge::SUCCESS;
@@ -112,10 +113,11 @@ ge::Status LLMLinkManager::SwitchRole(const std::string &role, const std::map<st
     const auto &ip = ip_it->second;
     std::lock_guard<std::mutex> lock(mutex_);
     if (!listen_port_.empty()) {
-      if (listen_port_ != iter->second) {
+      if (listen_port_ != iter->second || listen_ip_ != ip) {
         LLM_CHK_STATUS_RET(msg_handler_.StopDaemon(), "Failed to close listen daemon.");
         LLMEVENT("stop listen daemon success, listen on port:%s", listen_port_.c_str());
         listen_port_ = "";
+        listen_ip_ = "";
       } else {
         // already listen, do nothing
         return ge::SUCCESS;
@@ -126,12 +128,14 @@ ge::Status LLMLinkManager::SwitchRole(const std::string &role, const std::map<st
                        port);
     LLMEVENT("start daemon success, listen on %s:%u", ip.c_str(), port);
     listen_port_ = iter->second;
+    listen_ip_ = ip;
   } else {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!listen_port_.empty()) {
       LLM_CHK_STATUS_RET(msg_handler_.StopDaemon(), "Failed to close listen daemon.");
       LLMEVENT("stop listen daemon success, listen on port:%s", listen_port_.c_str());
       listen_port_ = "";
+      listen_ip_ = "";
     }
   }
   return ge::SUCCESS;
