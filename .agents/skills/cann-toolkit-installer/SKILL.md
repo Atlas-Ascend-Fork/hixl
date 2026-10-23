@@ -1,7 +1,7 @@
 ---
 name: cann-toolkit-installer
 description: >-
-  自动下载并安装华为 CANN Toolkit 与 ops 开发套件。当用户需要安装、更新或重新安装 CANN
+  自动下载并安装CANN Toolkit 与 ops 开发套件。当用户需要安装、更新或重新安装 CANN
   Toolkit/ops 时使用此 skill，适用于：新环境初始化、版本升级。自动获取最新构建版本，
   按 npu-smi 选择 ops 包，静默安装到用户指定目录并输出详细摘要。用户可能的指令是更新
   toolkit、更新 run 包、安装 CANN 基础环境等。
