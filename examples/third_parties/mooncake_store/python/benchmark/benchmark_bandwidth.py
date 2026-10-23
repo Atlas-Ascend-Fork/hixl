@@ -16,18 +16,18 @@ import time
 import logging
 import torch
 
-from mooncake_sample_common import (
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
+from mooncake_sample_common import (  # noqa: E402
     create_parser,
     setup_environment,
     validate_schema,
     HCCS_ALIGNMENT,
 )
-from mooncake_sample_base import MooncakeSampleBase
-from config import Config
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
+from mooncake_sample_base import MooncakeSampleBase  # noqa: E402
+from config import Config  # noqa: E402
 
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
