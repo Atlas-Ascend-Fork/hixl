@@ -1085,7 +1085,7 @@ Status TransferSync(const AscendString &remote_engine,
 | remote_engine | 输入 | 远端HIXL的唯一标识。 |
 | operation | 输入 | 将远端内存读到本地或者将本地内存写到远端。 |
 | op_descs | 输入 | 批量操作的本地以及远端地址。 |
-| optional_args | 输入 | 可选参数（预留）。 |
+| optional_args | 输入 | 可选参数。user_data 会随请求登记并在批量 GetTransferStatus 的 TransferResult.user_data 中原样返回。 |
 | req | 输出 | 请求的句柄，用户查询传输的请求状态。 |
 
 **调用示例**

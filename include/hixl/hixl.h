@@ -136,7 +136,8 @@ class ASCEND_FUNC_VISIBILITY Hixl {
    * ipv4格式为host_ip:host_port或host_ip，ipv6格式为[host_ip]:host_port或[host_ip]
    * @param [in] operation 将远端内存读到本地或者将本地内存写到远端
    * @param [in] op_descs 批量操作的本地以及远端地址
-   * @param [in] optional_args 可选参数，预留
+   * @param [in] optional_args 可选参数。user_data 会随请求登记并在批量 GetTransferStatus 的
+   * TransferResult.user_data 中原样返回。
    * @param [out] req 请求的handle，用于查询请求状态
    * @return 成功:SUCCESS, 失败:其它.
    */

@@ -8,9 +8,15 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include <vector>
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <dirent.h>
 #include <gtest/gtest.h>
 #include "data_transfer/d2h_data_transfer_job.h"
 #include "llm_datadist_v2.h"
@@ -107,6 +113,55 @@ void DrainTaskBatcher(llm::TaskBatcher &generator) {
     }
     std::cout << "batch end" << std::endl;
   }
+}
+
+int32_t FindFsmThreadId() {
+  DIR *dir = opendir("/proc/self/task");
+  if (dir == nullptr) {
+    return -1;
+  }
+  int32_t found = -1;
+  const dirent *entry = nullptr;
+  while ((entry = readdir(dir)) != nullptr) {
+    if (entry->d_name[0] == '.') {
+      continue;
+    }
+    const std::string tid(entry->d_name);
+    std::ifstream comm("/proc/self/task/" + tid + "/comm");
+    std::string name;
+    if (std::getline(comm, name) && name == "ge_llm_fsm") {
+      found = std::stoi(tid);
+      break;
+    }
+  }
+  closedir(dir);
+  return found;
+}
+
+bool ReadThreadCpuTicks(int32_t tid, uint64_t &ticks) {
+  std::ifstream stat("/proc/" + std::to_string(tid) + "/stat");
+  std::string line;
+  if (!std::getline(stat, line)) {
+    return false;
+  }
+  const auto comm_end = line.rfind(") ");
+  if (comm_end == std::string::npos) {
+    return false;
+  }
+  std::istringstream fields(line.substr(comm_end + 2U));
+  std::string skip;
+  for (int32_t i = 0; i < 11; ++i) {
+    if (!(fields >> skip)) {
+      return false;
+    }
+  }
+  uint64_t utime = 0U;
+  uint64_t stime = 0U;
+  if (!(fields >> utime >> stime)) {
+    return false;
+  }
+  ticks = utime + stime;
+  return true;
 }
 
 std::map<ge::AscendString, ge::AscendString> DefaultSwapTestOptions() {
@@ -437,6 +492,50 @@ TEST_F(DataCacheEngineTest, CopyCache_B2B) {
   std::vector<int32_t> dst_value(dst_tensor_base, dst_tensor_base + 4 * 4);
   EXPECT_EQ(dst_value, expected);
   cache_engine_.Finalize();
+}
+
+TEST(CommEntityManagerTest, IdleFsmThreadDoesNotBusySpin) {
+  llm::MockMmpaForHcclApi::Install();
+  llm::AclRuntimeStub::SetInstance(std::make_shared<llm::AclRuntimeStub>());
+  llm::CommAdapter::GetInstance().Initialize();
+  llm::CommEntityManager manager;
+  llm::CacheManager cache_manager;
+  llm::CommTransferEngine transfer_engine(0);
+  llm::CommMemManager comm_mem_manager;
+  transfer_engine.SetCommEntityManager(&manager);
+  transfer_engine.SetCacheManager(&cache_manager);
+  comm_mem_manager.Initialize(&transfer_engine);
+  llm::GlobalMemManager::GetInstance().Initialize(&transfer_engine);
+  ASSERT_EQ(transfer_engine.Initialize({}), ge::SUCCESS);
+  ASSERT_EQ(manager.Initialize(true), ge::SUCCESS);
+
+  int32_t tid = -1;
+  const auto name_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (std::chrono::steady_clock::now() < name_deadline && tid < 0) {
+    tid = FindFsmThreadId();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GT(tid, 0);
+  uint64_t before = 0U;
+  ASSERT_TRUE(ReadThreadCpuTicks(tid, before));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  uint64_t after = 0U;
+  ASSERT_TRUE(ReadThreadCpuTicks(tid, after));
+  // 300 ms at 100 Hz is 30 ticks on a busy core. An idle wait stays near zero.
+  EXPECT_LT(after - before, 6U);
+
+  const auto stop = std::chrono::steady_clock::now();
+  manager.Finalize();
+  const auto stop_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stop).count();
+  EXPECT_LT(stop_ms, 1000);
+
+  llm::GlobalMemManager::GetInstance().Finalize();
+  transfer_engine.Finalize();
+  comm_mem_manager.Finalize();
+  llm::CommAdapter::GetInstance().Finalize();
+  llm::AclRuntimeStub::Reset();
+  llm::MockMmpaForHcclApi::Reset();
 }
 
 TEST_F(DataCacheEngineTest, InitializeMemoryPool_Failed) {

@@ -11,8 +11,9 @@
 #ifndef CANN_GRAPH_ENGINE_RUNTIME_LLM_DATADIST_V2_ENTITY_MANAGER_H_
 #define CANN_GRAPH_ENGINE_RUNTIME_LLM_DATADIST_V2_ENTITY_MANAGER_H_
 
-#include <vector>
+#include <condition_variable>
 #include <thread>
+#include <vector>
 #include "common/llm_inner_types.h"
 #include "comm_entity.h"
 
@@ -39,8 +40,10 @@ class CommEntityManager {
 
  private:
   void HandleCacheRequest();
-  void HandleAllEntities();
+  bool HandleAllEntities();
+  void WaitForWork(bool send_pending);
   std::atomic_bool running_{true};
+  std::condition_variable idle_cv_;
   bool need_handle_request_ = false;
   std::thread cache_engine_thread_;
   std::unique_ptr<LlmMemPool> host_mem_pool_{};

@@ -42,6 +42,7 @@ class BufferTransferService {
   Status PushBufferResp(const ChannelPtr &channel, BufferResp &buffer_resp);
 
  private:
+  static Status CalcTimeoutUs(int32_t timeout_in_millis, uint64_t &timeout_us);
   Status TryGetBuffer(void *&buffer_addr, uint64_t timeout, size_t pool_index = 0U);
   void ReleaseBuffer(void *buffer_addr, size_t pool_index = 0U);
 

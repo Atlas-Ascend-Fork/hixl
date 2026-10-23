@@ -784,7 +784,7 @@ transfer_async(remote_engine: str, op: TransferOp, op_descs: List[TransferOpDesc
 | remote_engine | str | Unique identifier of remote HIXL. |
 | op | TransferOp | Read from remote memory to local or write from local memory to remote. |
 | op_descs | List[TransferOpDesc] | Batch operation local and remote addresses. |
-| args | TransferArgs | Optional parameters (reserved). |
+| args | TransferArgs | Optional parameter. user_data is registered with the request and returned unchanged in TransferResult.user_data by batch GetTransferStatus. |
 
 **Example**
 

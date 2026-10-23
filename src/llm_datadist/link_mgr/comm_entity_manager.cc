@@ -9,6 +9,7 @@
  */
 
 #include "comm_entity_manager.h"
+#include <chrono>
 #include "common/def_types.h"
 #include "llm_datadist/llm_error_codes.h"
 #include "common/llm_checker.h"
@@ -18,6 +19,10 @@
 #include "fsm/state_manager.h"
 
 namespace llm {
+namespace {
+constexpr uint32_t kFsmIdleBackoffUs = 100U;
+}  // namespace
+
 ge::Status CommEntityManager::AddEntity(uint64_t peer_cluster_id, EntityPtr entity_ptr) {
   LLM_CHECK_NOTNULL(entity_ptr, "Entity is null, peer cluster id = %lu", peer_cluster_id);
   auto entity_id = entity_id_gen_.fetch_add(1UL, std::memory_order::memory_order_relaxed);
@@ -25,6 +30,7 @@ ge::Status CommEntityManager::AddEntity(uint64_t peer_cluster_id, EntityPtr enti
   std::lock_guard<std::mutex> lock(mutex_);
   (void)entity_map_.emplace(entity_id, entity_ptr);
   cluster_id_to_entity_id_[peer_cluster_id] = entity_id;
+  idle_cv_.notify_one();
   mgr_high_priority_flag_.store(false);
   LLMLOGI("Add entity success, peer cluster id:%lu, entity id:%lu", peer_cluster_id, entity_id);
   return ge::SUCCESS;
@@ -120,16 +126,21 @@ size_t CommEntityManager::GetEntitySize() const {
   return num;
 }
 
-void CommEntityManager::HandleAllEntities() {
+bool CommEntityManager::HandleAllEntities() {
   if (mgr_high_priority_flag_.load()) {
-    return;
+    return false;
   }
+  bool send_pending = false;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto it = entity_map_.begin(); it != entity_map_.end();) {
     auto entity = it->second;
-    if ((entity->GetCurState() == FsmState::FSM_INIT_STATE) || (entity->GetCurState() == FsmState::FSM_ERROR_STATE)) {
+    const auto state = entity->GetCurState();
+    if ((state == FsmState::FSM_INIT_STATE) || (state == FsmState::FSM_ERROR_STATE)) {
       it++;
       continue;
+    }
+    if (state == FsmState::FSM_SEND_STATE) {
+      send_pending = true;
     }
     if (entity->GetProcessMutex().try_lock()) {
       std::lock_guard<std::mutex> process_lock(entity->GetProcessMutex(), std::adopt_lock);
@@ -139,16 +150,38 @@ void CommEntityManager::HandleAllEntities() {
         continue;
       }
       LLM_CHK_BOOL_EXEC(entity->ProcessState() == ge::SUCCESS, entity->MarkEntityError(), "Failed to process state");
+      if (entity->GetCurState() == FsmState::FSM_SEND_STATE) {
+        send_pending = true;
+      }
     }
     it++;
   }
+  return send_pending;
+}
+
+void CommEntityManager::WaitForWork(bool send_pending) {
+  if (send_pending) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!running_.load()) {
+    return;
+  }
+  if (!entity_map_.empty()) {
+    lock.unlock();
+    // The peer writes the request flag. Back off while linked and idle so the thread does not occupy a core.
+    std::this_thread::sleep_for(std::chrono::microseconds(kFsmIdleBackoffUs));
+    return;
+  }
+  idle_cv_.wait(lock, [this]() { return !running_.load() || !entity_map_.empty(); });
 }
 
 void CommEntityManager::HandleCacheRequest() {
   (void)pthread_setname_np(pthread_self(), "ge_llm_fsm");
   LLM_CHK_ACL(aclrtSetCurrentContext(aclrt_context_));
-  while (running_) {
-    HandleAllEntities();
+  while (running_.load()) {
+    const bool send_pending = HandleAllEntities();
+    WaitForWork(send_pending);
   }
 }
 
@@ -167,7 +200,11 @@ ge::Status CommEntityManager::Initialize(bool start_service) {
 
 void CommEntityManager::Finalize() {
   LLMLOGI("CommEntityManager finalize start");
-  running_ = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    running_ = false;
+    idle_cv_.notify_all();
+  }
   if (cache_engine_thread_.joinable()) {
     cache_engine_thread_.join();
   }

@@ -91,6 +91,25 @@ class BufferTransferServiceUTest : public ::testing::Test {
   std::unique_ptr<ScopedRuntimeMockForBuffer> scoped_runtime_mock_;
 };
 
+TEST(BufferTransferServiceTimeoutTest, LargeTimeoutConvertsWithoutSignedOverflow) {
+  uint64_t timeout_us = 0U;
+  constexpr int32_t kOverflowBoundaryMs = 2147484;
+  ASSERT_EQ(BufferTransferService::CalcTimeoutUs(kOverflowBoundaryMs, timeout_us), SUCCESS);
+  EXPECT_EQ(timeout_us, static_cast<uint64_t>(kOverflowBoundaryMs) * 1000ULL);
+  ASSERT_EQ(BufferTransferService::CalcTimeoutUs(std::numeric_limits<int32_t>::max(), timeout_us), SUCCESS);
+  EXPECT_EQ(timeout_us, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) * 1000ULL);
+  EXPECT_EQ(BufferTransferService::CalcTimeoutUs(0, timeout_us), PARAM_INVALID);
+  EXPECT_EQ(BufferTransferService::CalcTimeoutUs(-1, timeout_us), PARAM_INVALID);
+}
+
+TEST_F(BufferTransferServiceUTest, TransferEmptyOpsAcceptsOverflowBoundaryTimeout) {
+  auto channel = CreateChannel();
+  const std::vector<TransferOpDesc> op_descs;
+  ASSERT_EQ(service_->Transfer(channel, TransferType::kWriteH2RH, op_descs, 2147484), SUCCESS);
+  EXPECT_EQ(service_->Transfer(channel, TransferType::kWriteH2RH, op_descs, 0), PARAM_INVALID);
+  EXPECT_EQ(service_->Transfer(channel, TransferType::kWriteH2RH, op_descs, -1), PARAM_INVALID);
+}
+
 TEST_F(BufferTransferServiceUTest, ProcessBufferReqSkipsFinalizedChannel) {
   auto channel = CreateChannel();
   ASSERT_EQ(channel->Finalize(), SUCCESS);

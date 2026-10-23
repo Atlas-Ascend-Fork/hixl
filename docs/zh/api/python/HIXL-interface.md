@@ -1057,7 +1057,7 @@ transfer_async(remote_engine: str, op: TransferOp, op_descs: List[TransferOpDesc
 | remote_engine | str | 远端HIXL的唯一标识。 |
 | op | TransferOp | 将远端内存读到本地或者将本地内存写到远端。 |
 | op_descs | List[TransferOpDesc] | 批量操作的本地以及远端地址。 |
-| args | TransferArgs | 可选参数（预留）。 |
+| args | TransferArgs | 可选参数。user_data 会随请求登记并在批量 GetTransferStatus 的 TransferResult.user_data 中原样返回。 |
 
 **调用示例**
 

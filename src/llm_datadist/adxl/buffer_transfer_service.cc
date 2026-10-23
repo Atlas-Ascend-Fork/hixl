@@ -108,9 +108,16 @@ void BufferTransferService::Finalize() {
   }
 }
 
+Status BufferTransferService::CalcTimeoutUs(int32_t timeout_in_millis, uint64_t &timeout_us) {
+  ADXL_CHK_BOOL_RET_STATUS(timeout_in_millis > 0, PARAM_INVALID, "timeout_in_millis:%d must > 0", timeout_in_millis);
+  timeout_us = static_cast<uint64_t>(timeout_in_millis) * static_cast<uint64_t>(kMillisToMicros);
+  return SUCCESS;
+}
+
 Status BufferTransferService::Transfer(const ChannelPtr &channel, TransferType type,
                                        const std::vector<TransferOpDesc> &op_descs, int32_t timeout_in_millis) {
-  uint64_t timeout = timeout_in_millis * kMillisToMicros;
+  uint64_t timeout = 0U;
+  ADXL_CHK_STATUS_RET(CalcTimeoutUs(timeout_in_millis, timeout), "Invalid transfer timeout:%d ms", timeout_in_millis);
   const auto start = std::chrono::steady_clock::now();
   auto req_id = next_req_id_.fetch_add(1);
   {
@@ -837,7 +844,7 @@ Status BufferTransferService::SendBufferReq(const ChannelPtr &channel, BufferReq
     return ControlMsgHandler::SendMsg(fd, ControlMsgType::kBufferReq, buffer_req, buffer_req.timeout);
   };
   ADXL_CHK_STATUS_RET(channel->SendControlMsg(func), "Send req msg failed.");
-  LLMLOGI("End send buffer req control msg, req id:%u.", buffer_req.req_id);
+  LLMLOGI("End send buffer req control msg, req id:%lu.", buffer_req.req_id);
   return SUCCESS;
 }
 
