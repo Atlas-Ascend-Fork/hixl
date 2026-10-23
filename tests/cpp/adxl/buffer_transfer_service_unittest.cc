@@ -212,6 +212,79 @@ TEST_F(BufferTransferServiceUTest, HandleBufferRespRejectsExceedingBufferSize) {
   EXPECT_EQ(service_->HandleBufferResp(channel, resp), PARAM_INVALID);
 }
 
+namespace {
+class CountingBatchRuntime : public llm::AclRuntimeStub {
+ public:
+  aclError aclrtMemcpyBatch(void **, size_t *, void **, size_t *, size_t, aclrtMemcpyBatchAttr *, size_t *, size_t,
+                            size_t *fail_index) override {
+    if (fail_index != nullptr) {
+      *fail_index = 0U;
+    }
+    ++call_count;
+    if (call_count == 1U && pause_first_batch) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    return ACL_ERROR_NONE;
+  }
+
+  uint32_t call_count = 0U;
+  bool pause_first_batch = false;
+};
+
+void FillCopySlices(size_t count, std::vector<uintptr_t> &src_addrs, std::vector<uintptr_t> &dst_addrs,
+                    std::vector<size_t> &sizes) {
+  src_addrs.assign(count, 0x1000U);
+  dst_addrs.assign(count, 0x2000U);
+  sizes.assign(count, 1U);
+}
+}  // namespace
+
+TEST_F(BufferTransferServiceUTest, ProcessCopyRejectsBudgetBelowBatchFloor) {
+  auto runtime = std::make_shared<CountingBatchRuntime>();
+  llm::AclRuntimeStub::SetInstance(runtime);
+  auto channel = CreateChannel();
+  std::vector<uintptr_t> src_addrs;
+  std::vector<uintptr_t> dst_addrs;
+  std::vector<size_t> sizes;
+  FillCopySlices(1U, src_addrs, dst_addrs, sizes);
+  constexpr uint64_t kBelowFloorUs = 50000U;
+  EXPECT_EQ(service_->ProcessCopy(channel, src_addrs, dst_addrs, sizes,
+                                  std::make_pair(ACL_MEMCPY_HOST_TO_DEVICE, kBelowFloorUs)),
+            TIMEOUT);
+  EXPECT_EQ(runtime->call_count, 0U);
+}
+
+TEST_F(BufferTransferServiceUTest, ProcessCopyStopsWhenElapsedExceedsBatchFloor) {
+  auto runtime = std::make_shared<CountingBatchRuntime>();
+  runtime->pause_first_batch = true;
+  llm::AclRuntimeStub::SetInstance(runtime);
+  auto channel = CreateChannel();
+  // One past kMemcpyBatchLimit so the second loop observes the first batch's elapsed time.
+  constexpr size_t kTwoBatchSliceCount = 4097U;
+  constexpr uint64_t kBudgetUs = 110000U;
+  std::vector<uintptr_t> src_addrs;
+  std::vector<uintptr_t> dst_addrs;
+  std::vector<size_t> sizes;
+  FillCopySlices(kTwoBatchSliceCount, src_addrs, dst_addrs, sizes);
+  EXPECT_EQ(
+      service_->ProcessCopy(channel, src_addrs, dst_addrs, sizes, std::make_pair(ACL_MEMCPY_HOST_TO_DEVICE, kBudgetUs)),
+      TIMEOUT);
+  EXPECT_EQ(runtime->call_count, 1U);
+}
+
+TEST_F(BufferTransferServiceUTest, PrepareServerCopyBufferCountsElapsedInMicroseconds) {
+  constexpr size_t kServerPoolIndex = 1U;
+  int dummy = 0;
+  service_->buff_addr_idles_.resize(kServerPoolIndex + 1U);
+  service_->buff_addr_idles_[kServerPoolIndex][&dummy] = true;
+  BufferReq req{};
+  constexpr uint64_t kBudgetUs = 3000U;
+  req.timeout = kBudgetUs;
+  const auto start = std::chrono::steady_clock::now() - std::chrono::milliseconds(5);
+  uint64_t left_timeout = 0U;
+  EXPECT_EQ(service_->PrepareServerCopyBuffer(req, true, left_timeout, start), TIMEOUT);
+}
+
 TEST_F(BufferTransferServiceUTest, ProcessCopyRejectsMismatchedDstSize) {
   auto channel = CreateChannel();
   std::vector<uintptr_t> src_addrs = {0x1000U};

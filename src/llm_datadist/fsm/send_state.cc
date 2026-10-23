@@ -274,7 +274,14 @@ ge::Status SendState::QueryCacheEntryAndOffset(CommEntity &entity, CacheEntry &c
                           ge::LLM_KV_CACHE_NOT_EXIST,
                           "Failed to get cache entry by data_cache_key: (%lu, %lu), is_prefix = %d",
                           data_cache_key.first, data_cache_key.second, static_cast<int32_t>(is_prefix));
-  offset = cache_entry.id_to_batch_index_and_size.at(data_cache_key.first).first * cache_entry.stride;
+  // Block caches are indexed by block id. An ordinary pull must be rejected before the batch-index lookup.
+  LLM_CHK_BOOL_RET_STATUS(cache_entry.num_blocks == 0U, ge::LLM_PARAM_INVALID,
+                          "request pull block = %u, but local cache is block = 1, num_blocks = %lu",
+                          request.is_pull_block, cache_entry.num_blocks);
+  const auto batch_it = cache_entry.id_to_batch_index_and_size.find(data_cache_key.first);
+  LLM_CHK_BOOL_RET_STATUS(batch_it != cache_entry.id_to_batch_index_and_size.cend(), ge::LLM_KV_CACHE_NOT_EXIST,
+                          "cache key (%lu, %lu) has no batch index", data_cache_key.first, data_cache_key.second);
+  offset = batch_it->second.first * cache_entry.stride;
   if ((!is_prefix) && (cache_entry.is_owned) && (request.is_pull_block == 0U)) {
     LLMLOGI("CacheKey(%lu, %lu) need to be removed after pulling", data_cache_key.first, data_cache_key.second);
     entity.SetCacheKeyToRemove(data_cache_key);

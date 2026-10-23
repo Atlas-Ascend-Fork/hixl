@@ -442,7 +442,7 @@ Status BufferTransferService::PrepareServerCopyBuffer(BufferReq &buffer_req, boo
   ADXL_CHK_STATUS_RET(TryGetServerBuffer(dev_buffer, buffer_req.timeout), "Failed to get server buffer.");
   buffer_req.local_buffer_addr = llm::PtrToValue(dev_buffer);
   const uint64_t time_cost =
-      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
   ADXL_CHK_BOOL_RET_STATUS(time_cost < buffer_req.timeout, TIMEOUT, "Transfer timeout.");
   left_timeout = buffer_req.timeout - time_cost;
   return SUCCESS;
@@ -549,7 +549,7 @@ Status BufferTransferService::ProcessCopy(const ChannelPtr &channel, const std::
     while (left_num > 0) {
       auto batch_num = std::min(left_num, kMemcpyBatchLimit);
       uint64_t time_cost =
-          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
       ADXL_CHK_BOOL_RET_STATUS(time_cost < timeout, TIMEOUT, "Transfer timeout.");
       auto left_timeout = timeout - time_cost;
       ADXL_CHK_BOOL_RET_STATUS(left_timeout > kMemcpyBatchMinTime, TIMEOUT, "Timeout is not enough.");

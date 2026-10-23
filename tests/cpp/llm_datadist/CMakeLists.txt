@@ -21,6 +21,7 @@ set(LLM_DATADIST_TEST_FILES
         transfer_message_limits_unittest.cc
         scalable_allocator_unittest.cc
         transfer_request_validation_unittest.cc
+        send_state_unittest.cc
         msg_handler_plugin_unittest.cc
 )
 set(LLM_DATADIST_STUB_SRC_FILES
