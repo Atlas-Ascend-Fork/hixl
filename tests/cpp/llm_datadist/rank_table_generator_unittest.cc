@@ -21,6 +21,7 @@
 #include "common/rank_table_generator_v1.h"
 #include "common/rank_table_generator_v2.h"
 #include "depends/llm_datadist/src/data_cache_engine_test_helper.h"
+#include "depends/llm_datadist/src/hccn_tool_test_helper.h"
 #include "depends/mmpa/src/mmpa_stub.h"
 
 namespace llm {
@@ -61,15 +62,19 @@ class AutoCommResV1RuntimeMock : public AutoCommResRuntimeMock {
 class RankTableGeneratorUnitTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    MockMmpaForHcclApi::Install();
+    MockMmpaForHcclApiWithIsolatedHccnTool::Install();
     AutoCommResRuntimeMock::Install();
     AutoCommResRuntimeMock::SetDevice(kDeviceId);
+    ASSERT_TRUE(path_guard_.UseFakeHccnTool("unused"));
   }
 
   void TearDown() override {
     AutoCommResRuntimeMock::Reset();
     MockMmpaForHcclApi::Reset();
   }
+
+ private:
+  HccnToolPathGuard path_guard_{"rank_table_generator"};
 };
 
 TEST_F(RankTableGeneratorUnitTest, GenerateV2LocalCommResWritesConfiguredDevicePort) {
@@ -87,6 +92,7 @@ TEST_F(RankTableGeneratorUnitTest, GenerateV2LocalCommResWritesIpv6DeviceIp) {
   ASSERT_EQ(LocalCommResGenerator::Generate(kServerId, kDeviceId, local_comm_res), ge::SUCCESS);
 
   const auto device = GetOnlyDevice(local_comm_res);
+  ASSERT_TRUE(device.contains("device_ip")) << local_comm_res;
   EXPECT_EQ(device.at("device_ip").get<std::string>(), "121::101");
 }
 
@@ -108,6 +114,7 @@ TEST_F(RankTableGeneratorUnitTest, GenerateV1LocalCommResWritesIpv6DeviceIp) {
   ASSERT_EQ(LocalCommResGenerator::Generate(kServerId, kDeviceId, local_comm_res), ge::SUCCESS);
 
   const auto device = GetOnlyDevice(local_comm_res);
+  ASSERT_TRUE(device.contains("device_ip")) << local_comm_res;
   EXPECT_EQ(device.at("device_ip").get<std::string>(), "121::101");
 }
 

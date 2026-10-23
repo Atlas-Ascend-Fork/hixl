@@ -11,9 +11,6 @@
 #include <vector>
 #include <atomic>
 #include <cstdlib>
-#include <fstream>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -25,6 +22,7 @@
 #include "depends/mmpa/src/mmpa_stub.h"
 #include "depends/slog/src/slog_stub.h"
 #include "depends/llm_datadist/src/data_cache_engine_test_helper.h"
+#include "depends/llm_datadist/src/hccn_tool_test_helper.h"
 #include "hixl_test_helpers.h"
 
 using namespace std;
@@ -33,81 +31,6 @@ using namespace ::testing;
 using ::testing::Invoke;
 using ::testing::Mock;
 namespace hixl {
-namespace {
-class HccnToolPathGuard {
- public:
-  explicit HccnToolPathGuard(const std::string &test_name)
-      : old_path_(getenv("PATH") == nullptr ? "" : getenv("PATH")),
-        temp_dir_template_("/tmp/hixl_api_unittest_" + test_name + "_XXXXXX") {}
-
-  ~HccnToolPathGuard() {
-    RestorePath();
-    if (!temp_dir_.empty()) {
-      const std::string tool_path = temp_dir_ + "/hccn_tool";
-      (void)unlink(tool_path.c_str());
-      (void)rmdir(temp_dir_.c_str());
-    }
-  }
-
-  bool UseEmptyPath() {
-    if (!CreateTempDir()) {
-      return false;
-    }
-    setenv("PATH", temp_dir_.c_str(), 1);
-    return true;
-  }
-
-  bool UseFakeHccnTool(const std::string &output) {
-    if (!CreateTempDir()) {
-      return false;
-    }
-
-    const std::string tool_path = temp_dir_ + "/hccn_tool";
-    std::ofstream tool_file(tool_path);
-    if (!tool_file.is_open()) {
-      return false;
-    }
-    tool_file << "#!/bin/sh\n"
-              << "if [ \"$3\" = \"-link\" ]; then\n"
-              << "  printf 'link status: UP\\n'\n"
-              << "else\n"
-              << "  printf '" << output << "\\n'\n"
-              << "fi\n";
-    tool_file.close();
-    if (chmod(tool_path.c_str(), S_IRWXU) != 0) {
-      return false;
-    }
-
-    setenv("PATH", temp_dir_.c_str(), 1);
-    return true;
-  }
-
- private:
-  bool CreateTempDir() {
-    if (!temp_dir_.empty()) {
-      return true;
-    }
-    char *dir = mkdtemp(temp_dir_template_.data());
-    if (dir == nullptr) {
-      return false;
-    }
-    temp_dir_ = dir;
-    return true;
-  }
-
-  void RestorePath() const {
-    if (old_path_.empty()) {
-      unsetenv("PATH");
-      return;
-    }
-    setenv("PATH", old_path_.c_str(), 1);
-  }
-
-  std::string old_path_;
-  std::string temp_dir_template_;
-  std::string temp_dir_;
-};
-}  // namespace
 
 class HixlUTest : public ::testing::Test {
  protected:
@@ -216,14 +139,18 @@ class HccnToolTest : public HccnConfMissingTest {
 class HccnConfTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    llm::MockMmpaForHcclApi::Install();
+    llm::MockMmpaForHcclApiWithIsolatedHccnTool::Install();
     llm::AutoCommResRuntimeMock::Install();
+    ASSERT_TRUE(path_guard_.UseFakeHccnTool("unused"));
   }
 
   void TearDown() override {
     llm::MockMmpaForHcclApi::Reset();
     llm::AutoCommResRuntimeMock::Reset();
   }
+
+ private:
+  HccnToolPathGuard path_guard_{"hccn_conf"};
 };
 
 class HccnGetOutputTest : public HccnConfMissingTest {

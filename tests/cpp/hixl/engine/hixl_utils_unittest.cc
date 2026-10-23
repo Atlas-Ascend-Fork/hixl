@@ -19,12 +19,12 @@
 namespace fs = std::experimental::filesystem;
 #include <fstream>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include "common/hixl_utils.h"
 #include "common/soc_type.h"
 #include "depends/mmpa/src/mmpa_stub.h"
 #include "depends/sys_api/src/sys_api_wrap.h"
+#include "depends/llm_datadist/src/hccn_tool_test_helper.h"
 #include "graph/ascend_string.h"
 #include "hixl/hixl_types.h"
 #include "ascendcl_stub.h"
@@ -78,6 +78,35 @@ class SocNameAclStub : public llm::AclRuntimeStub {
 };
 }  // namespace
 
+TEST(HccnToolPathGuardTest, RestoresPathAndRemovesPrivateTool) {
+  llm::HccnToolPathGuard restore_path("restore_original_path");
+  ASSERT_TRUE(restore_path.UseEmptyPath());
+  const char *initial_paths[] = {nullptr, "", "/original/bin"};
+  for (const char *initial_path : initial_paths) {
+    if (initial_path == nullptr) {
+      ASSERT_EQ(unsetenv("PATH"), 0);
+    } else {
+      ASSERT_EQ(setenv("PATH", initial_path, 1), 0);
+    }
+    std::string tool_dir;
+    {
+      llm::HccnToolPathGuard guard("restore_path");
+      ASSERT_TRUE(guard.UseFakeHccnTool("unused"));
+      ASSERT_NE(getenv("PATH"), nullptr);
+      tool_dir = getenv("PATH");
+      EXPECT_TRUE(fs::exists(tool_dir + "/hccn_tool"));
+      ASSERT_TRUE(guard.UseEmptyPath());
+      EXPECT_FALSE(fs::exists(tool_dir + "/hccn_tool"));
+    }
+    EXPECT_FALSE(fs::exists(tool_dir));
+    if (initial_path == nullptr) {
+      EXPECT_EQ(getenv("PATH"), nullptr);
+    } else {
+      EXPECT_STREQ(getenv("PATH"), initial_path);
+    }
+  }
+}
+
 class HixlUtilsUTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -85,16 +114,11 @@ class HixlUtilsUTest : public ::testing::Test {
     fs::remove_all(temp_dir_);
     fs::create_directories(temp_dir_);
     conf_path_ = temp_dir_ / "hccn.conf";
-    old_path_ = getenv("PATH") == nullptr ? "" : getenv("PATH");
     hixl_test::ResetSysApiHooks();
+    ASSERT_TRUE(path_guard_.UseEmptyPath());
   }
 
   void TearDown() override {
-    if (old_path_.empty()) {
-      unsetenv("PATH");
-    } else {
-      setenv("PATH", old_path_.c_str(), 1);
-    }
     hixl_test::ResetSysApiHooks();
     llm::AclRuntimeStub::Reset();
     fs::remove_all(temp_dir_);
@@ -110,26 +134,19 @@ class HixlUtilsUTest : public ::testing::Test {
     hixl_test::InstallSysApiHooks(std::make_shared<DeviceIpMmpaStub>(conf_path_.string(), conf_exists));
   }
 
-  void CreateHccnTool(const std::string &tool_output) const {
+  void CreateHccnTool(const std::string &tool_output) {
     CreateHccnToolScript(
         "#!/bin/sh\nif [ \"$3\" = \"-link\" ]; then\n  echo \"link status: UP\"\n  exit 0\nfi\necho \"" + tool_output +
         "\"\n");
   }
 
-  void CreateHccnToolScript(const std::string &script_content) const {
-    const auto tool_path = temp_dir_ / "hccn_tool";
-    std::ofstream file(tool_path);
-    ASSERT_TRUE(file.is_open());
-    file << script_content;
-    file.close();
-    ASSERT_EQ(chmod(tool_path.c_str(), 0755), 0);
-    const auto new_path = temp_dir_.string() + ":" + old_path_;
-    setenv("PATH", new_path.c_str(), 1);
+  void CreateHccnToolScript(const std::string &script_content) {
+    ASSERT_TRUE(path_guard_.UseScript(script_content));
   }
 
   fs::path temp_dir_;
   fs::path conf_path_;
-  std::string old_path_;
+  llm::HccnToolPathGuard path_guard_{"utils_unittest_tool"};
 };
 
 TEST_F(HixlUtilsUTest, EndpointConfigToStringContainsDeviceInfoTest) {
@@ -303,7 +320,7 @@ TEST_F(HixlUtilsUTest, GetDeviceIpClearsIpWhenLinkCommandFailsTest) {
 TEST_F(HixlUtilsUTest, GetDeviceIpKeepsIpWhenHccnToolIsUnavailableTest) {
   WriteHccnConf("address_3=10.10.10.3\n");
   InstallConfStub(true);
-  setenv("PATH", temp_dir_.c_str(), 1);
+  ASSERT_TRUE(path_guard_.UseEmptyPath());
 
   std::string device_ip;
   EXPECT_EQ(GetDeviceIp(3, device_ip), SUCCESS);

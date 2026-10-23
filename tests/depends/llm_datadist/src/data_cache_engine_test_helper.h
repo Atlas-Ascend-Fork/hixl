@@ -12,6 +12,7 @@
 #define CANN_GRAPH_ENGINE_TESTS_DEPENDS_LLM_ENGINE_DATA_CACHE_ENGINE_TEST_HELPER_H_
 
 #include <gtest/gtest.h>
+#include <cerrno>
 #include <numeric>
 #include <fstream>
 #include <cstdio>  // for std::remove
@@ -199,6 +200,22 @@ class MockMmpaForHcclApi : public hixl_test::SysApiHooks {
 
   static HcclResult HcclCommPrepare(HcclComm comm, HcclPrepareConfig *prepareConfig, int32_t timeout) {
     return HcclApiStub::GetInstance().HcclCommPrepare(comm, prepareConfig, timeout);
+  }
+};
+
+// Use with HccnToolPathGuard so configuration tests never query the installed driver tool.
+class MockMmpaForHcclApiWithIsolatedHccnTool : public MockMmpaForHcclApi {
+ public:
+  static void Install() {
+    hixl_test::InstallSysApiHooks(std::make_shared<MockMmpaForHcclApiWithIsolatedHccnTool>());
+  }
+
+  int32_t Access(const char *path_name) override {
+    if (path_name != nullptr && std::string(path_name) == "/usr/local/Ascend/driver/tools/hccn_tool") {
+      errno = ENOENT;
+      return -1;
+    }
+    return MockMmpaForHcclApi::Access(path_name);
   }
 };
 
