@@ -36,16 +36,16 @@ ChatGPT的推出意味着交互式人工智能逐渐成为商业化成熟产品�
 - Prefill阶段：将用户请求的Prompt传入大模型，进行计算，中间结果写入KV Cache并推理出第1个token。随着Prompt Sequence Length长度线性增长，对首token时延（TTFT）指标有要求的业务通常采用单batch方式执行LLM推理，该阶段属于计算密集型操作。
 - Decode阶段：将请求的前1个token传入大模型，从显存读取前文产生的KV Cache再进行计算。采用KV Cache技术后，单token计算量低，而主要瓶颈在于搬运参数量，故通常需要采用多batch方式提升利用率，该阶段属于访存密集型操作。
 
-![](figures/260109142344517.png)
+![260109142344517](figures/260109142344517.png)
 
 ## 为什么要做PD分离
 
 从实现上来看，整个LLM推理过程由Prefill和多轮迭代的Decode组成，想要在Decode阶段实现Continuous batching的前提是，每个被调度的request需要有空闲算力完成Prefill计算。按现有的部署模式，Prefill和Decode部署在一起，当有新的Prefill请求时，会被优先处理，从而导致Decode的执行流程由于增量token时延（TBT）而无法得到有效保障。例如下图，当request5或request6到来时，系统可能会优先执行request5或request6的Prefill，此时request2/3/4的响应时延会受到一定影响，从而导致TBT不稳定。
 
-![](figures/260109142618323.png)
+![260109142618323](figures/260109142618323.png)
 
 在实际的深度学习模型部署中，由于Prefill和Decode两阶段的计算/通信特征的差异特点，为了提升性能和资源利用效率，通过PD分离部署方案将Prefill和Decode分别部署在不同规格和架构的集群中，并且配合服务层的任务调度，在满足TTFT和TBT指标的前提下，结合Continuous batching机制尽可能提高Decode阶段的batch并发数，提升算力利用率。
 
 基于该方案，结合下图可以看到Prefill和Decode的执行互不影响，系统能够提供给用户一个稳定的TBT。
 
-![](figures/260109142712834.png)
+![260109142712834](figures/260109142712834.png)

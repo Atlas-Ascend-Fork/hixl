@@ -9,7 +9,7 @@ LLM-DataDist作为大模型分布式集群和数据管理组件，提供了高�
 - 链路管理用于集群之间建链、断链，实现集群的动态扩缩的能力。
 - 缓存管理用于管理KV Cache，提供PD（下文P侧代表Prefill, D侧代表Decode）之间点对点传输KV Cache的能力。
 
-![](figures/260109143238748.png)
+![260109143238748](figures/260109143238748.png)
 
 ## LLM-DataDist应用场景
 
@@ -21,4 +21,4 @@ LLM-DataDist作为大模型分布式集群和数据管理组件，提供了高�
 
 大模型推理PD分离式框架中，Prefill阶段生成的KV Cache需要传输到Decode，然后Decode阶段进行增量迭代推理。LLM-DataDist作为大模型分布式集群和数据管理组件，通过简易的API开放给用户，构建大模型推理PD分离式框架如下图所示，LLM-DataDist提供了Prefill Node和Decode Node之间的KV Cache传输及链路管理。
 
-![](figures/260107091904908.png)
+![260107091904908](figures/260107091904908.png)

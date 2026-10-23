@@ -15,7 +15,7 @@
 单边通信库如图1所示。
 
 **图1** 单边通信库软件架构图
-![](figures/architecture.png "单边通信库软件架构图")
+![单边通信库软件架构图](figures/architecture.png "单边通信库软件架构图")
 
 **核心组件**
 
@@ -30,4 +30,4 @@
 
 在大模型推理PD分离式框架中，为了提升性能和资源利用效率，将Prefill和Decode分别部署在不同规格和架构的集群中。PD分离式框架可提升大模型推理系统吞吐，详见[为什么要做PD分离](appendices.md#为什么要做pd分离)。
 
-大模型推理PD分离式框架中，Prefill阶段生成的KV Cache需要传输到Decode，然后Decode阶段进行增量迭代推理。单边通信库作为大模型分布式集群和数据管理组件，通过简易的API开放给用户，构建大模型推理PD分离式框架如下图所示，单边通信库提供了Prefill Node和Decode Node之间的KV Cache传输及链路管理。![](figures/260107091904908.png)
+大模型推理PD分离式框架中，Prefill阶段生成的KV Cache需要传输到Decode，然后Decode阶段进行增量迭代推理。单边通信库作为大模型分布式集群和数据管理组件，通过简易的API开放给用户，构建大模型推理PD分离式框架如下图所示，单边通信库提供了Prefill Node和Decode Node之间的KV Cache传输及链路管理。![260107091904908](figures/260107091904908.png)
