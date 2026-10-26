@@ -17,7 +17,7 @@ generates perf.md directly from CSV outputs, and prints results to terminal.
 Usage:
   python3 benchmarks/run_all_benchmarks.py
   python3 benchmarks/run_all_benchmarks.py --loops 10 --device_ids 0,1,2,3,4,5,6,7
-  python3 benchmarks/run_all_benchmarks.py --skip-kv
+  python3 benchmarks/run_all_benchmarks.py --skip_kv
   python3 benchmarks/run_all_benchmarks.py --output /tmp/perf.md
   python3 benchmarks/run_all_benchmarks.py -H OPTION_KEY=OPTION_VALUE  # comm bench only (repeatable)
 """
