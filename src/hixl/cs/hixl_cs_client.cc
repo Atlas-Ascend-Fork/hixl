@@ -17,7 +17,6 @@
 #include <limits>
 #include <securec.h>
 #include <thread>
-#include <unordered_set>
 #include "acl/acl.h"
 #include "nlohmann/json.hpp"
 #include "hixl/hixl_types.h"
@@ -333,6 +332,7 @@ Status HixlCSClient::InitNotifyResources(const EndpointDesc &ep) {
 Status HixlCSClient::Create(const HixlClientDesc *client_desc, const HixlClientConfig *config) {
   std::lock_guard<std::mutex> lock(mutex_);
   transfer_failure_latched_ = false;
+  abort_active_slot_ = false;
   transfer_failure_status_ = SUCCESS;
   HIXL_CHECK_NOTNULL(client_desc->server_ip);
   HIXL_CHECK_NOTNULL(client_desc->local_endpoint);
@@ -701,14 +701,15 @@ void HixlCSClient::ReleaseSharedSlotRef(std::shared_ptr<TransferPool::SlotHandle
     }
     auto *pool = TransferPool::GetInstance(active_slot_->device_id);
     if (pool != nullptr) {
-      if (transfer_failure_latched_) {
+      if (transfer_failure_latched_ || abort_active_slot_) {
         pool->Abort(*active_slot_);
-        HIXL_LOGI("[HixlClient] Aborted slot on last ref after latched failure. slot_index=%u", slot_index);
+        HIXL_LOGI("[HixlClient] Aborted slot on last ref. slot_index=%u", slot_index);
       } else {
         pool->Release(*active_slot_);
         HIXL_LOGI("[HixlClient] Released slot to pool. slot_index=%u", slot_index);
       }
     }
+    abort_active_slot_ = false;
     active_slot_.reset();
   }
 }
@@ -722,6 +723,7 @@ void HixlCSClient::CleanupActiveSlot() {
     HIXL_LOGI("[HixlClient] Aborted active slot. slot_index=%u", active_slot_->slot_index);
     active_slot_.reset();
   }
+  abort_active_slot_ = false;
 }
 
 Status HixlCSClient::ValidateDeviceInputs(uint32_t list_num, const HixlOneSideOpDesc *desc_list,
@@ -929,12 +931,23 @@ Status HixlCSClient::BatchTransferDeviceAsync(bool is_get, uint32_t list_num, co
 
   {
     hixl::TemporaryRtContext ctx_guard(handle->shared_slot->ctx);
-    HIXL_CHK_STATUS_RET(LaunchDeviceChunkedKernels(is_get, *handle, list_num),
+    // The handle guard below is the only return. A failed launch or flag copy can leave work on the
+    // stream, so mark the slot before that guard releases it.
+    const Status launch_ret = LaunchDeviceChunkedKernels(is_get, *handle, list_num);
+    if (launch_ret != SUCCESS) {
+      abort_active_slot_ = true;
+    }
+    HIXL_CHK_STATUS_RET(launch_ret,
                         "[HixlClient] LaunchDeviceChunkedKernels failed, is_get=%d, list_num=%u, slot=%u, thread=%lu",
                         static_cast<int32_t>(is_get), list_num, handle->shared_slot->slot_index,
                         static_cast<uint64_t>(handle->shared_slot->thread));
-    HIXL_CHK_ACL_RET(aclrtMemcpyAsync(handle->host_flag, sizeof(uint64_t), handle->shared_slot->dev_const_one,
-                                      sizeof(uint64_t), ACL_MEMCPY_DEVICE_TO_HOST, handle->shared_slot->stream),
+    const aclError copy_ret =
+        aclrtMemcpyAsync(handle->host_flag, sizeof(uint64_t), handle->shared_slot->dev_const_one, sizeof(uint64_t),
+                         ACL_MEMCPY_DEVICE_TO_HOST, handle->shared_slot->stream);
+    if (copy_ret != ACL_SUCCESS) {
+      abort_active_slot_ = true;
+    }
+    HIXL_CHK_ACL_RET(copy_ret,
                      "[HixlClient] aclrtMemcpyAsync (Flag D2H) failed, is_get=%d, list_num=%u, slot=%u, thread=%lu",
                      static_cast<int32_t>(is_get), list_num, handle->shared_slot->slot_index,
                      static_cast<uint64_t>(handle->shared_slot->thread));
@@ -975,18 +988,19 @@ Status HixlCSClient::BatchTransferDeviceSync(bool is_get, uint32_t list_num, con
 
   {
     hixl::TemporaryRtContext ctx_guard(handle->shared_slot->ctx);
-    HIXL_CHK_STATUS_RET(LaunchDeviceChunkedKernels(is_get, *handle, list_num),
-                        "[HixlClient] LaunchDeviceChunkedKernels failed, is_get=%d, list_num=%u, slot=%u, thread=%lu",
-                        static_cast<int32_t>(is_get), list_num, handle->shared_slot->slot_index,
-                        static_cast<uint64_t>(handle->shared_slot->thread));
-    const aclError sync_ret = aclrtSynchronizeStreamWithTimeout(handle->shared_slot->stream, timeout_ms);
+    // The handle guard below is the only return. Mark the slot so that guard Aborts it once.
+    const Status launch_ret = LaunchDeviceChunkedKernels(is_get, *handle, list_num);
     const ThreadHandle thread = handle->shared_slot->thread;
     const uint32_t slot_index = handle->shared_slot->slot_index;
-    if (sync_ret != ACL_SUCCESS && handle->shared_slot != nullptr) {
-      auto *pool = TransferPool::GetInstance(handle->shared_slot->device_id);
-      if (pool != nullptr) {
-        pool->Abort(*handle->shared_slot);
-      }
+    if (launch_ret != SUCCESS) {
+      abort_active_slot_ = true;
+    }
+    HIXL_CHK_STATUS_RET(launch_ret,
+                        "[HixlClient] LaunchDeviceChunkedKernels failed, is_get=%d, list_num=%u, slot=%u, thread=%lu",
+                        static_cast<int32_t>(is_get), list_num, slot_index, static_cast<uint64_t>(thread));
+    const aclError sync_ret = aclrtSynchronizeStreamWithTimeout(handle->shared_slot->stream, timeout_ms);
+    if (sync_ret != ACL_SUCCESS) {
+      abort_active_slot_ = true;
     }
     HIXL_CHK_ACL_RET(sync_ret,
                      "[HixlClient] aclrtSynchronizeStreamWithTimeout failed, kernel=%s, list_num=%u, slot=%u, "
@@ -1518,17 +1532,9 @@ void HixlCSClient::AbortAllPendingDeviceHandles() {
   }
   std::vector<DeviceCompleteHandle *> pending(pending_device_handles_.begin(), pending_device_handles_.end());
   pending_device_handles_.clear();
-  std::unordered_set<uint32_t> aborted_slots;
+  // These handles share active_slot_. The last ReleaseDevCompleteHandle aborts that slot once.
+  abort_active_slot_ = true;
   for (DeviceCompleteHandle *h : pending) {
-    if (h == nullptr) {
-      continue;
-    }
-    if (h->shared_slot != nullptr) {
-      auto *pool = TransferPool::GetInstance(h->shared_slot->device_id);
-      if (pool != nullptr && aborted_slots.insert(h->shared_slot->slot_index).second) {
-        pool->Abort(*h->shared_slot);
-      }
-    }
     (void)ReleaseDevCompleteHandle(h);
   }
 }

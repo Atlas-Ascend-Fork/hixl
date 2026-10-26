@@ -189,6 +189,8 @@ class HixlCSClient {
   // Active slot shared by concurrent transfers - reference counted
   std::shared_ptr<TransferPool::SlotHandle> active_slot_;
   bool transfer_failure_latched_{false};
+  // The active slot is returned by one Abort when its last reference drops.
+  bool abort_active_slot_{false};
   Status transfer_failure_status_{SUCCESS};
   std::unique_ptr<UbMemEngine> ubmem_engine_;
 };
