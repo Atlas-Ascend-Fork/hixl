@@ -10,6 +10,7 @@
 | [gitcode-pipeline](skills/gitcode-pipeline)   | GitCode PR 流水线管理 | 触发流水线、查看流水线状态、等待流水线结果、流水线失败、盯 CI、看一下 PR 的 CI |
 | [gitcode-pr](skills/gitcode-pr)               | GitCode PR 创建与管理 | 创建 PR、推送代码到远程、合并请求、PR 模板/描述、关联 issue 创建 PR、获取 PR 改动、获取/查看/删除 PR 评论、查看 PR 讨论 |
 | [hixl-dev](skills/hixl-dev)                   | HIXL 本地开发与验证 | 修改 HIXL 代码/测试、本地 UT、增量覆盖率；开 PR 后配合 gitcode-pipeline 跟进 CI 并修低级错误 |
+| [hixl-issue-reply](skills/hixl-issue-reply)   | HIXL Issue 处理与回复 | 回复 Issue、跟进问题、补充进展、处理积压 Issue、判断能否关闭或撰写关闭说明 |
 | [hixl-troubleshoot](skills/hixl-troubleshoot) | HIXL/ADXL 运行时问题定位 | 用户明确要求诊断 HIXL，或日志中出现 HIXL、ADXL、Ascend direct transport 相关报错或调用栈 |
 | [hixl-review](skills/hixl-review)             | HIXL代码检视/审查       | 用户明确要求检视PR、审查PR、检查本地代码、检查指定目录/文件、检查指定 commit |
 | [hixl-ut-generator](skills/hixl-ut-generator) | HIXL UT 生成        | 用户要求基于当前改动生成测试、补充 UT、或根据 git diff 编写测试用例 |
