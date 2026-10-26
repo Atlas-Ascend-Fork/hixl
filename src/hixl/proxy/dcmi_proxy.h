@@ -19,6 +19,7 @@
 #define CANN_HIXL_SRC_HIXL_PROXY_DCMI_PROXY_H
 
 #include <cstdint>
+#include <string>
 #include "hixl/hixl_types.h"
 
 namespace hixl {
@@ -128,6 +129,10 @@ class DcmiProxy {
    * @return SUCCESS on success, FAILED on failure
    */
   static Status GetDeviceInfo(unsigned int logic_id, int32_t main_cmd, uint32_t sub_cmd, void *buf, unsigned int *size);
+  static bool IsTopoInfoByNicSupported();
+  // logic_id 由调用方转换后传入，本接口不再做 user id 转换。
+  static Status GetTopoInfoByNicName(int32_t logic_id, const std::string &nic_name, int32_t &dcmi_ret,
+                                     int32_t &topo_type);
   static void UnloadDcmi();
 };
 

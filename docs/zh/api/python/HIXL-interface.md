@@ -207,6 +207,7 @@ options = {
 | comm_resource_config.max_active_channels | 数字 | 可选 | CS场景下设备侧同时活跃传输通道数量，详见 [max_active_channels](#grc_max_active_channels)。 |
 | comm_resource_config.multi_channel.num_workers | 数字 | 可选 | 多通道并发传输的worker数，详见 [multi_channel](#grc_multi_channel)。 |
 | comm_resource_config.multi_channel.split_batch_size | 数字 | 可选 | 多通道并发传输的buffer拆分粒度，详见 [multi_channel](#grc_multi_channel)。 |
+| comm_resource_config.nic_topo_path | 字符串 | 可选 | 指定Host RoCE网卡与device设备的亲和关系，详见[nic_topo_path](#grc_nic_topo_path)。 |
 | transfer_config.max_transfer_count_per_batch | 数字或十进制数字字符串 | 可选 | 单个内部传输批次最多包含的buffer数量，详见 [max_transfer_count_per_batch](#grc_transfer_batch)。 |
 | fabric_memory.max_capacity | 数字或数字字符串 | 可选 | 虚拟内存池大小，详见 [fabric_memory](#grc_fabric_memory)。 |
 | fabric_memory.start_address | 数字或数字字符串 | 可选 | 虚拟内存池起始地址，详见 [fabric_memory](#grc_fabric_memory)。 |
@@ -222,6 +223,9 @@ options = {
 
 **产品支持情况**
 
+<!-- npu="950" id69 -->
+- `comm_resource_config.nic_topo_path`：仅支持Ascend 950PR&950DT系列产品。
+<!-- end id69 -->
 <!-- npu="A3" id67 -->
 - `fabric_memory.*`：仅支持Atlas A3系列产品。
 <!-- end id67 -->
@@ -239,7 +243,7 @@ options = {
   - 支持值：`"ub_ctp"`、`"ubmem"`、`"roce:device"`、`"hccs:device"`、`"ub_ctp:device"`、`"ub_ctp:host"`、`"uboe:device"`、`"ub_rtp:device"`、`"roce:host"`。
   - 过滤行为：配置后会对 `LocalCommRes` 中显式配置的 `endpoint_list` 和自动生成的 `endpoint_list` 按该范围进行过滤；显式配置的 `LocalCommRes` 在未配置本字段时不进行额外过滤。
   <!-- npu="950" id62 -->
-  - Ascend 950PR&950DT系列产品说明：未配置该字段或仅配置 `"ub_ctp:device"` 时，自动生成Device UB资源，Host内存通过UBMEM映射到Device地址后使用Device UB链路传输；同时配置 `"ub_ctp:device"` 和 `"ub_ctp:host"` 时，自动生成Device+Host UB资源并使用纯URMA路径；配置 `"ub_ctp"` 与上述组合等价；单独配置 `"ub_ctp:host"` 时仅保留Host UB CTP Endpoint。
+  - Ascend 950PR&950DT系列产品说明：未配置该字段或仅配置`"ub_ctp:device"`时，自动生成Device UB资源，Host内存通过UBMEM映射到Device地址后使用Device UB链路传输；同时配置`"ub_ctp:device"`和`"ub_ctp:host"`时，自动生成Device+Host UB资源并使用纯URMA路径；配置`"ub_ctp"`与上述组合等价；单独配置`"ub_ctp:host"`时仅保留Host UB CTP Endpoint。显式配置`"roce:host"`时，自动生成Host RoCE的endpoint_list。HDK版本不低于`26.2.RC1.B082`，1825版本不低于`SP560 1.0.1.1.B031`。
   <!-- end id62 -->
   - 手工配置 `LocalCommRes` 时，`"ub_ctp"` 要求同时提供Device和Host UB CTP Endpoint。
   <!-- npu="A3" id66 -->
@@ -284,6 +288,36 @@ options = {
     "comm_resource_config.max_active_channels": "128", //可选，CS场景下设备侧同时活跃传输通道数量，取值范围[1, 8192]，默认128
     "comm_resource_config.multi_channel.num_workers": 1, //可选，多通道并发传输的worker数，取值范围[1, 16]，默认1
     "comm_resource_config.multi_channel.split_batch_size": 128 //可选，多通道并发传输的buffer拆分粒度，取值范围[1, 4294967295]，默认128
+}
+```
+
+<a id="grc_nic_topo_path"></a>
+
+- **nic_topo_path**（`comm_resource_config.nic_topo_path`）：指定Host RoCE网卡与device设备的亲和关系，取值为主机网卡拓扑JSON文件路径。空串视为未配置。本字段仅未指定LocalCommRes时生效；已通过`LocalCommRes`或`local_comm_res_path`指定本地通信资源时，不会读取本字段，也不校验该路径。
+  - 不配置或配置为空串时，HIXL按网卡与当前device的亲和关系自动选择Host RoCE网卡。
+  - 配置非空路径时，使用该JSON文件指定亲和关系。目标文件必须是大小在[1字节,1MiB]范围内的普通文件。文件不存在、不是普通文件、为空、超出大小或无法打开时，initialize失败。JSON内容在生成Host RoCE端点时校验，内容不合法则生成失败。
+  - JSON文件为对象，每个成员描述一张NPU对应的网卡亲和关系。
+
+| 字段 | 含义 | 约束 |
+| --- | --- | --- |
+| key | `npu:<user_device_id>` | `user_device_id`为用户可见设备号（`aclrtGetDevice`的返回值，受`ASCEND_RT_VISIBLE_DEVICES`影响），须为十进制非负整数。重复key以后出现的值为准 |
+| value | 长度为2的数组`[preferred, avail]` | `preferred`为优先网卡，仅支持配置1个。网卡名为ibverbs设备名（例如`hrn5_0`，可通过`hiroce5 gids`查看NPU对应的ib_dev名），不能为空，长度不超过63个字符。`avail`为备选网卡，预留字段，当前不支持配置，填写空数组`[]` |
+
+使用示例：
+
+```json
+{
+    "comm_resource_config.nic_topo_path": "/path/to/nic_topo.json",
+    "comm_resource_config.protocol_desc": ["roce:host"]
+}
+```
+
+`nic_topo.json`内容示例：
+
+```json
+{
+    "npu:0": [["hrn5_0"], []],
+    "npu:1": [["hrn5_1"], []]
 }
 ```
 

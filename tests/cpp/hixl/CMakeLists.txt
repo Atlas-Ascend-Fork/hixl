@@ -19,6 +19,7 @@ set(HIXL_TEST_FILES
         common/segment_ut.cc
         llm_datadist_timer_ut.cc
         proxy/dsmi_proxy_ut.cc
+        proxy/ibverbs_proxy_ut.cc
         common/log_macro_ut.cc
         cs/endpoint_store_ut.cc
         cs/endpoint_factory_ut.cc
@@ -41,6 +42,7 @@ set(HIXL_TEST_FILES
         engine/hixl_api_unittest.cc
         engine/test_hixl_api.cc
         engine/endpoint_generator_ut.cc
+        engine/host_roce_endpoint_generator_ut.cc
         engine/hixl_profiling_unittest.cc
         engine/hixl_engine_uboe_unittest.cc
         engine/hixl_engine_ubg_unittest.cc
@@ -202,6 +204,7 @@ target_link_libraries(hixl_test
         ascendcl_stub
         runtime_stub
         dcmi_stub
+        ibverbs_stub
         drvdsmi_host_stub
         hixl_ascend_hal_stub
         sys_api_wrap
@@ -220,7 +223,7 @@ target_link_libraries(hixl_test
 # --disable-new-dtags 强制使用 DT_RPATH（优先于 LD_LIBRARY_PATH），
 # 确保测试桩优先于系统 CANN 安装的同名库被加载
 set_target_properties(hixl_test PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR}/tests/depends/dcmi;${CMAKE_BINARY_DIR}/tests/depends/dsmi;${CMAKE_BINARY_DIR}/tests/depends/ascend_hal"
+        BUILD_RPATH "${CMAKE_BINARY_DIR}/tests/depends/dcmi;${CMAKE_BINARY_DIR}/tests/depends/dsmi;${CMAKE_BINARY_DIR}/tests/depends/ascend_hal;${CMAKE_BINARY_DIR}/tests/depends/ibverbs"
         LINK_FLAGS "-Wl,--disable-new-dtags -Wl,--wrap=dlopen -Wl,--wrap=dlsym -Wl,--wrap=dlclose -Wl,--wrap=dlerror -Wl,--wrap=access -Wl,--wrap=realpath"
 )
 

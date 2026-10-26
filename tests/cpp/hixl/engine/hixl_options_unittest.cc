@@ -1006,6 +1006,62 @@ TEST_F(HixlOptionsUTest, ParseTopoFilePathSkippedWhenEndpointListProvided) {
   EXPECT_EQ(*result.TopoFilePath(), "/tmp/hixl_topo_not_exist_skip.json");
 }
 
+TEST_F(HixlOptionsUTest, ParseNicTopoPathSuccess) {
+  const std::string content = R"({"npu:0":[["mlx0"],[]]})";
+  const std::string file_path = test::CreateTempFileWithContent("/tmp/hixl_nic_topo_XXXXXX", content);
+  ASSERT_FALSE(file_path.empty());
+
+  const std::string grc = std::string(R"({"comm_resource_config.nic_topo_path":")") + file_path + "\"}";
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(grc.c_str());
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.NicTopoPath().has_value());
+  EXPECT_EQ(*result.NicTopoPath(), file_path);
+  unlink(file_path.c_str());
+}
+
+TEST_F(HixlOptionsUTest, ParseNicTopoPathEmptyIsUnset) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"comm_resource_config.nic_topo_path":""})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  EXPECT_FALSE(result.NicTopoPath().has_value());
+}
+
+TEST_F(HixlOptionsUTest, ParseNicTopoPathNotExistInvalid) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] =
+      R"({"comm_resource_config.nic_topo_path":"/tmp/hixl_nic_topo_not_exist_12345.json"})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), PARAM_INVALID);
+}
+
+TEST_F(HixlOptionsUTest, ParseNicTopoPathDoesNotCheckJsonContent) {
+  const std::string file_path = test::CreateTempFileWithContent("/tmp/hixl_nic_topo_XXXXXX", "not-json");
+  ASSERT_FALSE(file_path.empty());
+  const std::string grc = std::string(R"({"comm_resource_config.nic_topo_path":")") + file_path + "\"}";
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(grc.c_str());
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.NicTopoPath().has_value());
+  EXPECT_EQ(*result.NicTopoPath(), file_path);
+  unlink(file_path.c_str());
+}
+
+TEST_F(HixlOptionsUTest, ParseNicTopoPathSkippedWhenEndpointListProvided) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_LOCAL_COMM_RES] =
+      R"({"version":"1.3","net_instance_id":"superpod_0","endpoint_list":[{"protocol":"ub_ctp","comm_id":"eid0","placement":"device"}]})";
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] =
+      R"({"comm_resource_config.nic_topo_path":"/tmp/hixl_nic_topo_not_exist_skip.json"})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.NicTopoPath().has_value());
+  EXPECT_EQ(*result.NicTopoPath(), "/tmp/hixl_nic_topo_not_exist_skip.json");
+}
+
 TEST_F(HixlOptionsUTest, ParseTopoFilePathSkippedWhenEndpointListProvidedViaFile) {
   const std::string lcr =
       R"({"version":"1.3","net_instance_id":"superpod_0","endpoint_list":[{"protocol":"ub_ctp","comm_id":"eid0","placement":"device"}]})";

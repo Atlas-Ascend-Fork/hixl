@@ -108,7 +108,7 @@ target_link_libraries(ubmem_test
 # intercept realpath/access so the device-kernel json path resolves in unit tests (the file is not
 # installed in the test environment). Same setup the hixl suite uses.
 set_target_properties(ubmem_test PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR}/tests/depends/dcmi;${CMAKE_BINARY_DIR}/tests/depends/dsmi;${CMAKE_BINARY_DIR}/tests/depends/ascend_hal"
+        BUILD_RPATH "${CMAKE_BINARY_DIR}/tests/depends/dcmi;${CMAKE_BINARY_DIR}/tests/depends/dsmi;${CMAKE_BINARY_DIR}/tests/depends/ascend_hal;${CMAKE_BINARY_DIR}/tests/depends/ibverbs"
         LINK_FLAGS "-Wl,--disable-new-dtags -Wl,--wrap=dlopen -Wl,--wrap=dlsym -Wl,--wrap=dlclose -Wl,--wrap=dlerror -Wl,--wrap=access -Wl,--wrap=realpath"
 )
 

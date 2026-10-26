@@ -25,6 +25,7 @@
 #include "dcmi_proxy.h"
 #include "dsmi_proxy.h"
 #include "endpoint_generator_base.h"
+#include "host_roce_endpoint_generator.h"
 #include "local_comm_res_generator_v1.h"
 
 namespace hixl {
@@ -35,6 +36,7 @@ constexpr uint8_t kUbgEidMarkerMask = 0xC0U;
 constexpr uint8_t kUbgEidMarkerValue = 0x80U;
 constexpr size_t kEidHexStrLen = COMM_ADDR_EID_LEN * 2U;
 constexpr int32_t kSetwWidth = 2;
+constexpr const char kRoceHostProtocolDesc[] = "roce:host";
 
 // protocol_desc parsing mode, only relevant to the default (ScaleOut) generation flow.
 enum class ProtocolDescMode { kNone, kUboe, kUbg, kConflict };
@@ -281,8 +283,7 @@ struct UbCtpAppendInput {
 };
 
 // Generate ub_ctp endpoints on demand and merge them into endpoint_list.
-Status AppendUbCtpEndpoints(const UbCtpAppendInput &input, std::vector<EndpointConfig> &endpoint_list,
-                            std::string &net_instance_id) {
+Status AppendUbCtpEndpoints(const UbCtpAppendInput &input, std::vector<EndpointConfig> &endpoint_list) {
   bool ub_needed = false;
   LocalCommResGenerateMode ub_mode = LocalCommResGenerateMode::kDeviceOnly;
   HIXL_CHK_STATUS_RET(ResolveUbCtpNeedAndMode(input.protocol_desc, ub_needed, ub_mode),
@@ -299,27 +300,11 @@ Status AppendUbCtpEndpoints(const UbCtpAppendInput &input, std::vector<EndpointC
         GenerateLocalCommRes(input.phy_dev_id, input.topo_path, ub_mode, input.user_local_comm_res, ub_res),
         "GenerateLocalCommRes failed");
   }
-  if (net_instance_id.empty()) {
-    net_instance_id = ub_res.net_instance_id;
-  }
   for (auto &ep : ub_res.endpoint_list) {
     ep.server_id = ub_res.server_id;
     endpoint_list.emplace_back(std::move(ep));
   }
   return SUCCESS;
-}
-
-// Fill net_instance_id from generated endpoints when it is still empty.
-void FillNetInstanceIdIfEmpty(std::vector<EndpointConfig> &endpoint_list, std::string &net_instance_id) {
-  if (!net_instance_id.empty()) {
-    return;
-  }
-  for (const auto &ep : endpoint_list) {
-    if (!ep.net_instance_id.empty()) {
-      net_instance_id = ep.net_instance_id;
-      break;
-    }
-  }
 }
 
 }  // namespace
@@ -337,30 +322,22 @@ Status EndpointGeneratorV2::AutoGen(const HixlOptions &options, const std::strin
   }
 
   HIXL_LOGI("[EndpointGeneratorV2] auto-generate: device_id=%d, phy_id=%d", device_id, phy_id);
-  std::string net_instance_id;
-  const std::vector<std::string> protocol_desc = options.GetProtocolDesc();
-  const std::string user_local_comm_res = options.LocalCommRes().value_or("");
-  const std::string resolved_topo_path = options.TopoFilePath().value_or("");
-  AutoGenInput input{device_id, phy_id, resolved_topo_path, protocol_desc, user_local_comm_res};
-  HIXL_CHK_STATUS_RET(AutoGenCore(input, endpoint_list, net_instance_id), "[EndpointGeneratorV2] AutoGenCore failed");
-  return SUCCESS;
-}
-
-Status EndpointGeneratorV2::AutoGenCore(const EndpointGeneratorV2::AutoGenInput &input,
-                                        std::vector<EndpointConfig> &endpoint_list, std::string &net_instance_id) {
   endpoint_list.clear();
-  net_instance_id.clear();
-
-  HIXL_CHK_STATUS_RET(GenAutoScaleOutEndpoints(input.device_id, input.protocol_desc, endpoint_list),
-                      "GenAutoScaleOutEndpoints failed");
-
-  UbCtpAppendInput ub_input{input.phy_dev_id, input.topo_path, input.protocol_desc, input.user_local_comm_res};
-  HIXL_CHK_STATUS_RET(AppendUbCtpEndpoints(ub_input, endpoint_list, net_instance_id), "AppendUbCtpEndpoints failed");
-
-  HIXL_CHK_STATUS_RET(EndpointGeneratorBase::FilterEndpointsByProtocolDescList(input.protocol_desc, endpoint_list),
+  const std::vector<std::string> protocol_desc = options.GetProtocolDesc();
+  const std::string topo_path = options.TopoFilePath().value_or("");
+  const std::string user_local_comm_res = options.LocalCommRes().value_or("");
+  UbCtpAppendInput ub_input{phy_id, topo_path, protocol_desc, user_local_comm_res};
+  // Empty protocol_desc is handled inside each call: ScaleOut follows InterconType, UB CTP generates device edges.
+  HIXL_CHK_STATUS_RET(GenAutoScaleOutEndpoints(device_id, protocol_desc, endpoint_list),
+                      "[EndpointGeneratorV2] ScaleOut generation failed");
+  HIXL_CHK_STATUS_RET(AppendUbCtpEndpoints(ub_input, endpoint_list), "[EndpointGeneratorV2] UB CTP generation failed");
+  if (options.HasProtocolDesc(kRoceHostProtocolDesc)) {
+    HIXL_CHK_STATUS_RET(HostRoceEndpointGenerator::GenerateHostRoceEndpoints(options, endpoint_list),
+                        "[EndpointGeneratorV2] Host RoCE generation failed");
+  }
+  // ubmem is not appended here: FabricMem is A3-only.
+  HIXL_CHK_STATUS_RET(EndpointGeneratorBase::FilterEndpointsByProtocolDescList(protocol_desc, endpoint_list),
                       "FilterEndpointsByProtocolDescList failed");
-
-  FillNetInstanceIdIfEmpty(endpoint_list, net_instance_id);
   return SUCCESS;
 }
 

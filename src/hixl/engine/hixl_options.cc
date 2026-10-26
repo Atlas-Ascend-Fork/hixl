@@ -220,6 +220,14 @@ Status ParseCommResourceConfig(const nlohmann::json &json, CommResourceConfigDes
   IntegerFieldRange split_batch_range = {kGlobalResCfgSplitBatchSize, 1U, std::numeric_limits<uint32_t>::max(), ""};
   HIXL_CHK_STATUS_RET(ParseIntegerFieldInRange(json, split_batch_range, cfg.multi_channel_split_batch_size),
                       "Failed to parse comm_resource_config.multi_channel.split_batch_size");
+  if (json.contains(kGlobalResCfgNicTopoPath)) {
+    const auto &path_json = json.at(kGlobalResCfgNicTopoPath);
+    HIXL_CHK_BOOL_RET_STATUS(path_json.is_string(), PARAM_INVALID, "%s must be a string", kGlobalResCfgNicTopoPath);
+    const std::string path = path_json.get<std::string>();
+    if (!path.empty()) {
+      cfg.nic_topo_path = path;
+    }
+  }
   return SUCCESS;
 }
 
@@ -306,6 +314,18 @@ Status MaybeValidateTopoFilePath(const HixlOptions &opts) {
   return ValidateRegularFileSizeLimit(*path, kMaxTopoFileSizeBytes, kGlobalResCfgTopoFilePath);
 }
 
+Status MaybeValidateNicTopoPath(const HixlOptions &opts) {
+  const auto path = opts.NicTopoPath();
+  if (!path.has_value() || path->empty()) {
+    return SUCCESS;
+  }
+  if (HasManualEndpointList(opts)) {
+    HIXL_LOGI("Skip nic_topo_path validation because endpoint_list is provided");
+    return SUCCESS;
+  }
+  return ValidateRegularFileSizeLimit(*path, kMaxTopoFileSizeBytes, kGlobalResCfgNicTopoPath);
+}
+
 Status ParseGlobalResourceConfigJson(const nlohmann::json &json, GlobalResourceConfig &cfg) {
   HIXL_CHK_STATUS_RET(ParseUbMemoryConfig(json, cfg.fabric_memory), "Failed to parse UbMemoryConfig");
   HIXL_CHK_STATUS_RET(ParseConnectPoolConfig(json, cfg.connect_pool), "Failed to parse ConnectPoolConfig");
@@ -353,6 +373,7 @@ Status HixlOptions::Parse(const std::map<AscendString, AscendString> &options, H
   HIXL_CHK_STATUS_RET(result.ApplyUbMemEquivalence(), "Failed to apply ubmem protocol equivalence.");
   HIXL_CHK_STATUS_RET(result.ResolveLocalCommResFromFile(), "Failed to resolve LocalCommRes from file.");
   HIXL_CHK_STATUS_RET(MaybeValidateTopoFilePath(result), "Failed to validate topo_file_path");
+  HIXL_CHK_STATUS_RET(MaybeValidateNicTopoPath(result), "Failed to validate %s", kGlobalResCfgNicTopoPath);
   return SUCCESS;
 }
 
@@ -382,6 +403,14 @@ std::optional<std::string> HixlOptions::TopoFilePath() const {
     return std::nullopt;
   }
   return global_resource_config_->topo_file_path;
+}
+
+std::optional<std::string> HixlOptions::NicTopoPath() const {
+  if (!global_resource_config_.has_value() ||
+      !global_resource_config_->comm_resource_config.nic_topo_path.has_value()) {
+    return std::nullopt;
+  }
+  return global_resource_config_->comm_resource_config.nic_topo_path;
 }
 
 Status HixlOptions::ParseRdmaOptions(const std::map<AscendString, AscendString> &options) {

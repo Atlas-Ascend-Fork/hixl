@@ -26,6 +26,11 @@ void DcmiStubSetEidCount(int count);
 void DcmiStubSetEnableUbgEid(bool enable);
 // 覆盖 mesh die（-1 表示按产品形态推断）；用于让 stub EID die 布局与被测 topo 一致
 void DcmiStubSetMeshDieId(int die);
+void DcmiStubSetNicTopo(int ret, int topo_type);
+void DcmiStubSetNicTopoForName(const char *name, int ret, int topo_type);
+void DcmiStubResetNicTopo(void);
+int DcmiStubLastNicTopoDeviceId(void);
+int DcmiStubLastNicTopoNameLen(void);
 
 #ifdef __cplusplus
 }

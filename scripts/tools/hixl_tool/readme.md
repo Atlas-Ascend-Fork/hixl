@@ -160,6 +160,7 @@ hixl_tool local_comm_res [options]
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--topo_file_path <path>` | 硬件拓扑 JSON 文件路径（可选） | 缺省走默认 topo |
+| `--comm_resource_config <json\|path>` | `comm_resource_config`内的字段，JSON对象字符串或JSON文件路径。例如`{"nic_topo_path":"/etc/hixl/nic_topo.json"}`。后续新增的通信资源字段也写在这个对象里 | 不配置 |
 | `--device_id <id1,id2,...>` | 目标用户设备 ID，逗号分隔 | 自动识别全部设备 |
 | `--protocol_desc <desc>` | 协议描述，`ub_ctp`或`protocol:placement`格式，逗号分隔 | ScaleOut 按 InterconType 自动选择 + `ub_ctp:device` |
 | `--output <dir>` | 输出目录 | `/etc/` |
@@ -223,6 +224,7 @@ hixl_tool local_comm_res [options]
 | `ub_ctp:host` | 生成 host 侧 ub_ctp 端点 |
 | `uboe:device` | 生成 UBoE ScaleOut 端点 |
 | `ub_rtp:device` | 生成 UB_RTP（UBG）ScaleOut 端点 |
+| `roce:host` | 生成Host RoCE端点。失败则该设备生成失败 |
 
 约束：
 
@@ -233,13 +235,7 @@ hixl_tool local_comm_res [options]
 - 单独配置`ub_ctp:host`时，仅保留Host侧ub_ctp端点
 - 同时配置`ub_ctp`和其他ub_ctp placement时按集合处理，`ub_ctp`仍包含Device+Host资源
 
-### 4.5 执行流程
-
-1. 解析参数，确定目标设备列表
-2. 对每个 device：`aclrtSetDevice` 占用设备 → 构造 `HixlOptions`（含 `protocol_desc`）→ 调用 `EndpointGenerator::AutoGenEndpointList`（按 SoC 类型分发，A5 走默认 topo/自定义 topo）→ 组装 LocalCommRes → 写 JSON → `aclrtResetDevice` 释放设备
-3. `route_data` 在引擎内部通过 DSMI + urma_admin + DCMI 自动生成，**无需 `host_route.json`**
-
-### 4.6 示例
+### 4.5示例
 
 ```bash
 # 全部设备，auto 模式（ScaleOut 按 InterconType + ub_ctp:device）
@@ -256,6 +252,13 @@ hixl_tool local_comm_res [options]
   --topo_file_path /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
   --output /home/hixl \
   --protocol_desc uboe:device,ub_ctp:device
+
+# Host RoCE+网卡拓扑
+./hixl_tool local_comm_res \
+  --protocol_desc roce:host \
+  --comm_resource_config '{"nic_topo_path":"/etc/hixl/nic_topo.json"}' \
+  --device_id 0 \
+  --output /home/hixl
 ```
 
 ---

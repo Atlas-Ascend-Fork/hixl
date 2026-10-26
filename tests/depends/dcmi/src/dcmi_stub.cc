@@ -20,6 +20,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
+#include <string>
+#include <utility>
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,6 +55,13 @@ static bool g_enable_ubg_eid = false;
 
 // mesh die 覆盖：>=0 使用该值生成 EID die 布局（与 topo 解析一致），-1 按产品形态推断
 static int g_mesh_die_id_override = -1;
+
+// dcmiv2_get_topo_info_by_device_id_and_nic_name: default -8255 (not support)
+static int g_nic_topo_ret = -8255;
+static int g_nic_topo_type = 0;
+static int g_last_nic_topo_device_id = -1;
+static int g_last_nic_topo_name_len = -1;
+static std::map<std::string, std::pair<int, int>> g_nic_topo_by_name;
 
 int dcmiv2_init(void) {
   return g_dcmi_init_ret;
@@ -252,6 +262,22 @@ int dcmiv2_get_device_info(int npu_id, int main_cmd, unsigned int sub_cmd, void 
   return 0;
 }
 
+int dcmiv2_get_topo_info_by_device_id_and_nic_name(int device_id, const char *nic_name, int nic_name_len,
+                                                   int *topo_type) {
+  g_last_nic_topo_device_id = device_id;
+  g_last_nic_topo_name_len = nic_name_len;
+  if (nic_name == nullptr || topo_type == nullptr || nic_name_len <= 0) {
+    return -1;
+  }
+  const auto it = g_nic_topo_by_name.find(nic_name);
+  if (it != g_nic_topo_by_name.end()) {
+    *topo_type = it->second.second;
+    return it->second.first;
+  }
+  *topo_type = g_nic_topo_type;
+  return g_nic_topo_ret;
+}
+
 // ============ 测试控制接口 ============
 
 void DcmiStubSetInitRet(int ret) {
@@ -288,6 +314,34 @@ void DcmiStubSetEnableUbgEid(bool enable) {
 
 void DcmiStubSetMeshDieId(int die) {
   g_mesh_die_id_override = die;
+}
+
+void DcmiStubSetNicTopo(int ret, int topo_type) {
+  g_nic_topo_ret = ret;
+  g_nic_topo_type = topo_type;
+}
+
+void DcmiStubSetNicTopoForName(const char *name, int ret, int topo_type) {
+  if (name == nullptr) {
+    return;
+  }
+  g_nic_topo_by_name[name] = std::make_pair(ret, topo_type);
+}
+
+int DcmiStubLastNicTopoDeviceId(void) {
+  return g_last_nic_topo_device_id;
+}
+
+int DcmiStubLastNicTopoNameLen(void) {
+  return g_last_nic_topo_name_len;
+}
+
+void DcmiStubResetNicTopo(void) {
+  g_nic_topo_ret = -8255;
+  g_nic_topo_type = 0;
+  g_nic_topo_by_name.clear();
+  g_last_nic_topo_device_id = -1;
+  g_last_nic_topo_name_len = -1;
 }
 
 #ifdef __cplusplus

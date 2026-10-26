@@ -34,6 +34,8 @@ using DcmiGetMainboardIdFunc = int32_t (*)(int32_t npu_id, uint32_t *mainboard_i
 using DcmiGetLogicIdFromPhyIdFunc = int32_t (*)(uint32_t phy_id, uint32_t *logic_id);
 using DcmiGetDeviceInfoFunc = int32_t (*)(int32_t npu_id, int32_t main_cmd, uint32_t sub_cmd, void *buf,
                                           uint32_t *size);
+using DcmiGetTopoInfoByNicFunc = int32_t (*)(int32_t logic_id, const char *nic_name, int32_t nic_name_len,
+                                             int32_t *topo_type);
 
 // DCMI 接口函数指针
 DcmiInitFunc g_dcmi_init = nullptr;
@@ -42,6 +44,7 @@ DcmiGetEidListFunc g_dcmi_get_eid_list = nullptr;
 DcmiGetMainboardIdFunc g_dcmi_get_mainboard_id = nullptr;
 DcmiGetLogicIdFromPhyIdFunc g_dcmi_get_logicid_from_phyid = nullptr;
 DcmiGetDeviceInfoFunc g_dcmi_get_device_info = nullptr;
+DcmiGetTopoInfoByNicFunc g_dcmi_get_topo_info_by_nic = nullptr;
 
 void *g_dcmi_handle = nullptr;
 volatile bool g_dcmi_loaded = false;
@@ -78,6 +81,8 @@ int32_t TryLoadDcmiSymbols() {
     return -1;
   }
 
+  g_dcmi_get_topo_info_by_nic = reinterpret_cast<DcmiGetTopoInfoByNicFunc>(
+      dlsym(g_dcmi_handle, "dcmiv2_get_topo_info_by_device_id_and_nic_name"));
   return 0;
 }
 
@@ -151,6 +156,7 @@ void DcmiProxy::UnloadDcmi() {
   g_dcmi_get_mainboard_id = nullptr;
   g_dcmi_get_logicid_from_phyid = nullptr;
   g_dcmi_get_device_info = nullptr;
+  g_dcmi_get_topo_info_by_nic = nullptr;
   g_dcmi_loaded = false;
   g_dcmi_init_status = -1;
 }
@@ -208,6 +214,30 @@ Status DcmiProxy::GetDeviceInfo(uint32_t logic_id, int32_t main_cmd, uint32_t su
                            "[DcmiProxy] Call api:dcmiv2_get_device_info failed, ret=%d, logic_id=%u, main_cmd=%d, "
                            "sub_cmd=%u",
                            ret, logic_id, main_cmd, sub_cmd);
+  return SUCCESS;
+}
+
+bool DcmiProxy::IsTopoInfoByNicSupported() {
+  std::lock_guard<std::mutex> lock(g_dcmi_mu);
+  if (LoadDcmiUnlocked() != 0) {
+    return false;
+  }
+  return g_dcmi_get_topo_info_by_nic != nullptr;
+}
+
+Status DcmiProxy::GetTopoInfoByNicName(int32_t logic_id, const std::string &nic_name, int32_t &dcmi_ret,
+                                       int32_t &topo_type) {
+  HIXL_CHK_BOOL_RET_STATUS(!nic_name.empty() && nic_name.size() <= static_cast<size_t>(INT32_MAX), PARAM_INVALID,
+                           "invalid nic name length, logic_id=%d, len=%zu", logic_id, nic_name.size());
+  std::lock_guard<std::mutex> lock(g_dcmi_mu);
+  HIXL_CHK_STATUS_RET(EnsureDcmiReady(), "[DcmiProxy] EnsureDcmiReady failed");
+  HIXL_CHK_BOOL_RET_STATUS(g_dcmi_get_topo_info_by_nic != nullptr, FAILED,
+                           "[DcmiProxy] dcmiv2_get_topo_info_by_device_id_and_nic_name is unavailable");
+  int32_t type = 0;
+  dcmi_ret = g_dcmi_get_topo_info_by_nic(logic_id, nic_name.c_str(), static_cast<int32_t>(nic_name.size()), &type);
+  if (dcmi_ret == 0) {
+    topo_type = type;
+  }
   return SUCCESS;
 }
 

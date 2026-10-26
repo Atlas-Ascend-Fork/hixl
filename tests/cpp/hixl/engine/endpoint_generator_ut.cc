@@ -2179,8 +2179,7 @@ TEST_F(EndpointGeneratorUTest, AutoGenUbgByInterconTypeWhenNoProtocolDescOnDefau
   std::vector<EndpointConfig> endpoint_list;
   HixlOptions parsed;
   ASSERT_EQ(HixlOptions::Parse(options, parsed), SUCCESS);
-  // BuildEndpointList 会因 GenerateLocalCommRes 找不到 topo 文件而 FAILED，
-  // 但 GenerateScaleOutEndpointByInterconType 在此之前已执行并添加了 ScaleOut 端点
+  // GenerateLocalCommRes 找不到 topo 文件时终止。ScaleOut 端点已先写入列表。
   EXPECT_NE(EndpointGenerator::BuildEndpointList(parsed, "127.0.0.1:26000", local_comm_res, endpoint_list), SUCCESS);
   ASSERT_GE(endpoint_list.size(), 1U);
   EXPECT_EQ(endpoint_list[0].protocol, kProtocolUbRtp);

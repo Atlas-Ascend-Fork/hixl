@@ -46,6 +46,7 @@ constexpr const char *kGlobalResCfgConnectPoolThreadNum = "connect_pool.thread_n
 constexpr const char *kGlobalResCfgConnectPoolTaskQueueCapacity = "connect_pool.task_queue_capacity";
 constexpr const char *kGlobalResCfgLocalCommResPath = "local_comm_res_path";
 constexpr const char *kGlobalResCfgTopoFilePath = "topo_file_path";
+constexpr const char *kGlobalResCfgNicTopoPath = "comm_resource_config.nic_topo_path";
 
 struct ConnectPoolConfig {
   std::optional<int32_t> thread_num;
@@ -59,6 +60,7 @@ struct CommResourceConfigDesc {
   std::optional<uint32_t> max_active_channels;
   std::optional<uint32_t> multi_worker_num;
   std::optional<uint32_t> multi_channel_split_batch_size;
+  std::optional<std::string> nic_topo_path;
 };
 
 struct TransferConfig {
@@ -106,6 +108,7 @@ class HixlOptions {
   std::vector<std::string> GetProtocolDesc() const;
   bool HasProtocolDesc(const std::string &token) const;
   std::optional<std::string> TopoFilePath() const;
+  std::optional<std::string> NicTopoPath() const;
 
  private:
   std::map<AscendString, AscendString> raw_options_;

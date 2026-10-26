@@ -62,6 +62,7 @@ target_link_libraries(cann_hixl PRIVATE
         hccp_proxy_static
         dsmi_proxy_static
         dcmi_proxy_static
+        ibverbs_proxy_static
         ascend_hal_proxy_static
         alog
         error_manager

@@ -14,7 +14,7 @@
  *
  * Usage:
  *   hixl_tool host_route [--output <dir>] [--topo_file_path <path>]
- *   hixl_tool local_comm_res [--topo_file_path <path>] [options...]
+ *   hixl_tool local_comm_res [--topo_file_path <path>] [--comm_resource_config <json|path>] [options...]
  *
  * Note: run 'hixl_tool <subcommand> --help' for the full options of each subcommand.
  *

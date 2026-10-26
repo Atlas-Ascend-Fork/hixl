@@ -157,13 +157,14 @@ Generate a `LocalCommRes` (local communication resource) JSON file for each targ
 hixl_tool local_comm_res [options]
 ```
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--topo_file_path <path>` | Hardware topology JSON path (optional) | Default topology when omitted |
-| `--device_id <id1,id2,...>` | Target user device IDs, comma-separated | Auto-detect all devices |
-| `--protocol_desc <desc>` | Protocol description in `ub_ctp` or `protocol:placement` form, comma-separated | ScaleOut selected by InterconType + `ub_ctp:device` |
-| `--output <dir>` | Output directory | `/etc/` |
-| `--file_name_prefix <prefix>` | Output file-name prefix | `local_comm_res` |
+| Option | Description                                                                                                                                                                                              | Default |
+|--------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `--topo_file_path <path>` | Hardware topology JSON path (optional)                                                                                                                                                                   | Default topology when omitted |
+| `--comm_resource_config <json\|path>` | Fields inside `comm_resource_config`, as a JSON object string or a JSON file path. For example `{"nic_topo_path":"/etc/hixl/nic_topo.json"}`. Later communication-resource fields also go in this object | Unset |
+| `--device_id <id1,id2,...>` | Target user device IDs, comma-separated                                                                                                                                                                  | Auto-detect all devices |
+| `--protocol_desc <desc>` | Protocol description in `ub_ctp` or `protocol:placement` form, comma-separated                                                                                                                           | ScaleOut selected by InterconType + `ub_ctp:device` |
+| `--output <dir>` | Output directory                                                                                                                                                                                         | `/etc/` |
+| `--file_name_prefix <prefix>` | Output file-name prefix                                                                                                                                                                                  | `local_comm_res` |
 
 ### 4.3 Output format
 
@@ -223,6 +224,7 @@ The format is `ub_ctp` or `protocol:placement`. Separate multiple entries with a
 | `ub_ctp:host` | Generate host-side ub_ctp endpoints |
 | `uboe:device` | Generate UBoE ScaleOut endpoints |
 | `ub_rtp:device` | Generate UB_RTP (UBG) ScaleOut endpoints |
+| `roce:host` | Generate Host RoCE endpoints. Failure fails this device |
 
 Constraints:
 
@@ -233,13 +235,7 @@ Constraints:
 - When only `ub_ctp:host` is configured, only host-side ub_ctp endpoints are retained
 - When `ub_ctp` and another ub_ctp placement are configured together, union semantics apply and `ub_ctp` still includes Device+Host resources
 
-### 4.5 Execution flow
-
-1. Parse arguments and determine the target device list
-2. For each device: `aclrtSetDevice` to occupy the device → build `HixlOptions` (including `protocol_desc`) → call `EndpointGenerator::AutoGenEndpointList` (dispatch by SoC type; A5 uses the default or custom topology) → assemble LocalCommRes → write JSON → `aclrtResetDevice` to release the device
-3. The engine generates `route_data` internally through DSMI + urma_admin + DCMI. **`host_route.json` is not required**
-
-### 4.6 Examples
+### 4.5 Examples
 
 ```bash
 # All devices, auto mode (ScaleOut by InterconType + ub_ctp:device)
@@ -256,6 +252,13 @@ Constraints:
   --topo_file_path /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
   --output /home/hixl \
   --protocol_desc uboe:device,ub_ctp:device
+
+# Host RoCE with NIC topology
+./hixl_tool local_comm_res \
+  --protocol_desc roce:host \
+  --comm_resource_config '{"nic_topo_path":"/etc/hixl/nic_topo.json"}' \
+  --device_id 0 \
+  --output /home/hixl
 ```
 
 ---

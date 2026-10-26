@@ -47,6 +47,7 @@ void ResetDcmiStub() {
   DcmiStubSetUrmaDeviceCnt(1, 0);
   DcmiStubSetSuperPodId(0, 0);
   DcmiStubSetEidCount(2);
+  DcmiStubResetNicTopo();
 }
 
 }  // anonymous namespace
@@ -106,6 +107,39 @@ TEST_F(DcmiProxySuccessTest, GetMainboardIdSuccess) {
 }
 
 // DcmiProxy::GetDeviceInfo 成功路径
+TEST_F(DcmiProxySuccessTest, IsTopoInfoByNicSupported) {
+  EXPECT_TRUE(DcmiProxy::IsTopoInfoByNicSupported());
+}
+
+TEST_F(DcmiProxySuccessTest, GetTopoInfoByNicNameReturnsStubCode) {
+  DcmiStubSetNicTopo(-8255, 0);
+  int32_t dcmi_ret = 0;
+  int32_t topo_type = 0;
+  EXPECT_EQ(DcmiProxy::GetTopoInfoByNicName(0, "mlx0", dcmi_ret, topo_type), SUCCESS);
+  EXPECT_EQ(dcmi_ret, -8255);
+  EXPECT_EQ(DcmiStubLastNicTopoDeviceId(), 0);
+  EXPECT_EQ(DcmiStubLastNicTopoNameLen(), 4);
+}
+
+TEST_F(DcmiProxySuccessTest, GetTopoInfoByNicNameForwardsLogicIdAndNameLength) {
+  DcmiStubSetNicTopo(0, 8);
+  int32_t dcmi_ret = -1;
+  int32_t topo_type = 0;
+  EXPECT_EQ(DcmiProxy::GetTopoInfoByNicName(7, "mlx0", dcmi_ret, topo_type), SUCCESS);
+  EXPECT_EQ(dcmi_ret, 0);
+  EXPECT_EQ(topo_type, 8);
+  EXPECT_EQ(DcmiStubLastNicTopoDeviceId(), 7);
+  EXPECT_EQ(DcmiStubLastNicTopoNameLen(), 4);
+}
+
+TEST_F(DcmiProxySuccessTest, GetTopoInfoByNicNameRejectsEmptyName) {
+  int32_t dcmi_ret = 0;
+  int32_t topo_type = 0;
+  EXPECT_EQ(DcmiProxy::GetTopoInfoByNicName(0, "", dcmi_ret, topo_type), PARAM_INVALID);
+  EXPECT_EQ(DcmiStubLastNicTopoDeviceId(), -1);
+  EXPECT_EQ(DcmiStubLastNicTopoNameLen(), -1);
+}
+
 TEST_F(DcmiProxySuccessTest, GetDeviceInfoSuccess) {
   unsigned int logic_id = 0;
   int main_cmd = 0;
