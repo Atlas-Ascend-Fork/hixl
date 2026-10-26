@@ -53,7 +53,7 @@ repos:
         args: [ '--ignore-words-list=CANN,cann,alog,CLOS,nd,inout,VAs' ]
         exclude: '^(.agents/)'
 
-  # OAT 合规性检查 (Open Source Audit Tool)
+  # 日志规范校验
   - repo: local
     hooks:
       - id: log-spec-check
@@ -62,11 +62,12 @@ repos:
         language: system
         pass_filenames: true
         types_or: [ c++, c ]
+
+  # OAT 合规性检查 (Open Source Audit Tool) — 远程 Python hook
+  - repo: https://gitcode.com/HiAgent/compliance
+    rev: v1.0.6
+    hooks:
       - id: oat-check
-        name: OAT Compliance Check
-        entry: bash scripts/oat_check.sh
-        language: system
         pass_filenames: true
-        types: [ file ]
-        stages: [ pre-commit ]
+        stages: [pre-commit]
         verbose: true

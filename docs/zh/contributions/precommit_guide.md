@@ -93,6 +93,8 @@ pre-commit run log-spec-check --all-files
 
 **OAT（Open Source Audit Tool）** 是一个开源合规性检查工具，自动集成到 Git 提交流程中。
 
+本仓库通过 pre-commit 远程 hook 引用 OAT：hook 托管在 [HiAgent/compliance](https://gitcode.com/HiAgent/compliance) 仓库（`oat-check`，Python 实现），仓库内不保留本地检查脚本，无需安装 Java/Maven。
+
 #### 3.2.1 检查内容
 
 - **文件类型检查** - 禁止提交二进制文件（.so, .dll, .exe等）
@@ -100,74 +102,36 @@ pre-commit run log-spec-check --all-files
 
 #### 3.2.2 核心特点
 
-- **增量检查** - 仅检查待提交文件，速度快（< 5 秒）
+- **增量检查** - 仅检查本次提交涉及的文件，速度快
 - **自动触发** - 每次 `git commit` 自动运行
-- **详细报告** - 自动生成 `result.txt` 摘要和完整报告
-- **零配置** - Java 和 Maven 自动安装（Linux/macOS）
+- **远程 hook、零本地脚本** - 无需 Java/Maven、无需克隆额外仓库；首次运行时 pre-commit 自动安装 hook 运行环境
+- **详细报告** - 自动生成 `oat_reports/result.txt` 摘要报告
 - **跨平台** - Windows/Linux/macOS 全支持
 
 #### 3.2.3 必需软件
 
 | 软件 | 版本要求 | 用途 | 安装方式 |
 |------|---------|------|----------|
-| **Java** | JRE 8+ | 运行 OAT | **自动安装**（Linux/macOS）<br>手动安装（Windows） |
-| **Maven** | 3.5+ | 打包 OAT | **自动安装**（Linux/macOS）<br>手动安装（Windows） |
+| **Python** | 3.7+ | Hook 运行环境 | 手动安装 |
 | **Git** | 2.0+ | 版本控制 | 通常已安装 |
 | **pre-commit** | 2.0+ | Hook 框架 | `pip install pre-commit` |
 
-#### 3.2.4 自动安装支持
+首次运行 `oat-check` 时，pre-commit 会自动从 gitcode.com 拉取 hook 仓库并创建隔离的 Python 虚拟环境（自动安装 `lxml`、`chardet` 依赖），无需手动配置。
 
-| 平台 | Java | Maven | 包管理器 | 首次安装时间 |
-|------|------|-------|---------|-------------|
-| **Linux (Ubuntu/Debian)** | 自动 | 自动 | apt | 5-8 分钟 |
-| **Linux (CentOS/RHEL)** | 自动 | 自动 | yum | 5-8 分钟 |
-| **macOS** | 自动 | 自动 | Homebrew | 8-10 分钟 |
-| **Windows** | 手动 | 手动 | - | 需手动安装 |
-
-#### 3.2.5 重要提示：环境问题自动跳过
-
-**友好的设计**：如果无法安装 Java/Maven 或遇到环境问题，OAT 检查会**自动跳过**，提交仍会继续。
-
-**会自动跳过的场景**
-
-| 场景 | 行为 | 提示 |
-|------|------|------|
-| Java/Maven 未安装（Windows） | 跳过检查，允许提交 | 提供手动安装指引 |
-| Java/Maven 自动安装失败 | 跳过检查，允许提交 | 提示手动安装方法 |
-| Maven 打包失败 | 跳过检查，允许提交 | 提供解决方案 |
-| OAT 扫描执行失败 | 跳过检查，允许提交 | 提示重新打包 |
-
-**仍会阻止提交的场景**
-
-| 场景 | 行为 | 原因 |
-|------|------|------|
-| **发现二进制文件** | 阻止提交 | 真正的合规性问题 |
-| **许可证头缺失/错误** | 阻止提交 | 真正的合规性问题 |
-
-**跳过检查的提示示例**
-
-```
-[OAT] Windows 系统无法自动安装 Java
-[OAT] 请手动下载并安装：
-  ...（安装步骤）...
-
-[OAT] 跳过 OAT 检查，继续提交...
-[OAT] 建议安装 Java 后再次运行检查
-```
-
-**后续手动运行检查**
-
-配置好环境后，可以手动运行检查：
+#### 3.2.4 手动运行检查
 
 ```bash
-# 推荐方式
+# 检查暂存区文件（与 git commit 自动触发一致）
 pre-commit run oat-check
 
-# 或直接运行脚本
-bash scripts/oat_check.sh
+# 检查指定文件
+pre-commit run oat-check --files src/foo.cc
+
+# 检查一段范围（例如本地分支相对 master 的全部改动）
+pre-commit run oat-check --from-ref origin/master --to-ref HEAD
 ```
 
-#### 3.2.6 合规性问题（阻止提交）
+#### 3.2.5 合规性问题（阻止提交）
 
 **重要**：以下问题会**阻止提交**，必须修复。
 
@@ -178,20 +142,30 @@ bash scripts/oat_check.sh
 **输出**：
 ```
 ====================================================================
-  发现合规性问题
+  OAT: Compliance issues found. Commit blocked.
 ====================================================================
 
-[OAT] Found 1 compliance issue(s):
-  - Invalid File Type: 1
-  - License Header Invalid: 0
+[OAT] Cumulative scan: 1 file(s) checked, 1 issue(s).
 
-[OAT] Details saved to: oat_reports/single/result.txt
-[OAT] Please check the report and fix the issues.
+[OAT] Report:
+---
+===================================
+OAT Scan Result Summary
+===================================
+Scan Time: 2026-10-26 14:30:15
+Project: hixl
+Files Checked: 1
 
-To view the summary:
-  cat oat_reports/single/result.txt
+-----------------------------------
+Invalid File Type Total Count: 1
+Name:	Invalid File Type	Content:	binary	Line:	0	Project:	hixl	File:	/path/to/hixl/lib/libtest.so
 
-To skip this check temporarily:
+-----------------------------------
+License Header Invalid Total Count: 0
+===================================
+---
+
+Fix the issues and recommit, or skip with:
   git commit --no-verify
 ```
 
@@ -199,28 +173,7 @@ To skip this check temporarily:
 
 **查看详情**：
 ```bash
-cat oat_reports/single/result.txt
-```
-
-**报告内容示例**：
-```
-===================================
-OAT Scan Result Summary
-===================================
-Scan Time: 2026-03-25 14:30:15
-Project: CANN
-Files Checked: 1
-
------------------------------------
-Invalid File Type Total Count: 1
-lib/libtest.so: BINARY_FILE_TYPE
-
------------------------------------
-License Header Invalid Total Count: 0
-
-===================================
-Full report: oat_reports/single/PlainReport_CANN.txt
-===================================
+cat oat_reports/result.txt
 ```
 
 **解决方案**：
@@ -245,38 +198,39 @@ git commit -m "update: add binary files to gitignore"
 **输出**：
 ```
 ====================================================================
-  发现合规性问题
+  OAT: Compliance issues found. Commit blocked.
 ====================================================================
 
-[OAT] Found 2 compliance issue(s):
-  - Invalid File Type: 0
-  - License Header Invalid: 2
+[OAT] Cumulative scan: 2 file(s) checked, 2 issue(s).
 
-[OAT] Details saved to: oat_reports/single/result.txt
-```
-
-**行为**：**阻止提交，必须修复**
-
-**查看详情**：
-```bash
-cat oat_reports/single/result.txt
-```
-
-**报告内容示例**：
-```
+[OAT] Report:
+---
 ===================================
 OAT Scan Result Summary
 ===================================
+Scan Time: 2026-10-26 14:30:15
+Project: hixl
+Files Checked: 2
 
 -----------------------------------
 Invalid File Type Total Count: 0
 
 -----------------------------------
 License Header Invalid Total Count: 2
-src/main.cpp: MISSING_LICENSE_HEADER
-src/utils.cpp: MISSING_LICENSE_HEADER
-
+Name:	License Header Invalid	Content:	NoLicenseHeader	Line:	0	Project:	hixl	File:	/path/to/hixl/src/main.cpp
+Name:	License Header Invalid	Content:	NoLicenseHeader	Line:	0	Project:	hixl	File:	/path/to/hixl/src/utils.cpp
 ===================================
+---
+
+Fix the issues and recommit, or skip with:
+  git commit --no-verify
+```
+
+**行为**：**阻止提交，必须修复**
+
+**查看详情**：
+```bash
+cat oat_reports/result.txt
 ```
 
 **解决方案**：
@@ -303,33 +257,35 @@ git commit -m "fix: add license headers"
 
 ---
 
-#### 3.2.7 报告查看
+#### 3.2.6 报告查看
 
 **报告文件位置**
 
 | 报告类型 | 文件路径 | 内容 |
 |---------|---------|------|
-| **摘要报告** | `oat_reports/single/result.txt` | 关键问题汇总  |
+| **摘要报告** | `oat_reports/result.txt` | 关键问题汇总  |
+
+`oat_reports/` 目录已被 `.gitignore` 忽略，报告不会误提交到仓库。
 
 **查看命令**
 
 ```bash
 # 查看报告
-cat oat_reports/single/result.txt
+cat oat_reports/result.txt
 
 # 使用编辑器查看
-code oat_reports/single/result.txt
-vim oat_reports/single/result.txt
+code oat_reports/result.txt
+vim oat_reports/result.txt
 ```
 
-**摘要报告内容**
+**摘要报告内容示例**
 
 ```
 ===================================
 OAT Scan Result Summary
 ===================================
-Scan Time: 2026-03-25 14:30:15
-Project: CANN
+Scan Time: 2026-10-26 14:30:15
+Project: hixl
 Files Checked: 3
 
 -----------------------------------
@@ -337,298 +293,47 @@ Invalid File Type Total Count: 0
 
 -----------------------------------
 License Header Invalid Total Count: 0
-
-===================================
-Full report: oat_reports/single/PlainReport_CANN.txt
 ===================================
 ```
 
-#### 3.2.8 环境问题
+#### 3.2.7 环境问题
 
-**1) Java 未安装（Linux/macOS 自动安装）**
+**说明**：与旧版本地脚本不同，远程 hook 在环境安装失败或扫描异常时**不会静默跳过**，而是使 hook 失败并阻止提交，避免合规检查被绕过。确需临时绕过时，可使用 `git commit --no-verify`。
 
-**场景**：首次提交，系统未安装 Java。
+**1) hook 环境安装失败**
 
-**输出**：
-```
-====================================================================
-  Java 未安装 - 正在尝试自动安装
-====================================================================
+**场景**：首次运行 `oat-check` 时无法访问 gitcode.com，或依赖（`lxml`、`chardet`）安装失败。
 
-[OAT] 检测到系统未安装 Java，开始自动安装...
-[OAT] 使用 apt 安装 OpenJDK 11...
-[OAT] [OK] OpenJDK 11 安装成功
-```
-
-**处理**：自动安装，可能需要输入 sudo 密码。
-
----
-
-**2) Java 未安装（Windows 手动安装）**
-
-**场景**：Windows 系统无法自动安装 Java。
-
-**输出**：
-```
-[OAT] Windows 系统无法自动安装 Java
-[OAT] 请手动下载并安装：
-
-  1. 访问：https://adoptium.net/
-  2. 下载：Eclipse Temurin JRE 11 (x64)
-  3. 安装后重启 Git Bash
-  4. 验证：java -version
-
-[OAT] 跳过 OAT 检查，继续提交...
-[OAT] 建议安装 Java 后再次运行检查
-```
-
-**行为**：**跳过检查，允许提交**
-
-**后续操作**：
-1. 按提示手动安装 Java
-2. 重启终端
-3. 运行 `pre-commit run oat-check` 验证环境
-
----
-
-**3) Java 自动安装失败**
-
-**场景**：Linux/macOS 自动安装 Java 失败。
-
-**输出**：
-```
-[OAT] [ERROR] 自动安装失败
-
-[OAT] 自动安装失败，跳过 OAT 检查
-
-手动安装方法：
-  Linux:   sudo apt install openjdk-11-jre
-  macOS:   brew install openjdk@11
-  Windows: https://adoptium.net/
-
-[OAT] 继续提交（未进行合规性检查）...
-[OAT] 建议安装 Java 后再次运行: pre-commit run oat-check
-```
-
-**行为**：**跳过检查，允许提交**
-
-**可能原因**：
-- 网络连接问题
-- 包管理器未配置
-- 权限不足
-- macOS 未安装 Homebrew
+**行为**：pre-commit 报错，hook 失败，提交被阻止。
 
 **解决方案**：
 ```bash
-# Linux
-sudo apt update
-sudo apt install openjdk-11-jre
-
-# macOS - 先安装 Homebrew
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install openjdk@11
-
-# 验证
-java -version
-
-# 手动运行检查
-pre-commit run oat-check
-```
-
----
-
-**4) Maven 未安装（Linux/macOS 自动安装）**
-
-**场景**：首次提交，系统未安装 Maven。
-
-**输出**：
-```
-====================================================================
-  Maven 未安装 - 正在尝试自动安装
-====================================================================
-
-[OAT] 使用 apt 安装 Maven...
-[OAT] [OK] Maven 安装成功
-```
-
-**处理**：自动安装，可能需要输入 sudo 密码。
-
----
-
-**5) Maven 未安装（Windows 手动安装）**
-
-**场景**：Windows 系统无法自动安装 Maven。
-
-**输出**：
-```
-[OAT] Windows 系统无法自动安装 Maven
-[OAT] 请手动下载并安装：
-
-  1. 访问：https://maven.apache.org/download.cgi
-  2. 下载：apache-maven-3.x.x-bin.zip
-  3. 解压到 C:\Program Files\apache-maven-3.x.x
-  4. 添加到系统 PATH
-  5. 重启 Git Bash
-  6. 验证：mvn -version
-
-[OAT] 跳过 OAT 检查，继续提交...
-[OAT] 建议安装 Maven 后再次运行检查
-```
-
-**行为**：**跳过检查，允许提交**
-
-**后续操作**：按提示手动安装 Maven，然后运行 `pre-commit run oat-check`
-
----
-
-**6) Maven 打包失败**
-
-**场景**：Maven 打包 OAT JAR 失败。
-
-**输出**：
-```
-====================================================================
-  Maven 打包失败
-====================================================================
-
-[OAT] 无法打包 OAT JAR，跳过 OAT 检查
-
-可能原因：
-  1. Maven 配置问题
-  2. 网络连接问题（无法下载依赖）
-  3. pom.xml 配置错误
-
-建议解决方案：
-  1. 手动打包：
-     cd ../tools_oat
-     mvn clean package -DskipTests
-
-  2. 配置 Maven 镜像（国内网络）：
-     编辑 ~/.m2/settings.xml 添加阿里云镜像
-
-[OAT] 继续提交（未进行合规性检查）...
-[OAT] 建议修复打包问题后运行: pre-commit run oat-check
-```
-
-**行为**：**跳过检查，允许提交**
-
-**解决方案**：
-
-**方法 1：手动打包**
-```bash
-cd ../tools_oat
-mvn clean package -DskipTests
-
-# 查看输出，应该看到 BUILD SUCCESS
-```
-
-**方法 2：配置阿里云镜像（国内网络）**
-```bash
-mkdir -p ~/.m2
-cat > ~/.m2/settings.xml <<'EOF'
-<settings>
-  <mirrors>
-    <mirror>
-      <id>aliyun</id>
-      <mirrorOf>central</mirrorOf>
-      <name>Aliyun Maven Mirror</name>
-      <url>https://maven.aliyun.com/repository/public</url>
-    </mirror>
-  </mirrors>
-</settings>
-EOF
-
-# 重新打包
-cd ../tools_oat
-mvn clean package -DskipTests
-```
-
-**方法 3：从团队获取 JAR**
-```bash
-# 如果团队已有编译好的 JAR，直接复制
-# 将 JAR 文件复制到 ../tools_oat/target/ 目录
-```
-
-**验证修复**：
-```bash
-pre-commit run oat-check
-```
-
----
-
-**7) tools_oat 克隆失败**
-
-**输出**：
-```
-[OAT] tools_oat not found. Cloning...
-[OAT] [ERROR] Failed to clone tools_oat.
-[OAT] You can manually clone from: https://gitcode.com/openharmony-sig/tools_oat.git
-```
-
-**原因**：网络连接问题。
-
-**解决方案**：
-```bash
-# 方法 1：检查网络
+# 1. 检查网络与 gitcode.com 连通性
 ping gitcode.com
 
-# 方法 2：手动克隆
-cd ..
-git clone https://gitcode.com/openharmony-sig/tools_oat.git
+# 2. 重试（pre-commit 会自动重建 hook 环境）
+pre-commit run oat-check --files README.md
 
-# 方法 3：配置代理
-git config --global http.proxy http://proxy.example.com:8080
-
-# 方法 4：从团队成员复制
-# 让已克隆的同事打包 tools_oat 文件夹给你
+# 3. 确需临时绕过
+git commit --no-verify
 ```
 
----
+**2) OAT 扫描执行失败**
 
-**8) OAT 扫描执行失败**
-
-**场景**：OAT JAR 运行失败。
+**场景**：hook 运行过程中发生内部错误。
 
 **输出**：
 ```
-====================================================================
-  OAT 扫描执行失败
-====================================================================
-
-[OAT] 扫描失败，跳过 OAT 检查
-
-可能原因：
-  1. JAR 文件损坏
-  2. Java 版本不兼容
-  3. OAT 配置问题
-
-建议解决方案：
-  1. 删除并重新打包 JAR：
-     rm ../tools_oat/target/ohos_ossaudittool-*.jar
-     cd ../tools_oat && mvn clean package -DskipTests
-
-  2. 检查 Java 版本（需要 Java 8+）：
-     java -version
-
-[OAT] 继续提交（未进行合规性检查）...
-[OAT] 建议修复扫描问题后运行: pre-commit run oat-check
+[OAT] [ERROR] OAT scan failed: <错误信息>
 ```
 
-**行为**：**跳过检查，允许提交**
+**行为**：hook 返回失败，提交被阻止。
 
 **解决方案**：
 ```bash
-# 步骤 1：删除旧 JAR
-rm ../tools_oat/target/ohos_ossaudittool-*.jar
+# 重试，确认是否为偶发问题
+pre-commit run oat-check --files <文件>
 
-# 步骤 2：重新打包
-cd ../tools_oat
-mvn clean package -DskipTests
-
-# 步骤 3：验证 JAR
-ls -lh target/ohos_ossaudittool-*.jar
-
-# 步骤 4：运行检查
-cd -
-pre-commit run oat-check
+# 若持续失败，可到 hook 仓库反馈：
+# https://gitcode.com/HiAgent/compliance
 ```
