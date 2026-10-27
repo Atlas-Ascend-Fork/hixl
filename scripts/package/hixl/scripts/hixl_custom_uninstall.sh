@@ -9,7 +9,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------
 
-curpath=$(dirname $(readlink -f "$0"))
+curpath=$(dirname "$(readlink -f "$0")")
 unset PYTHONPATH
 
 common_parse_dir=""
@@ -91,8 +91,9 @@ remove_stub_softlink() {
         return
     fi
     local pwdbak="$(pwd)"
-    cd $stub_dir && chmod u+w . && ls -1 "$ref_dir" | xargs --no-run-if-empty rm -rf
-    cd $pwdbak
+    cd "$stub_dir" && chmod u+w . && \
+        find -L "$ref_dir" -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%f\0' | xargs -0 --no-run-if-empty rm -rf --
+    cd "$pwdbak"
 }
 
 recreate_common_stub_softlink() {
@@ -102,8 +103,8 @@ recreate_common_stub_softlink() {
         return
     fi
     local pwdbak="$(pwd)"
-    cd $stub_dir && [ -f "$arch_name/libgraph.so" ] && chmod u+w . && ln -s "$arch_name/libgraph.so" libgraph.so
-    cd $pwdbak
+    cd "$stub_dir" && [ -f "$arch_name/libgraph.so" ] && chmod u+w . && ln -s "$arch_name/libgraph.so" libgraph.so
+    cd "$pwdbak"
 }
 
 remove_whl_residuals() {
@@ -170,8 +171,7 @@ remove_rl_soft_link() {
 remove_empty_dir() {
     local _path="${1}"
     if [ -d "${_path}" ]; then
-        local is_empty=$(ls "${_path}" | wc -l)
-        if [ "$is_empty" -ne 0 ]; then
+        if [ -n "$(find "${_path}" -mindepth 1 -print -quit 2>/dev/null)" ]; then
             log "INFO" "${_path} dir is not empty."
         else
             prev_path=$(dirname "${_path}")

@@ -10,7 +10,7 @@
 # ----------------------------------------------------------------------------
 
 sourcedir="$PWD/hixl"
-curpath=$(dirname $(readlink -f "$0"))
+curpath=$(dirname "$(readlink -f "$0")")
 common_func_path="${curpath}/common_func.inc"
 unset PYTHONPATH
 
@@ -92,10 +92,10 @@ create_stub_softlink() {
     fi
     local arch_name="$2"
     local pwdbak="$(pwd)"
-    cd $stub_dir && [ -d "$arch_name" ] && for so_file in $(find "$arch_name" -type f -o -type l); do
-        ln -sf "$so_file" "$(basename $so_file)"
+    cd "$stub_dir" && [ -d "$arch_name" ] && for so_file in $(find "$arch_name" -type f -o -type l); do
+        ln -sf "$so_file" "$(basename "$so_file")"
     done
-    cd $pwdbak
+    cd "$pwdbak"
 }
 
 hixl_install_package() {

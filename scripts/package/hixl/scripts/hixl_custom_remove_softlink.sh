@@ -48,8 +48,9 @@ remove_stub_softlink() {
         return
     fi
     local pwdbak="$(pwd)"
-    cd $stub_dir && chmod u+w . && ls -1 "$ref_dir" | xargs --no-run-if-empty rm -rf
-    cd $pwdbak
+    cd "$stub_dir" && chmod u+w . && \
+        find -L "$ref_dir" -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%f\0' | xargs -0 --no-run-if-empty rm -rf --
+    cd "$pwdbak"
 }
 
 recreate_common_stub_softlink() {
@@ -59,19 +60,22 @@ recreate_common_stub_softlink() {
         return
     fi
     local pwdbak="$(pwd)"
-    cd $stub_dir && [ -L "$arch_name/libgraph.so" ] && chmod u+w . && ln -s "$arch_name/libgraph.so" libgraph.so
-    cd $pwdbak
+    cd "$stub_dir" && [ -L "$arch_name/libgraph.so" ] && chmod u+w . && ln -s "$arch_name/libgraph.so" libgraph.so
+    cd "$pwdbak"
 }
 
 remove_softlink() {
-    rm -rf $WHL_SOFTLINK_INSTALL_DIR_PATH/$1 > /dev/null 2>&1
+    local _entry
+    for _entry in "${WHL_SOFTLINK_INSTALL_DIR_PATH}"/$1; do
+        [ -e "$_entry" ] || [ -L "$_entry" ] || continue
+        rm -rf "$_entry" > /dev/null 2>&1
+    done
 }
 
 remove_empty_dir() {
     local _path="${1}"
     if [ -d "${_path}" ]; then
-        local is_empty=$(ls "${_path}" | wc -l)
-        if [ "$is_empty" -eq 0 ]; then
+        if [ -z "$(find "${_path}" -mindepth 1 -print -quit 2>/dev/null)" ]; then
             prev_path=$(dirname "${_path}")
             chmod +w "${prev_path}" > /dev/null 2>&1
             rm -rf "${_path}" > /dev/null 2>&1
@@ -87,6 +91,10 @@ python_dir_chmod_set() {
     chmod u+w "$dir" > /dev/null 2>&1
 }
 
+if [ -z "$install_path" ] || [ -z "$latest_dir" ]; then
+    echo "[ERROR] hixl_custom_remove_softlink: --install-path/--latest-dir is required" >&2
+    exit 1
+fi
 WHL_SOFTLINK_INSTALL_DIR_PATH="$install_path/$latest_dir/python/site-packages"
 
 python_dir_chmod_set "$WHL_SOFTLINK_INSTALL_DIR_PATH"
