@@ -277,6 +277,16 @@ class Bar {
 
 ##### Rule 5.2 Avoid using global variables; use the singleton pattern with caution and avoid abuse
 
+**[Singletons must not be implemented inline in header files]**
+
+Implementing a singleton inline in a header file (e.g., writing `static X &GetInstance() { static X instance; return instance; }` directly in a .h) has the following problems:
+
+- Every .cc file (translation unit) that includes the header generates a local copy of the function; copies within the same link module (executable or a single .so) are merged by the linker and do not create multiple instances, but they add compilation and linking overhead.
+- The core hazard of multiple instances lies across .so boundaries: each .so holds its own copy of the function and its static local variable (the linker never merges across .so files), and whether they are unified at runtime depends on symbol visibility and loading (with default visibility they usually resolve to the first-loaded copy, while hidden visibility, RTLD_LOCAL, -Bsymbolic, etc. keep them separate), so the C++ standard guarantee that "a static local variable is initialized only once within a program" may be broken.
+- Coredumps may occur due to dlopen load ordering.
+
+Correct approach: declare only `static X &GetInstance();` in the header file, and put the implementation in the corresponding .cc file.
+
 ##### Rule 5.3 Do not reference a variable again within an expression that contains its own increment or decrement operation
 
 ##### Rule 5.4 Pointer variables pointing to resource handles or descriptors must be assigned a new value or set to NULL immediately after the resource is released

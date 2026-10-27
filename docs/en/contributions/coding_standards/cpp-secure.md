@@ -20,7 +20,8 @@
 | 3.6 | String storage must have sufficient space | Memory Safety | High |
 | 4.1 | Validate external input legitimacy | Input Validation | High |
 | 4.2 | Validate memory operation length | Input Validation | High |
-| 5.1 | Check whether resource allocation succeeded | Resource Management | High |
+| 4.3 | Memory validity for copy and async transfer | Input Validation | High |
+| 5.1 | Check allocation success; validate size before allocation | Resource Management | High |
 | 5.2 | Resource leak protection | Resource Management | High |
 | 5.3 | Use new/delete in matching pairs | Resource Management | High |
 | 5.4 | Custom new/delete must be defined in pairs | Resource Management | Medium |
@@ -53,6 +54,8 @@
 | 11.3 | LOG API parameter types must match format specifiers | LOG API Safety | High |
 | 11.4 | LOG API must not be passed pointers to released memory | LOG API Safety | High |
 | 11.5 | LOG message English should be grammatically correct and clear | LOG API Specification | Low |
+| 12.1 | Do not hardcode sensitive information or use sensitive words | Sensitive Information | High |
+| 12.2 | Do not use non-open RTS interfaces | Interface Usage | High |
 
 ---
 
@@ -402,27 +405,44 @@ HIXL_CHK_BOOL_RET_STATUS(pointer != nullptr, INVALID_PARAM, "%s should not be nu
 **[Description]**
 Copying data into memory whose capacity is insufficient to hold the data causes a buffer overflow. The size of the data to be copied must be limited based on the target capacity, or the target capacity must be ensured to be large enough to hold the data to be copied.
 
+#### 4.3 Copy and async transfer interfaces must ensure memory validity, and the length must be validated to be greater than 0 before copying
+
+**[Description]**
+
+`aclrtMemcpy` performs the copy immediately; you must ensure the memory being operated on is valid at the time of the call. `aclrtMemcpyAsync` returns immediately after being submitted to the specified stream and is scheduled with a delay; you must ensure the memory being operated on is still valid when the task is actually scheduled for execution.
+
+- **Memory lifetime of async copies**: After an async copy is submitted, the source/destination memory (including host-side buffers) must remain valid until the stream is synchronized or the task completes. Releasing or reusing it early causes undefined behavior. A typical HIXL scenario is the async copy-back of completion flags (e.g., the D2H copy of `host_flag`); the host buffer must not be released before the stream is synchronized.
+- **Host memory lifetime for async H2D**: An async H2D copy returns immediately after submission. If the host memory is released right away, undefined behavior occurs when the copy actually executes. If the caller needs to release host memory immediately after submission, confirm that the copy configuration in use has host memory relay (h2h copy) semantics and understand its applicable restrictions (such interface variants may have size or scenario limits); when this cannot be confirmed, use the synchronous interface, or synchronize the stream before releasing the host memory.
+- **Check size > 0 before copying**: When calling a copy interface, a size of 0 usually means the source address itself is nullptr, and the RTS interface reports an error. The length must be validated to be greater than 0 before issuing the copy.
+- **Cross-component resource lifetime constraints**: When calling interfaces provided by other components (such as aclrt, hcomm/HCCL) that hold pointers or resources passed in by HIXL, the lifetime or release timing constraints must be clarified. For example, host memory registered via `aclrtHostRegister` must not be released before `aclrtHostUnregister`. Such constraints should be clarified with the relevant components at the design stage, and the releasing party should be documented in interface comments.
+
 ---
 
 ### 5. Resource Management
 
-#### 5.1 After resource allocation, you must check whether it succeeded
+#### 5.1 After resource allocation, you must check whether it succeeded; the size must be validated before allocation
 
 **[Description]**
 If the allocation of resources such as memory, objects, streams, and notify fails, subsequent operations carry the risk of undefined behavior.
 
+The size of a memory allocation may come from external data and must be validated for legitimacy (e.g., upper-bound validation) to prevent excessive or illegal memory allocation that leads to OOM/DoS; zero-length memory must not be allocated.
+
 **[Correct Code Example]**
 
 ```cpp
-struct tm *MakeTm(int year, int mon, int day, int hour, int min, int sec) {
-  struct tm *tmb = static_cast<struct tm *>(malloc(sizeof(*tmb)));
-  if (tmb == nullptr) {
+int32_t ProcessData(size_t size) {
+  if (size == 0 || size > kMaxBufferSize) {  // validate size before allocation
     ...  // error handling: log the error and return
-    return nullptr;
+    return -1;
   }
-  tmb->tm_year = year;
-  ...
-  return tmb;
+  char *buffer = static_cast<char *>(malloc(size));
+  if (buffer == nullptr) {  // check whether allocation succeeded
+    ...  // error handling: log the error and return
+    return -1;
+  }
+  ...  // business processing with buffer
+  free(buffer);
+  return 0;
 }
 ```
 
@@ -434,6 +454,29 @@ struct tm *MakeTm(int year, int mon, int day, int hour, int min, int sec) {
 - Before releasing struct/class/array/various data container pointers, member pointers must be released first
 - External interfaces that allocate resources but do not release them cause resource leaks, leading to denial of service
 - When C++ catches exceptions, ensure program consistency is restored; the RAII pattern is recommended to ensure resources are automatically released when an exception occurs
+
+**[Allocation/Release Interfaces Must Be Used in Matching Pairs]**
+
+When releasing memory or resources, you must use the release interface paired with the allocation interface. Cross-interface release is prohibited; otherwise it causes memory leaks, illegal frees (bad free), or even process crashes. Common pairing combinations in HIXL:
+
+| Allocation Interface | Release Interface |
+|---------|---------|
+| `malloc` | `free` |
+| `new` | `delete` |
+| `new[]` | `delete[]` |
+| `aclrtMalloc` | `aclrtFree` |
+| `aclrtMallocHost` | `aclrtFreeHost` |
+| `aclrtHostRegister` | `aclrtHostUnregister` |
+| `aclrtCreateStream` | `aclrtDestroyStream` |
+| `aclrtCreateNotify` | `aclrtDestroyNotify` |
+| `HcommMemReg` | `HcommMemUnreg` |
+
+Notes:
+
+- Interfaces within the same family must not be mixed either: allocation and release of device memory and host memory must correspond one-to-one (e.g., memory allocated by `aclrtMallocHost` must not be released with `aclrtFree`, and `new[]` must be released with `delete[]`).
+- Memory allocated through an allocator/memory pool must go through the corresponding recycle path. Releasing it directly with low-level interfaces such as `aclrtFree` is prohibited; otherwise the accounting of the upper-layer memory pool is broken, causing memory leaks or double frees.
+- Memory managed by containers/smart pointers (`std::vector`, `std::unique_ptr`, etc.) must not be released manually.
+- If the release of a resource is borne by another component, the releasing party must be clarified at the interface (see the cross-component lifetime constraints in rule 4.3).
 
 #### 5.3 Use new and delete in matching pairs; use new[] and delete[] in matching pairs
 
@@ -572,6 +615,26 @@ The following scenarios may skip the return value check if secure functions are 
 
 
 #### 10.2 Do not save the pointers returned by the `c_str` and `data` member functions of std::string
+
+**[Description]**
+
+After saving internal data pointers of containers such as `std::string::c_str()/data()`, `std::vector::data()`, or addresses of `std::map` elements, once the container is reallocated, inserted into, assigned, moved, or destructed (including going out of scope), the pointer becomes invalid; continuing to use it is a wild pointer with undefined behavior (possibly reading random data, overwriting other memory, or crashing). When content needs to be retained long-term, use value semantics: store `std::string` by value, copy `std::vector` (or hold it with `shared_ptr`); do not save `data()`/`c_str()` pointers, and never return pointers/references to local objects or local container elements.
+
+**[Common False Positives]**
+
+In the following scenarios the pointer is actually valid and must not be marked as FAIL during review:
+
+| Scenario | Reason |
+|------|------|
+| Saving `c_str()`/`data()` of a static/global const `std::string` (including function-local `static const std::string`) | The object has static storage duration, its lifetime is program-level, it is never reallocated or destructed, and the pointer remains valid long-term |
+| Saving a string literal pointer (e.g., `const char *p = "abc";`, `static const char kName[] = "x";`) | Literals have static storage duration and remain valid throughout program execution |
+| A raw pointer obtained from smart pointer `get()`, used within the lifetime of its object (same scope, not yet `reset`/`release`d) | The object has not been destroyed and the pointer is valid |
+| A container data pointer used only within the same expression or a synchronous call, with the container unmodified in between (e.g., `f(v.data(), v.size())`, synchronous `aclrtMemcpy`) | No reallocation or destruction occurs, and the pointer is valid at that point |
+
+> Note:
+> - **Local `const` variables are not exempt** — e.g., `const std::string s = "..."; s.c_str()` becomes invalid as soon as the scope ends.
+> - **The validity of static/global constants (including string literals) is premised on the .so they reside in not being unloaded**: after a .so is dynamically unloaded, its static storage is reclaimed and previously saved pointers become wild pointers. When passing such pointers across .so boundaries or retaining them long-term, the .so must remain loaded during use.
+> - Pointers passed to async interfaces (e.g., `aclrtMemcpyAsync`) must still be valid when actually scheduled for execution (see rule 4.3).
 
 #### 10.3 Avoid using atoi, atol, atoll, and atof functions
 
@@ -776,3 +839,22 @@ HIXL_LOGD("Not support BN2S2.");  // → BN2S2 is not supported
 ```
 
 > **Review Level**: Mark as SUSPICIOUS only, do not mark as FAIL.
+
+---
+
+### 12. Sensitive Information and Interface Usage Red Lines
+
+#### 12.1 Do not hardcode sensitive information or use sensitive words
+
+**[Description]**
+
+1. Hardcoding high-sensitivity data such as plaintext passwords, keys, and tokens in source code is prohibited.
+2. Leftover deprecated accounts and passwords from historical remediation must not exist. In subsequent code delivery (such as open-source audits and security certifications), such leftovers may be questioned by customers as hidden backdoor accounts, which is high risk; they must be fully investigated and thoroughly cleaned up.
+3. Avoid large arrays with unclear purposes or ambiguous data definitions, or code with poor readability; such code is easily suspected of containing hidden backdoors.
+4. Hardcoding public IP addresses, domains, email addresses, or sensitive words that easily raise doubts (such as backdoor) in code or configuration is prohibited. Hardcoded public addresses raise suspicion of illegally collecting and reporting customer data, implying a backdoor; in particular, IP addresses pointing to Huawei or China must not be included. Any genuinely required introduction must be investigated one by one and confirmed to have a reasonable explanation.
+
+#### 12.2 Do not use non-open RTS interfaces
+
+**[Description]**
+
+For RTS interfaces starting with `rt`, only the open interfaces declared in `rt_external*.h` headers (such as `runtime/rt_external_stream.h`) may be used; interfaces not in these headers are prohibited and must be replaced with equivalent `aclrt` interfaces. Non-open interfaces carry no compatibility commitment and may change or be removed as versions evolve; depending on them directly leads to compilation or runtime problems after upgrades.
