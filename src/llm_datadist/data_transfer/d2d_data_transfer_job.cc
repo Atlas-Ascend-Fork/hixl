@@ -36,6 +36,16 @@ ge::Status GetSendTask(const CacheEntry &cache_entry, const TransferCacheReq &re
       (request.src_tensor_indices_size == 0U) ? cache_entry.cache_addrs.size() : src_layer_range_cache_num;
   LLM_CHK_BOOL_RET_STATUS(src_addr_num == static_cast<size_t>(dst_addr_count), ge::LLM_PARAM_INVALID,
                           "src addr count:%zu, not match received dst_addr_count:%u", src_addr_num, dst_addr_count);
+  const size_t src_tensor_start_index = static_cast<size_t>(request.src_tensor_start_index);
+  if (request.src_tensor_indices_size != 0U) {
+    const size_t src_tensor_indices_size = static_cast<size_t>(request.src_tensor_indices_size);
+    LLM_CHK_BOOL_RET_STATUS(
+        (src_tensor_start_index <= cache_entry.cache_addrs.size()) &&
+            (src_tensor_indices_size <= cache_entry.cache_addrs.size() - src_tensor_start_index),
+        ge::LLM_PARAM_INVALID,
+        "src_tensor_start_index[%u] or src_tensor_indices_size[%u] is out of range, src_cache num is[%zu]",
+        request.src_tensor_start_index, request.src_tensor_indices_size, cache_entry.cache_addrs.size());
+  }
   for (size_t i = 0UL; i < src_addr_num; ++i) {
     for (uint32_t j = 0U; j < buffer_info_count; ++j) {
       HcclOneSideOpDesc hccl_one_side_op_desc;

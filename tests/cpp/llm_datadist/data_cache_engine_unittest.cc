@@ -1332,6 +1332,27 @@ TEST_F(DataCacheEngineTest, PullCache_D2D_C2C_with_layer_range) {
   EXPECT_EQ(actual, (std::vector<int32_t>{1, 2, 3, 4}));
 }
 
+TEST_F(DataCacheEngineTest, PullCache_D2D_C2C_with_out_of_range_source_layer_range) {
+  llm::CacheDesc src_cache_desc{};
+  src_cache_desc.num_tensors = 4;
+  src_cache_desc.shape = {1, 128};
+  src_cache_desc.data_type = ge::DT_INT32;
+  src_cache_desc.placement = 1;
+
+  llm::CacheDesc dst_cache_desc = src_cache_desc;
+  dst_cache_desc.shape = {4, 128};
+
+  llm::PullCacheParam pull_cache_param{};
+  pull_cache_param.size = -1;
+  pull_cache_param.batch_index = 1;
+  pull_cache_param.src_tensor_indices = {8, 9, 10, 11};
+  pull_cache_param.dst_tensor_indices = {0, 1, 2, 3};
+
+  DataCacheEngineTestRunner test_runner(100 * 1024 * 1024, false, true);
+  test_runner.Initialize(src_cache_desc, dst_cache_desc, pull_cache_param);
+  ASSERT_EQ(test_runner.Run(pull_cache_param), ge::LLM_PARAM_INVALID);
+}
+
 TEST_F(DataCacheEngineTest, TransferCache_D2D_C2C) {
   llm::CacheDesc src_cache_desc{};
   src_cache_desc.num_tensors = 8;
