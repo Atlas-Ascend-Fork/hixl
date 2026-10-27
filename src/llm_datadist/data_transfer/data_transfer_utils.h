@@ -11,6 +11,8 @@
 #ifndef CANN_GRAPH_ENGINE_RUNTIME_LLM_ENGINE_DATA_TRANSFER_DATA_TRANSFER_UTILS_H_
 #define CANN_GRAPH_ENGINE_RUNTIME_LLM_ENGINE_DATA_TRANSFER_DATA_TRANSFER_UTILS_H_
 
+#include <list>
+
 #include "ge_common/ge_api_error_codes.h"
 #include "link_mgr/comm_entity.h"
 
@@ -20,7 +22,7 @@ class DataTransferUtils {
   static ge::Status QueryEventStatus(const aclrtEvent &event, aclrtEventRecordedStatus &status);
   static ge::Status SendCache(const aclrtStream stream, CommEntity &comm_entity,
                               std::list<HcclOneSideOpDesc> &transfer_tasks, aclrtEvent &event);
-  static ge::Status SendBatchCache(const aclrtStream stream, const std::vector<HcclOneSideOpDesc> &desces,
+  static ge::Status SendBatchCache(const aclrtStream stream, std::list<HcclOneSideOpDesc> &transfer_tasks,
                                    CommEntity &comm_entity);
 };
 }  // namespace llm

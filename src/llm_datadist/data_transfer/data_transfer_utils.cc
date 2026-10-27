@@ -10,23 +10,30 @@
 
 #include "data_transfer/data_transfer_utils.h"
 
+#include <algorithm>
+#include <iterator>
+
 namespace llm {
 namespace {
 constexpr uint32_t kMaxTaskNum = 1024U;
 constexpr uint64_t kMaxBatchPutNum = 64U;
 }  // namespace
 
-ge::Status DataTransferUtils::SendBatchCache(const aclrtStream stream, const std::vector<HcclOneSideOpDesc> &desces,
+ge::Status DataTransferUtils::SendBatchCache(const aclrtStream stream, std::list<HcclOneSideOpDesc> &transfer_tasks,
                                              CommEntity &comm_entity) {
-  size_t start = 0U;
-  while (start < desces.size()) {
-    size_t end = std::min(start + kMaxBatchPutNum, desces.size());
-    std::vector<HcclOneSideOpDesc> batch(desces.begin() + start, desces.begin() + end);
+  size_t submitted = 0U;
+  while (submitted < kMaxTaskNum && !transfer_tasks.empty()) {
+    const size_t batch_size =
+        std::min(static_cast<size_t>(kMaxBatchPutNum), static_cast<size_t>(kMaxTaskNum) - submitted);
+    auto batch_end = transfer_tasks.begin();
+    std::advance(batch_end, std::min(batch_size, transfer_tasks.size()));
+    std::vector<HcclOneSideOpDesc> batch(transfer_tasks.begin(), batch_end);
     LLM_CHK_STATUS_RET(comm_entity.BatchPutAsync(batch, stream),
                        "put cache data to remote cluster[%lu] failed, data num:%zu", comm_entity.GetClusterId(),
                        batch.size());
     LLMLOGI("comm entity:%s successfully batched cache, cache size:%zu", comm_entity.GetDesc().c_str(), batch.size());
-    start = end;
+    transfer_tasks.erase(transfer_tasks.begin(), batch_end);
+    submitted += batch.size();
   }
   return ge::SUCCESS;
 }
@@ -34,24 +41,16 @@ ge::Status DataTransferUtils::SendBatchCache(const aclrtStream stream, const std
 ge::Status DataTransferUtils::SendCache(const aclrtStream stream, CommEntity &comm_entity,
                                         std::list<HcclOneSideOpDesc> &transfer_tasks, aclrtEvent &event) {
   auto &send_statistic_info = comm_entity.GetSendStatisticInfo(stream);
-  std::vector<HcclOneSideOpDesc> desces;
-  while (desces.size() < kMaxTaskNum) {
-    if (transfer_tasks.empty()) {
-      break;
-    }
-    HcclOneSideOpDesc send_task = transfer_tasks.front();
-    transfer_tasks.pop_front();
-    desces.emplace_back(send_task);
-  }
+  const size_t task_num = std::min(static_cast<size_t>(kMaxTaskNum), transfer_tasks.size());
   LLMLOGI("comm entity:%s begin send cache, cache size:%zu, send_task size:%zu", comm_entity.GetDesc().c_str(),
-          desces.size(), transfer_tasks.size());
-  LLM_CHK_STATUS_RET(SendBatchCache(stream, desces, comm_entity),
+          task_num, transfer_tasks.size());
+  LLM_CHK_STATUS_RET(SendBatchCache(stream, transfer_tasks, comm_entity),
                      "comm_entity:%s put batch cache data to remote cluster[%lu] failed, data num:%zu",
-                     comm_entity.GetDesc().c_str(), comm_entity.GetClusterId(), desces.size());
+                     comm_entity.GetDesc().c_str(), comm_entity.GetClusterId(), task_num);
 
-  if ((transfer_tasks.empty() || desces.size() == kMaxTaskNum) && event == nullptr) {
+  if ((transfer_tasks.empty() || task_num == kMaxTaskNum) && event == nullptr) {
     LLMLOGI("transfer tasks[%zu] are empty or task num[%zu] reached %zu, create event and record",
-            transfer_tasks.size(), desces.size(), static_cast<size_t>(kMaxTaskNum));
+            transfer_tasks.size(), task_num, static_cast<size_t>(kMaxTaskNum));
     const auto start = std::chrono::steady_clock::now();
     LLM_CHK_ACL_RET(aclrtCreateEvent(&event));
     const aclError record_ret = aclrtRecordEvent(event, stream);
