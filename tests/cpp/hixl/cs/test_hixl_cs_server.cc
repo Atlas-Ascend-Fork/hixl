@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <atomic>
 #include <memory>
+#include <future>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -24,6 +25,9 @@
 #include <unistd.h>
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+
+#include "depends/ctrl_msg_test_helper.h"
+
 #include "cs/hixl_cs.h"
 #include "hixl/hixl_types.h"
 #include "common/ctrl_msg.h"
@@ -56,7 +60,6 @@ static constexpr uint32_t kRecvTimeoutMs = 1000U;
 static constexpr uint32_t kTimeSleepMs = 10U;
 static constexpr uint32_t kCaptureLogTimeoutMs = 1000U;
 static constexpr uint32_t kLockWaitTimeoutMs = 1000U;
-static constexpr int32_t kStubClientFd = 9999;
 static constexpr uint64_t kRuntimeNotifyAddr = 0x88888888ULL;
 static constexpr int32_t kNum1 = 1;
 static constexpr int32_t kNum2 = 2;
@@ -65,10 +68,42 @@ static std::vector<int32_t> kHostMems(kMemNum, kNum1);
 static std::vector<int32_t> kDeviceMems(kMemNum, kNum2);
 
 static constexpr int32_t kCtrlMsgType = 1024;
-class HixlCSTest : public ::testing::Test {
+
+class ContextCheckingChannel : public Channel {
+ public:
+  explicit ContextCheckingChannel(aclrtContext context) : context_(context) {}
+  std::promise<void> destroyed;
+
+  HcclResult ChannelCreate(EndpointHandle, CommEngine, HcommChannelDesc &, ChannelHandle &handle) override {
+    handle = 1UL;
+    return HCCL_SUCCESS;
+  }
+
+  HcclResult ChannelDestroy() override {
+    aclrtContext current = nullptr;
+    EXPECT_EQ(aclrtGetCurrentContext(&current), ACL_SUCCESS);
+    EXPECT_EQ(current, context_);
+    destroyed.set_value();
+    return current == context_ ? HCCL_SUCCESS : HCCL_E_INTERNAL;
+  }
+
+  HcclResult ChannelGetStatus(int32_t &status) const override {
+    status = 0;
+    return HCCL_SUCCESS;
+  }
+
+ private:
+  aclrtContext context_;
+};
+
+class HixlCSTest : public hixl::test::PlainTlsTest {
+ protected:
+  CtrlMsgPluginPtr stub_connection_ = test::Connection(-1);
+
  protected:
   // 在测试类中设置一些准备工作，如果需要的话
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     ResetHcommVersionStub();
     ResetChannelDescRecord();
     EndpointDesc ep0{};
@@ -107,11 +142,11 @@ class HixlCSTest : public ::testing::Test {
     CtrlMsgType msg_type = CtrlMsgType::kMatchEndpointReq;
     MatchEndpointReq body{};
     body.dst = default_eps[1];
-    auto ret = CtrlMsgPlugin::Send(client_fd, &header, static_cast<uint64_t>(sizeof(header)));
+    auto ret = test::Connection(client_fd)->Send(&header, static_cast<uint64_t>(sizeof(header)));
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Send(client_fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)));
+    ret = test::Connection(client_fd)->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)));
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Send(client_fd, &body, static_cast<uint64_t>(sizeof(body)));
+    ret = test::Connection(client_fd)->Send(&body, static_cast<uint64_t>(sizeof(body)));
     EXPECT_EQ(ret, SUCCESS);
   }
 
@@ -119,15 +154,16 @@ class HixlCSTest : public ::testing::Test {
     CtrlMsgHeader recv_header{};
     const uint64_t expect_body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(MatchEndpointResp));
     recv_header.body_size = expect_body_size;
-    auto ret = CtrlMsgPlugin::Recv(client_fd, &recv_header, static_cast<uint64_t>(sizeof(recv_header)), kRecvTimeoutMs);
+    auto ret =
+        test::Connection(client_fd)->Recv(&recv_header, static_cast<uint64_t>(sizeof(recv_header)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
     EXPECT_EQ(recv_header.magic, kMagicNumber);
     EXPECT_EQ(recv_header.body_size, expect_body_size);
     CtrlMsgType resp_type{};
-    ret = CtrlMsgPlugin::Recv(client_fd, &resp_type, static_cast<uint64_t>(sizeof(resp_type)), kRecvTimeoutMs);
+    ret = test::Connection(client_fd)->Recv(&resp_type, static_cast<uint64_t>(sizeof(resp_type)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
     EXPECT_EQ(resp_type, CtrlMsgType::kMatchEndpointResp);
-    ret = CtrlMsgPlugin::Recv(client_fd, &resp_body, static_cast<uint64_t>(sizeof(resp_body)), kRecvTimeoutMs);
+    ret = test::Connection(client_fd)->Recv(&resp_body, static_cast<uint64_t>(sizeof(resp_body)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
   }
 
@@ -148,7 +184,7 @@ class HixlCSTest : public ::testing::Test {
     EXPECT_EQ(ret, SUCCESS);
     ret = HixlCSServerListen(server_handle, kBackLog);
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1);
+    ret = test::Connect("127.0.0.1", kPort, client_fd, 1);
     EXPECT_EQ(ret, SUCCESS);
     SendMatchEndpointReq(client_fd);
   }
@@ -163,11 +199,11 @@ class HixlCSTest : public ::testing::Test {
     body.dst_ep_handle = dst_ep_handle;
     body.channel_index = channel_index;
     body.qos = qos;
-    auto ret = CtrlMsgPlugin::Send(client_fd, &header, static_cast<uint64_t>(sizeof(header)));
+    auto ret = test::Connection(client_fd)->Send(&header, static_cast<uint64_t>(sizeof(header)));
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Send(client_fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)));
+    ret = test::Connection(client_fd)->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)));
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Send(client_fd, &body, static_cast<uint64_t>(sizeof(body)));
+    ret = test::Connection(client_fd)->Send(&body, static_cast<uint64_t>(sizeof(body)));
     EXPECT_EQ(ret, SUCCESS);
   }
 
@@ -175,15 +211,16 @@ class HixlCSTest : public ::testing::Test {
     CtrlMsgHeader recv_header{};
     const uint64_t expect_body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(CreateChannelResp));
     recv_header.body_size = expect_body_size;
-    auto ret = CtrlMsgPlugin::Recv(client_fd, &recv_header, static_cast<uint64_t>(sizeof(recv_header)), kRecvTimeoutMs);
+    auto ret =
+        test::Connection(client_fd)->Recv(&recv_header, static_cast<uint64_t>(sizeof(recv_header)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
     EXPECT_EQ(recv_header.magic, kMagicNumber);
     EXPECT_EQ(recv_header.body_size, expect_body_size);
     CtrlMsgType resp_type{};
-    ret = CtrlMsgPlugin::Recv(client_fd, &resp_type, static_cast<uint64_t>(sizeof(resp_type)), kRecvTimeoutMs);
+    ret = test::Connection(client_fd)->Recv(&resp_type, static_cast<uint64_t>(sizeof(resp_type)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
     EXPECT_EQ(resp_type, CtrlMsgType::kCreateChannelResp);
-    ret = CtrlMsgPlugin::Recv(client_fd, &resp_body, static_cast<uint64_t>(sizeof(resp_body)), kRecvTimeoutMs);
+    ret = test::Connection(client_fd)->Recv(&resp_body, static_cast<uint64_t>(sizeof(resp_body)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
   }
 
@@ -194,12 +231,13 @@ class HixlCSTest : public ::testing::Test {
 
   void RecvGetRemoteMemRespDrain(int32_t client_fd) {
     CtrlMsgHeader recv_header{};
-    auto ret = CtrlMsgPlugin::Recv(client_fd, &recv_header, static_cast<uint64_t>(sizeof(recv_header)), kRecvTimeoutMs);
+    auto ret =
+        test::Connection(client_fd)->Recv(&recv_header, static_cast<uint64_t>(sizeof(recv_header)), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
     EXPECT_EQ(recv_header.magic, kMagicNumber);
     EXPECT_GT(recv_header.body_size, static_cast<uint64_t>(sizeof(CtrlMsgType)));
     std::vector<uint8_t> body(static_cast<size_t>(recv_header.body_size));
-    ret = CtrlMsgPlugin::Recv(client_fd, body.data(), static_cast<uint64_t>(body.size()), kRecvTimeoutMs);
+    ret = test::Connection(client_fd)->Recv(body.data(), static_cast<uint64_t>(body.size()), kRecvTimeoutMs);
     EXPECT_EQ(ret, SUCCESS);
   }
 
@@ -210,14 +248,85 @@ class HixlCSTest : public ::testing::Test {
     CtrlMsgType msg_type = CtrlMsgType::kGetRemoteMemReq;
     GetRemoteMemReq body{};
     body.dst_ep_handle = dst_ep_handle;
-    auto ret = CtrlMsgPlugin::Send(client_fd, &header, static_cast<uint64_t>(sizeof(header)));
+    auto ret = test::Connection(client_fd)->Send(&header, static_cast<uint64_t>(sizeof(header)));
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Send(client_fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)));
+    ret = test::Connection(client_fd)->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)));
     EXPECT_EQ(ret, SUCCESS);
-    ret = CtrlMsgPlugin::Send(client_fd, &body, static_cast<uint64_t>(sizeof(body)));
+    ret = test::Connection(client_fd)->Send(&body, static_cast<uint64_t>(sizeof(body)));
     EXPECT_EQ(ret, SUCCESS);
   }
+
+  void CheckCleanupClientContext(aclrtContext previous, bool device_endpoint) {
+    HixlServerConfig config{};
+    HixlServerDesc desc{};
+    desc.server_ip = "127.0.0.1";
+    desc.endpoint_list = &default_eps[device_endpoint ? 2U : 0U];
+    desc.endpoint_list_num = 1U;
+    HixlServerHandle handle = nullptr;
+    ASSERT_EQ(HixlCSServerCreate(&desc, &config, &handle), SUCCESS);
+    auto *server = static_cast<HixlCSServer *>(handle);
+    auto endpoint_handle = server->endpoint_store_.GetAllEndpointHandles().front();
+    auto endpoint = server->endpoint_store_.GetEndpoint(endpoint_handle);
+    aclrtContext expected = device_endpoint ? TransferPool::GetInstance(server->device_id_)->GetContext() : previous;
+    if (!device_endpoint) {
+      ASSERT_EQ(aclrtGetCurrentContext(&expected), ACL_SUCCESS);
+    }
+    auto channel = std::make_shared<ContextCheckingChannel>(expected);
+    auto destroyed = channel->destroyed.get_future();
+    HcommChannelDesc channel_desc{};
+    ASSERT_EQ(channel->Create(*endpoint, channel_desc, CommEngine::COMM_ENGINE_CPU, kRecvTimeoutMs), SUCCESS);
+    endpoint->channels_[channel->GetHandle()] = channel;
+    auto connection = test::Connection(-1);
+    server->channels_[connection] = {endpoint_handle, channel->GetHandle()};
+    server->clients_[connection->Fd()] = std::make_shared<MsgReceiver>(connection);
+
+    std::thread worker([&]() {
+      llm::AclRuntimeStub runtime;
+      (void)runtime.aclrtSetCurrentContext(previous);
+      llm::AclRuntimeStub::Install(&runtime);
+      server->CleanupClient(connection);
+      aclrtContext current = nullptr;
+      EXPECT_EQ(aclrtGetCurrentContext(&current), ACL_SUCCESS);
+      EXPECT_EQ(current, previous);
+      llm::AclRuntimeStub::UnInstall(&runtime);
+    });
+    worker.join();
+    EXPECT_EQ(destroyed.wait_for(std::chrono::milliseconds(kRecvTimeoutMs)), std::future_status::ready);
+    server->msg_handler_.Finalize();
+
+    EXPECT_TRUE(server->clients_.empty());
+    EXPECT_TRUE(server->channels_.empty());
+    EXPECT_TRUE(endpoint->channels_.empty());
+    EXPECT_EQ(HixlCSServerDestroy(handle), SUCCESS);
+  }
 };
+
+TEST_F(HixlCSTest, PlainPendingMessagesDoNotWaitForClientTable) {
+  HixlCSServer server("127.0.0.1", 0U, GlobalConfig{});
+  server.clients_.emplace(-1, std::make_shared<MsgReceiver>(stub_connection_));
+  std::unique_lock<std::mutex> lock(server.client_mutex_);
+  auto processed = std::async(std::launch::async, [&server]() { return server.ProcessPendingMsg(); });
+  const auto status = processed.wait_for(std::chrono::milliseconds(kLockWaitTimeoutMs));
+  lock.unlock();
+  EXPECT_EQ(status, std::future_status::ready);
+  EXPECT_FALSE(processed.get());
+  EXPECT_EQ(server.clients_.size(), 1U);
+}
+
+TEST_F(HixlCSTest, InitializeRejectsDuplicateBuiltinProcessor) {
+  for (const auto type : {CtrlMsgType::kMatchEndpointReq, CtrlMsgType::kCreateChannelReq, CtrlMsgType::kGetRemoteMemReq,
+                          CtrlMsgType::kDestroyChannelReq}) {
+    SCOPED_TRACE(static_cast<int32_t>(type));
+    HixlCSServer server("127.0.0.1", 0U, GlobalConfig{});
+    HIXL_MAKE_GUARD(finalize, ([&server]() { (void)server.Finalize(); }));
+    ASSERT_EQ(server.RegProc(type, [](const CtrlMsgPluginPtr &, const char *, uint64_t) { return SUCCESS; }), SUCCESS);
+
+    EXPECT_EQ(server.Initialize(default_eps.data(), 1U), PARAM_INVALID);
+    EXPECT_TRUE(server.endpoint_store_.GetAllEndpointHandles().empty());
+    EXPECT_EQ(server.listener_connection_, nullptr);
+    EXPECT_FALSE(server.msg_handler_.running_.load());
+  }
+}
 
 TEST_F(HixlCSTest, TestHixlCSServer) {
   HixlServerConfig config{};
@@ -229,8 +338,8 @@ TEST_F(HixlCSTest, TestHixlCSServer) {
   desc.endpoint_list_num = default_eps.size();
   auto ret = HixlCSServerCreate(&desc, &config, &server_handle);
   EXPECT_EQ(ret, SUCCESS);
-  auto proc = [](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-    (void)fd;
+  auto proc = [](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+    (void)connection;
     (void)msg;
     (void)msg_len;
     return 0;
@@ -276,12 +385,12 @@ TEST_F(HixlCSTest, RepeatedListenPreservesSocketAndDoesNotCloseOtherFd) {
                   }));
   ASSERT_EQ(HixlCSServerListen(server_handle, kBackLog), SUCCESS);
   auto *server = static_cast<HixlCSServer *>(server_handle);
-  const int32_t listen_fd = server->listen_fd_;
+  const int32_t listen_fd = server->listener_connection_->Fd();
 
   EXPECT_EQ(HixlCSServerListen(server_handle, kBackLog), HIXL_FAILED);
-  EXPECT_EQ(server->listen_fd_, listen_fd);
+  EXPECT_EQ(server->listener_connection_->Fd(), listen_fd);
   int32_t client_fd = -1;
-  ASSERT_EQ(CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1), SUCCESS);
+  ASSERT_EQ(test::Connect("127.0.0.1", kPort, client_fd, 1), SUCCESS);
   (void)close(client_fd);
 
   const int32_t probe_fd = open("/dev/null", O_RDONLY);
@@ -291,15 +400,15 @@ TEST_F(HixlCSTest, RepeatedListenPreservesSocketAndDoesNotCloseOtherFd) {
   server_handle = nullptr;
   EXPECT_NE(fcntl(probe_fd, F_GETFD), -1);
 
-  int32_t rebound_fd = -1;
-  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", kPort, kBackLog, rebound_fd), SUCCESS);
-  HIXL_MAKE_GUARD(close_rebound, ([rebound_fd]() { (void)close(rebound_fd); }));
+  CtrlMsgPlugin rebound;
+  ASSERT_EQ(rebound.Initialize(), SUCCESS);
+  ASSERT_EQ(rebound.Listen("127.0.0.1", kPort, kBackLog), SUCCESS);
 }
 
 TEST_F(HixlCSTest, FailedInitialListenDoesNotCloseOtherFd) {
-  int32_t occupied_fd = -1;
-  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", kPort, kBackLog, occupied_fd), SUCCESS);
-  HIXL_MAKE_GUARD(close_occupied, ([occupied_fd]() { (void)close(occupied_fd); }));
+  CtrlMsgPlugin occupied;
+  ASSERT_EQ(occupied.Initialize(), SUCCESS);
+  ASSERT_EQ(occupied.Listen("127.0.0.1", kPort, kBackLog), SUCCESS);
   HixlServerConfig config{};
   HixlServerDesc desc{};
   desc.server_ip = "127.0.0.1";
@@ -314,7 +423,7 @@ TEST_F(HixlCSTest, FailedInitialListenDoesNotCloseOtherFd) {
                     }
                   }));
   EXPECT_EQ(HixlCSServerListen(server_handle, kBackLog), HIXL_FAILED);
-  EXPECT_EQ(static_cast<HixlCSServer *>(server_handle)->listen_fd_, -1);
+  EXPECT_EQ(static_cast<HixlCSServer *>(server_handle)->listener_connection_->Fd(), -1);
 
   const int32_t probe_fd = open("/dev/null", O_RDONLY);
   ASSERT_GE(probe_fd, 0);
@@ -343,13 +452,13 @@ TEST_F(HixlCSTest, FailedEpollRegistrationClosesListenSocket) {
   ASSERT_GE(server->epoll_fd_, 0);
 
   EXPECT_EQ(HixlCSServerListen(server_handle, kBackLog), HIXL_FAILED);
-  EXPECT_EQ(server->listen_fd_, -1);
+  EXPECT_EQ(server->listener_connection_->Fd(), -1);
   EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
   server_handle = nullptr;
 
-  int32_t rebound_fd = -1;
-  ASSERT_EQ(CtrlMsgPlugin::Listen("127.0.0.1", kPort, kBackLog, rebound_fd), SUCCESS);
-  HIXL_MAKE_GUARD(close_rebound, ([rebound_fd]() { (void)close(rebound_fd); }));
+  CtrlMsgPlugin rebound;
+  ASSERT_EQ(rebound.Initialize(), SUCCESS);
+  ASSERT_EQ(rebound.Listen("127.0.0.1", kPort, kBackLog), SUCCESS);
 }
 
 TEST_F(HixlCSTest, RegisterDeviceMemForUbEndpointsSkipsHostEndpoint) {
@@ -757,7 +866,7 @@ TEST_F(HixlCSTest, TestHixlCSClient2Server) {
   EXPECT_EQ(ret, SUCCESS);
 
   int32_t client_fd = -1;
-  ret = CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1);
+  ret = test::Connect("127.0.0.1", kPort, client_fd, 1);
   EXPECT_EQ(ret, SUCCESS);
   SendMatchEndpointReq(client_fd);
   MatchEndpointResp match_resp{};
@@ -795,7 +904,7 @@ TEST_F(HixlCSTest, TestHixlCSServerCreateChannelQosUnsetAccepted) {
   EXPECT_EQ(ret, SUCCESS);
 
   int32_t client_fd = -1;
-  ret = CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1);
+  ret = test::Connect("127.0.0.1", kPort, client_fd, 1);
   EXPECT_EQ(ret, SUCCESS);
   SendMatchEndpointReq(client_fd);
   MatchEndpointResp match_resp{};
@@ -825,7 +934,7 @@ TEST_F(HixlCSTest, TestHixlCSServerCreateChannelQosInvalidRejected) {
   EXPECT_EQ(ret, SUCCESS);
 
   int32_t client_fd = -1;
-  ret = CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1);
+  ret = test::Connect("127.0.0.1", kPort, client_fd, 1);
   EXPECT_EQ(ret, SUCCESS);
   SendMatchEndpointReq(client_fd);
   MatchEndpointResp match_resp{};
@@ -839,6 +948,21 @@ TEST_F(HixlCSTest, TestHixlCSServerCreateChannelQosInvalidRejected) {
   (void)close(client_fd);
   ret = HixlCSServerDestroy(server_handle);
   EXPECT_EQ(ret, SUCCESS);
+}
+
+TEST_F(HixlCSTest, CleanupClientSetsContextOnThreadWithoutDevice) {
+  CheckCleanupClientContext(nullptr, true);
+}
+
+TEST_F(HixlCSTest, CleanupClientRestoresPreviousContext) {
+  aclrtContext previous = nullptr;
+  ASSERT_EQ(aclrtCreateContext(&previous, 1), ACL_SUCCESS);
+  CheckCleanupClientContext(previous, true);
+  EXPECT_EQ(aclrtDestroyContext(previous), ACL_SUCCESS);
+}
+
+TEST_F(HixlCSTest, CleanupClientHostEndpointNeedsNoContext) {
+  CheckCleanupClientContext(nullptr, false);
 }
 
 TEST_F(HixlCSTest, TestHixlCSServerDisconnectionCleanup) {
@@ -890,7 +1014,7 @@ TEST_F(HixlCSTest, TestHixlCSServerInvalidHeaderCleanup) {
   CtrlMsgHeader invalid_header{};
   invalid_header.magic = 0U;
   invalid_header.body_size = sizeof(CtrlMsgType);
-  ASSERT_EQ(CtrlMsgPlugin::Send(client_fd, &invalid_header, static_cast<uint64_t>(sizeof(invalid_header))), SUCCESS);
+  ASSERT_EQ(test::Connection(client_fd)->Send(&invalid_header, static_cast<uint64_t>(sizeof(invalid_header))), SUCCESS);
 
   EXPECT_TRUE(log_capture->WaitForAllPatternsCaptured(kCaptureLogTimeoutMs));
   struct timeval timeout {};
@@ -914,6 +1038,7 @@ TEST_F(HixlCSTest, FinalizeClosesConnectedClientSockets) {
 
   auto *server = static_cast<HixlCSServer *>(server_handle);
   ASSERT_FALSE(server->clients_.empty());
+  EXPECT_EQ(server->clients_.begin()->first, server->clients_.begin()->second->Connection()->Fd());
   EXPECT_EQ(server->Finalize(), SUCCESS);
   EXPECT_TRUE(server->clients_.empty());
 
@@ -942,7 +1067,8 @@ TEST_F(HixlCSTest, CloseAllClientsHandlesAlreadyClosedFd) {
   int32_t closed_fd = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(closed_fd, 0);
   ASSERT_EQ(close(closed_fd), 0);
-  server->clients_[closed_fd] = std::make_shared<MsgReceiver>(closed_fd);
+  auto connection = test::Connection(-1);
+  server->clients_[connection->Fd()] = std::make_shared<MsgReceiver>(connection);
   server->CloseAllClients();
   EXPECT_TRUE(server->clients_.empty());
   EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
@@ -973,17 +1099,18 @@ TEST_F(HixlCSTest, DestroyChannelReleasesChnMutexDuringEndpointDestroy) {
   EndpointChannelInfo info{};
   info.endpoint_handle = handles[0];
   info.channel_handle = channel_handle;
-  server->channels_[kStubClientFd] = info;
+  server->channels_[stub_connection_] = info;
 
   // 持有 endpoint::mutex_ 使 Endpoint::DestroyChannel 阻塞，用于观察此刻 chn_mutex_ 是否已释放
   std::unique_lock<std::mutex> ep_lock(ep->mutex_);
   Status destroy_ret = FAILED;
-  std::thread worker([&destroy_ret, server]() { destroy_ret = server->DestroyChannel(kStubClientFd, nullptr, 0UL); });
+  std::thread worker(
+      [&destroy_ret, server, this]() { destroy_ret = server->DestroyChannel(stub_connection_, nullptr, 0UL); });
   bool entry_erased = false;
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kLockWaitTimeoutMs);
   while (std::chrono::steady_clock::now() < deadline) {
     if (server->chn_mutex_.try_lock()) {
-      entry_erased = server->channels_.find(kStubClientFd) == server->channels_.end();
+      entry_erased = server->channels_.find(stub_connection_) == server->channels_.end();
       server->chn_mutex_.unlock();
     }
     if (entry_erased) {
@@ -1019,9 +1146,9 @@ TEST_F(HixlCSTest, DestroyChannelErasesEntryWhenEndpointMissing) {
   EndpointChannelInfo info{};
   info.endpoint_handle = reinterpret_cast<EndpointHandle>(0xDEADBEEFUL);
   info.channel_handle = 0x1234UL;
-  server->channels_[kStubClientFd] = info;
+  server->channels_[stub_connection_] = info;
 
-  EXPECT_EQ(server->DestroyChannel(kStubClientFd, nullptr, 0UL), SUCCESS);
+  EXPECT_EQ(server->DestroyChannel(stub_connection_, nullptr, 0UL), SUCCESS);
   EXPECT_TRUE(server->channels_.empty());
   EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
 }
@@ -1038,7 +1165,7 @@ TEST_F(HixlCSTest, DestroyChannelUnknownFdIsNoOp) {
   ASSERT_EQ(HixlCSServerCreate(&desc, &config, &server_handle), SUCCESS);
   auto *server = static_cast<HixlCSServer *>(server_handle);
 
-  EXPECT_EQ(server->DestroyChannel(kStubClientFd, nullptr, 0UL), SUCCESS);
+  EXPECT_EQ(server->DestroyChannel(stub_connection_, nullptr, 0UL), SUCCESS);
   EXPECT_TRUE(server->channels_.empty());
   EXPECT_EQ(HixlCSServerDestroy(server_handle), SUCCESS);
 }
@@ -1071,7 +1198,7 @@ TEST_F(HixlCSTest, TestConfiguredListenPortInServerConfig) {
   EXPECT_EQ(ret, SUCCESS);
 
   int32_t client_fd = -1;
-  ret = CtrlMsgPlugin::Connect("127.0.0.1", kPort, client_fd, 1);
+  ret = test::Connect("127.0.0.1", kPort, client_fd, 1);
   EXPECT_EQ(ret, SUCCESS);
   SendMatchEndpointReq(client_fd);
   MatchEndpointResp match_resp{};
@@ -1295,7 +1422,7 @@ TEST_F(HixlCSTest, CtrlMsgPluginSendEpipe) {
   header.magic = kMagicNumber;
   header.body_size = sizeof(CtrlMsgType);
   int32_t err_no = 0;
-  Status ret = CtrlMsgPlugin::Send(fds[0], &header, sizeof(header), CtrlMsgPlugin::kDefaultCtrlTimeoutMs, err_no);
+  Status ret = test::Connection(fds[0])->Send(&header, sizeof(header), CtrlMsgPlugin::kDefaultCtrlTimeoutMs, err_no);
   EXPECT_EQ(ret, FAILED);
   EXPECT_EQ(err_no, EPIPE);
 
@@ -1341,8 +1468,8 @@ TEST_F(HixlCSTest, MsgHandlerConcurrentRegisterAndSubmit) {
   ASSERT_EQ(HixlCSServerCreate(&desc, &config, &server_handle), SUCCESS);
   auto *server = static_cast<HixlCSServer *>(server_handle);
   std::atomic<int32_t> hits{0};
-  auto proc = [&hits](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-    (void)fd;
+  auto proc = [&hits](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+    (void)connection;
     (void)msg;
     (void)msg_len;
     hits.fetch_add(1);
@@ -1358,7 +1485,7 @@ TEST_F(HixlCSTest, MsgHandlerConcurrentRegisterAndSubmit) {
     for (int32_t i = 0; i < 32; ++i) {
       auto msg = std::make_shared<CtrlMsg>();
       msg->msg_type = static_cast<CtrlMsgType>(kCtrlMsgType + (i % kExtraTypes));
-      server->msg_handler_.SubmitMsg(0, msg);
+      server->msg_handler_.SubmitMsg(test::Connection(-1), msg);
     }
   });
   registrar.join();

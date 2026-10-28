@@ -38,6 +38,7 @@ file(GLOB LLM_SRC_LIST
         "${CMAKE_CURRENT_LIST_DIR}/memory/type/*.cc"
         "${CMAKE_CURRENT_LIST_DIR}/memory/util/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/common/*.cc"
+        "${HIXL_CODE_DIR}/src/hixl/common/tls/*.cc"
         )
 
 add_library(llm_datadist SHARED ${LLM_SRC_LIST})
@@ -76,6 +77,8 @@ target_link_libraries(llm_datadist PRIVATE
         acl_rt
         runtime
         json
+        ssl_static
+        crypto_static
         -ldl
         -fPIC -Wextra -Wfloat-equal
         )

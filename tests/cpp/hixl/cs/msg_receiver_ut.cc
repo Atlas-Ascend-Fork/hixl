@@ -10,12 +10,15 @@
 
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "depends/ctrl_msg_test_helper.h"
 
 #include "common/ctrl_msg.h"
 #include "cs/msg_receiver.h"
@@ -45,11 +48,12 @@ void SendCtrlMsg(int fd, CtrlMsgType msg_type, const std::string &body) {
 }
 }  // namespace
 
-class MsgReceiverTest : public ::testing::Test {
+class MsgReceiverTest : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_), 0);
-    receiver_ = std::make_unique<MsgReceiver>(fds_[0]);
+    receiver_ = std::make_unique<MsgReceiver>(test::Connection(fds_[0]));
   }
 
   void TearDown() override {
@@ -104,6 +108,46 @@ TEST_F(MsgReceiverTest, RejectsOversizedBody) {
 
   std::vector<CtrlMsgPtr> msgs;
   EXPECT_EQ(receiver_->IRecv(msgs), PARAM_INVALID);
+  EXPECT_TRUE(msgs.empty());
+}
+
+TEST_F(MsgReceiverTest, PreservesConnectionWhenNoDataIsAvailable) {
+  const int flags = fcntl(fds_[0], F_GETFL, 0);
+  ASSERT_GE(flags, 0);
+  ASSERT_EQ(fcntl(fds_[0], F_SETFL, flags | O_NONBLOCK), 0);
+  std::vector<CtrlMsgPtr> msgs;
+  EXPECT_EQ(receiver_->IRecv(msgs), SUCCESS);
+  EXPECT_TRUE(msgs.empty());
+
+  SendCtrlMsg(fds_[1], CtrlMsgType::kGetEndpointInfoReq, "after-eagain");
+  EXPECT_EQ(receiver_->IRecv(msgs), SUCCESS);
+  ASSERT_EQ(msgs.size(), 1U);
+  EXPECT_EQ(msgs[0]->msg, "after-eagain");
+}
+
+TEST_F(MsgReceiverTest, ReportsPeerEofAsFailure) {
+  ASSERT_EQ(close(fds_[1]), 0);
+  fds_[1] = -1;
+  std::vector<CtrlMsgPtr> msgs;
+  EXPECT_EQ(receiver_->IRecv(msgs), FAILED);
+  EXPECT_TRUE(msgs.empty());
+}
+
+TEST_F(MsgReceiverTest, PropagatesConnectionFailure) {
+  ASSERT_EQ(receiver_->Connection()->Close(), SUCCESS);
+  std::vector<CtrlMsgPtr> msgs;
+  EXPECT_EQ(receiver_->IRecv(msgs), FAILED);
+  EXPECT_TRUE(msgs.empty());
+}
+
+TEST_F(MsgReceiverTest, ReportsNonRetryableSocketError) {
+  const int fd = open("/dev/null", O_RDONLY);
+  ASSERT_GE(fd, 0);
+  auto connection = CtrlMsgPluginTestAccess::Own(fd);
+  ASSERT_NE(connection, nullptr);
+  MsgReceiver receiver(connection);
+  std::vector<CtrlMsgPtr> msgs;
+  EXPECT_EQ(receiver.IRecv(msgs), FAILED);
   EXPECT_TRUE(msgs.empty());
 }
 }  // namespace hixl

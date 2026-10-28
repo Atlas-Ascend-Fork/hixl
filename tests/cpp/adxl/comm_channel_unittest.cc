@@ -15,6 +15,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "depends/ctrl_msg_test_helper.h"
+
 #include "depends/llm_datadist/src/data_cache_engine_test_helper.h"
 
 #define private public
@@ -43,9 +45,10 @@ class UnbindFailureHcclApiStub final : public llm::HcclApiStub {
   int destroy_count = 0;
 };
 
-class CommChannelFinalizeUnitTest : public ::testing::Test {
+class CommChannelFinalizeUnitTest : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     llm::MockMmpaForHcclApi::Install();
     ASSERT_EQ(llm::CommAdapter::GetInstance().Initialize(), ge::SUCCESS);
   }
@@ -66,7 +69,7 @@ TEST_F(CommChannelFinalizeUnitTest, FinalizeCleansLocalResourcesWhenUnbindFails)
   auto channel = std::make_shared<CommChannel>(channel_info);
   channel->channel_info_.comm = reinterpret_cast<HcclComm>(0x1);
   channel->channel_info_.registered_mems.emplace(reinterpret_cast<MemHandle>(0x2), nullptr);
-  channel->fd_ = socket_fds[0];
+  channel->connection_ = hixl::CtrlMsgPluginTestAccess::Own(socket_fds[0]);
   channel->with_heartbeat_.store(true, std::memory_order_release);
   channel->disconnect_flag_.store(true, std::memory_order_release);
   channel->transfer_count_.store(3, std::memory_order_release);

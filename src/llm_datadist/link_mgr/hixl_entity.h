@@ -32,7 +32,8 @@ class HixlEntity : public CommEntity {
                            int32_t timeout_ms) override;
 
  private:
-  static ge::Status RecvCacheTableResp(int32_t fd, CacheTableInfo &cache_table_info, int32_t timeout_ms);
+  static ge::Status RecvCacheTableResp(const hixl::CtrlMsgPluginPtr &connection, CacheTableInfo &cache_table_info,
+                                       int32_t timeout_ms);
 
   std::string remote_ip_;
   uint32_t remote_port_ = 0U;

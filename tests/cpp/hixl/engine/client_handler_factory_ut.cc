@@ -19,6 +19,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "depends/ctrl_msg_test_helper.h"
+
 #include "ascendcl_stub.h"
 #include "common/ctrl_msg.h"
 #include "common/ctrl_msg_plugin.h"
@@ -65,9 +67,10 @@ HandlerCreateArgs MakeDirectArgs(uint32_t workers) {
 }
 }  // namespace
 
-class ClientHandlerFactoryUbMemUt : public ::testing::Test {
+class ClientHandlerFactoryUbMemUt : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     acl_stub_ = endpoint_test::CreateAclRuntimeStub("Ascend910_9391", 0, 0, 9, 8);
     llm::AclRuntimeStub::SetInstance(acl_stub_);
     hixl_test::InstallSysApiHooks(std::make_shared<hixl::test::KernelJsonMmpaStub>());
@@ -138,7 +141,7 @@ void ServeGetMemInfo(int32_t fd) {
 }
 }  // namespace
 
-class ClientHandlerFactoryUbUt : public ::testing::Test {
+class ClientHandlerFactoryUbUt : public hixl::test::PlainTlsTest {
  private:
   // 仿 hixl_engine_unittest：mock libra.so 的 RaRdevGetHandle/RaGetNotifyBaseAddr，
   // 使 TransferPool 通知地址解析在 UT 环境可用
@@ -186,6 +189,7 @@ class ClientHandlerFactoryUbUt : public ::testing::Test {
 
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     acl_stub_ = endpoint_test::CreateAclRuntimeStub("Ascend910_9391", 0, 0, 9, 8);
     llm::AclRuntimeStub::SetInstance(acl_stub_);
     hixl_test::InstallSysApiHooks(std::make_shared<HccpSysApiStub>());
@@ -231,7 +235,7 @@ TEST_F(ClientHandlerFactoryUbUt, WorkersGreaterThanOneCreatesUbMultiChannelHandl
 
   std::unique_ptr<IClientHandler> handler;
   auto args = MakeUbArgs(2U);
-  args.ctrl_socket = fds[0];
+  args.connection = test::Connection(fds[0]);
   const Status create_ret = ClientHandlerFactory::Create(args, handler);
   server.join();
   ASSERT_EQ(create_ret, SUCCESS);
@@ -258,7 +262,7 @@ TEST_F(ClientHandlerFactoryUbUt, SingleWorkerFallsBackToUbClientHandler) {
 
   std::unique_ptr<IClientHandler> handler;
   auto args = MakeUbArgs(1U);
-  args.ctrl_socket = fds[0];
+  args.connection = test::Connection(fds[0]);
   const Status create_ret = ClientHandlerFactory::Create(args, handler);
   server.join();
   ASSERT_EQ(create_ret, SUCCESS);

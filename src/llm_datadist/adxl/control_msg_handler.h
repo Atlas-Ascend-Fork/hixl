@@ -12,6 +12,7 @@
 #define CANN_GRAPH_ENGINE_RUNTIME_LLM_DATADIST_V2_ADXL_CONTROL_MSG_HANDLER_H_
 
 #include <chrono>
+#include "common/ctrl_msg_plugin.h"
 
 #include "nlohmann/json.hpp"
 #include "acl/acl.h"
@@ -220,10 +221,11 @@ class ControlMsgHandler {
   }
 
   template <typename T>
-  static Status SendMsg(int32_t fd, ControlMsgType msg_type, const T &msg, uint64_t timeout) {
+  static Status SendMsg(const hixl::CtrlMsgPluginPtr &connection, ControlMsgType msg_type, const T &msg,
+                        uint64_t timeout) {
     std::string msg_str;
     ADXL_CHK_STATUS_RET(Serialize(msg, msg_str), "Failed to serialize msg");
-    ADXL_CHK_STATUS_RET(SendMsgByProtocol(fd, msg_type, msg_str, timeout), "Failed to send msg");
+    ADXL_CHK_STATUS_RET(SendMsgByProtocol(connection, msg_type, msg_str, timeout), "Failed to send msg");
     return SUCCESS;
   }
 
@@ -240,8 +242,9 @@ class ControlMsgHandler {
   }
 
  private:
-  static Status SendMsgByProtocol(int32_t fd, ControlMsgType msg_type, const std::string &msg_str, uint64_t timeout);
-  static Status Write(int32_t fd, const void *buf, size_t len, uint64_t timeout,
+  static Status SendMsgByProtocol(const hixl::CtrlMsgPluginPtr &connection, ControlMsgType msg_type,
+                                  const std::string &msg_str, uint64_t timeout);
+  static Status Write(const hixl::CtrlMsgPluginPtr &connection, const void *buf, size_t len, uint64_t timeout,
                       std::chrono::steady_clock::time_point &start);
 };
 }  // namespace adxl

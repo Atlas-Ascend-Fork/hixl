@@ -59,11 +59,12 @@ void FreeExportDesc(std::vector<hixl::HixlMemDesc> &descs) {
   descs.clear();
 }
 
-hixl::Status RecvAndCheckHeader(int32_t socket, uint64_t &body_size, uint32_t timeout_ms) {
-  HIXL_LOGI("[HixlClient] RecvAndCheckHeader start. socket: %d", socket);
+hixl::Status RecvAndCheckHeader(const hixl::CtrlMsgPluginPtr &connection, uint64_t &body_size, uint32_t timeout_ms) {
+  HIXL_LOGI("[HixlClient] RecvAndCheckHeader start. connection: %s", connection->Desc().c_str());
   hixl::CtrlMsgHeader header{};
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Recv(socket, &header, static_cast<uint32_t>(sizeof(header)), timeout_ms));
-  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResp header ok. fd=%d, body_size=%" PRIu64, socket, header.body_size);
+  HIXL_CHK_STATUS_RET(connection->Recv(&header, static_cast<uint32_t>(sizeof(header)), timeout_ms));
+  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResp header ok. connection=%s, body_size=%" PRIu64,
+             connection->Desc().c_str(), header.body_size);
   HIXL_LOGD("[HixlClient] Header received. magic: 0x%X, body_size: %lu", header.magic, header.body_size);
   HIXL_CHK_BOOL_RET_STATUS(header.magic == hixl::kMagicNumber, hixl::PARAM_INVALID,
                            "[HixlClient] Invalid magic in GetRemoteMemResp, expect:0x%X, actual:0x%X",
@@ -78,12 +79,15 @@ hixl::Status RecvAndCheckHeader(int32_t socket, uint64_t &body_size, uint32_t ti
   return hixl::SUCCESS;
 }
 
-hixl::Status RecvBody(int32_t socket, uint64_t body_size, std::vector<uint8_t> &body, uint32_t timeout_ms) {
+hixl::Status RecvBody(const hixl::CtrlMsgPluginPtr &connection, uint64_t body_size, std::vector<uint8_t> &body,
+                      uint32_t timeout_ms) {
   HIXL_LOGI("[HixlClient] RecvBody start. body_size: %lu", body_size);
   body.resize(static_cast<size_t>(body_size));
-  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResp body begin. fd=%d, body_size=%" PRIu64, socket, body_size);
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Recv(socket, body.data(), static_cast<uint32_t>(body_size), timeout_ms));
-  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResp body ok. fd=%d, body_size=%" PRIu64, socket, body_size);
+  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResp body begin. connection=%s, body_size=%" PRIu64,
+             connection->Desc().c_str(), body_size);
+  HIXL_CHK_STATUS_RET(connection->Recv(body.data(), static_cast<uint32_t>(body_size), timeout_ms));
+  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResp body ok. connection=%s, body_size=%" PRIu64, connection->Desc().c_str(),
+             body_size);
   return hixl::SUCCESS;
 }
 
@@ -242,9 +246,10 @@ hixl::Status ParseGetRemoteMemJson(const char *json_ptr, size_t json_len, std::v
 
 namespace hixl {
 
-Status MemMsgHandler::SendGetRemoteMemRequest(int32_t socket, uint64_t endpoint_handle, uint32_t timeout_ms) {
-  HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest start. socket: %d, endpoint_handle: %lu, timeout:%u ms", socket,
-             endpoint_handle, timeout_ms);
+Status MemMsgHandler::SendGetRemoteMemRequest(const CtrlMsgPluginPtr &connection, uint64_t endpoint_handle,
+                                              uint32_t timeout_ms) {
+  HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest start. connection: %s, endpoint_handle: %lu",
+             connection->Desc().c_str(), endpoint_handle);
   const uint32_t send_timeout_ms = timeout_ms == 0U ? CtrlMsgPlugin::kDefaultCtrlTimeoutMs : timeout_ms;
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
@@ -255,20 +260,21 @@ Status MemMsgHandler::SendGetRemoteMemRequest(int32_t socket, uint64_t endpoint_
   GetRemoteMemReq body{};
   body.dst_ep_handle = endpoint_handle;
 
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(socket, &body, static_cast<uint64_t>(sizeof(body)), send_timeout_ms));
-  HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest success. fd=%d", socket);
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms));
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms));
+  HIXL_CHK_STATUS_RET(connection->Send(&body, static_cast<uint64_t>(sizeof(body)), send_timeout_ms));
+  HIXL_EVENT("[HixlClient] SendGetRemoteMemRequest success. connection=%s", connection->Desc().c_str());
   return SUCCESS;
 }
 
-Status MemMsgHandler::RecvGetRemoteMemResponse(int32_t socket, std::vector<HixlMemDesc> &mem_descs,
+Status MemMsgHandler::RecvGetRemoteMemResponse(const CtrlMsgPluginPtr &connection, std::vector<HixlMemDesc> &mem_descs,
                                                uint32_t timeout_ms) {
-  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResponse start. socket: %d, timeout_ms: %u ms", socket, timeout_ms);
+  HIXL_EVENT("[HixlClient] RecvGetRemoteMemResponse start. connection: %s, timeout_ms: %u ms",
+             connection->Desc().c_str(), timeout_ms);
   uint64_t body_size = 0;
-  HIXL_CHK_STATUS_RET(RecvAndCheckHeader(socket, body_size, timeout_ms));
+  HIXL_CHK_STATUS_RET(RecvAndCheckHeader(connection, body_size, timeout_ms));
   std::vector<uint8_t> body;
-  HIXL_CHK_STATUS_RET(RecvBody(socket, body_size, body, timeout_ms));
+  HIXL_CHK_STATUS_RET(RecvBody(connection, body_size, body, timeout_ms));
   CtrlMsgType msg_type{};
   const char *json_ptr = nullptr;
   size_t json_len = 0;

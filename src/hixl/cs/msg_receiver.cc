@@ -11,6 +11,7 @@
 #include <securec.h>
 #include "hixl_cs_server.h"
 #include "common/hixl_checker.h"
+#include "common/ctrl_msg_plugin.h"
 
 namespace hixl {
 namespace {
@@ -43,18 +44,19 @@ Status MsgReceiver::RecvHeader() {
   return SUCCESS;
 }
 
-bool MsgReceiver::CheckRecv(ssize_t recv_size) const {
+Status MsgReceiver::CheckRecv(ssize_t recv_size) const {
   if (recv_size < 0) {
-    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-      HIXL_LOGE(FAILED, "Failed to recv message, fd:%d, errno:%d, errmsg:%s", fd_, errno, strerror(errno));
-    }
-    return false;
+    const int saved_errno = errno;
+    HIXL_CHK_BOOL_RET_STATUS(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK || saved_errno == EINTR, FAILED,
+                             "Call api:recv failed, ret:%ld, fd:%d, errno:%d, error_msg:%s", recv_size,
+                             connection_->Fd(), saved_errno, strerror(saved_errno));
+    return SUCCESS;
   }
   if (recv_size == 0) {
-    HIXL_LOGI("Peer closed connection, fd:%d.", fd_);
-    return false;
+    HIXL_LOGI("Peer closed connection, fd:%d.", connection_->Fd());
+    return FAILED;
   }
-  return true;
+  return SUCCESS;
 }
 
 Status MsgReceiver::IRecv(std::vector<CtrlMsgPtr> &msgs) {
@@ -63,9 +65,10 @@ Status MsgReceiver::IRecv(std::vector<CtrlMsgPtr> &msgs) {
   }
   auto buffer = recv_buffer_.data() + received_size_;
   auto buffer_size = recv_buffer_.size() - received_size_;
-  const ssize_t n = recv(fd_, buffer, buffer_size, 0);
-  if (!CheckRecv(n)) {
-    return SUCCESS;
+  ssize_t n = 0;
+  HIXL_CHK_STATUS_RET(connection_->Recv(buffer, buffer_size, n), "Failed to receive control message");
+  if (n <= 0) {
+    return CheckRecv(n);
   }
   received_size_ += static_cast<size_t>(n);
   while (true) {

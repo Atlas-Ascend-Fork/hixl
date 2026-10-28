@@ -26,6 +26,7 @@ file(GLOB ADXL_SRC_LIST
 
 file(GLOB HIXL_SRC_LIST
         "${HIXL_CODE_DIR}/src/hixl/common/*.cc"
+        "${HIXL_CODE_DIR}/src/hixl/common/tls/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/cs/ubmem/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/endpoint_generator/*.cc"
@@ -79,6 +80,8 @@ target_link_libraries(cann_hixl_base PRIVATE
         dcmi_stub
         drvdsmi_host_stub
         json
+        ssl_static
+        crypto_static
         -ldl
         -Wl,--no-as-needed
         hccl_stub

@@ -14,6 +14,7 @@
 #include "common/ctrl_msg.h"
 #include "common/hixl_checker.h"
 #include "common/scope_guard.h"
+#include "common/tls/tls_manager.h"
 #include "hixl_cs_server.h"
 #include "hixl_cs_client.h"
 #include <mutex>
@@ -76,6 +77,9 @@ HixlStatus HixlCSServerCreate(const HixlServerDesc *server_desc, const HixlServe
   HIXL_CHK_STATUS_RET(hixl::GlobalConfig::Parse(config->global_resource_config, global_config,
                                                 hixl::GlobalConfig::ParseTarget::kServer),
                       "Failed to parse hixl cs server global_resource_config");
+  HIXL_CHK_STATUS_RET(hixl::TlsManager::GetInstance().Initialize(global_config.TlsCfg()),
+                      "Failed to initialize TLS from hixl cs server global_resource_config");
+  HIXL_DISMISSABLE_GUARD(tls_guard, ([]() { hixl::TlsManager::GetInstance().Finalize(); }));
   auto server = new (std::nothrow) hixl::HixlCSServer(server_desc->server_ip, server_desc->server_port, global_config);
   HIXL_CHECK_NOTNULL(server);
   HIXL_DISMISSABLE_GUARD(rollback, ([server]() { delete server; }));
@@ -83,6 +87,7 @@ HixlStatus HixlCSServerCreate(const HixlServerDesc *server_desc, const HixlServe
                       "Failed to init hixl cs server, ip:%s, port:%u", server_desc->server_ip,
                       server_desc->server_port);
   HIXL_DISMISS_GUARD(rollback);
+  HIXL_DISMISS_GUARD(tls_guard);
   *server_handle = server;
   ServerRegistry::Register(server);
   HIXL_EVENT("[HixlCSServer] create server success, server_handle:%p", *server_handle);
@@ -97,7 +102,10 @@ HixlStatus HixlCSServerDestroy(HixlServerHandle server_handle) {
     return HIXL_PARAM_INVALID;
   }
   auto server = static_cast<hixl::HixlCSServer *>(server_handle);
-  HIXL_MAKE_GUARD(release, ([server]() { delete server; }));
+  HIXL_MAKE_GUARD(release, ([server]() {
+                    delete server;
+                    hixl::TlsManager::GetInstance().Finalize();
+                  }));
   HIXL_CHK_STATUS_RET(server->Finalize(), "Failed to finalize hixl cs server, server_handle:%p", server_handle);
   return HIXL_SUCCESS;
 }

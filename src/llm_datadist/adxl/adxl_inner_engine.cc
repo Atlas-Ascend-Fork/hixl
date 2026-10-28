@@ -15,6 +15,8 @@
 #include "common/llm_scope_guard.h"
 #include "common/llm_checker.h"
 #include "common/hixl_utils.h"
+#include "common/tls/tls_config.h"
+#include "common/tls/tls_manager.h"
 #include "statistic_manager.h"
 #include "adxl_utils.h"
 #include "profiling/prof_reporter.h"
@@ -152,32 +154,41 @@ Status AdxlInnerEngine::ParseAutoConnectConfig(const std::map<AscendString, Asce
 Status AdxlInnerEngine::LoadGlobalResourceConfig(const std::map<AscendString, AscendString> &options) {
   auto config_it = options.find(hixl::OPTION_GLOBAL_RESOURCE_CONFIG);
   std::map<AscendString, AscendString> json_options;
+  hixl::TlsConfig tls_cfg;
   if (config_it != options.end()) {
     ADXL_CHK_STATUS_RET(LoadJsonConfig(config_it->second.GetString(), json_options), "Failed to load JSON config: %s",
                         config_it->second.GetString());
+    try {
+      const auto json = nlohmann::json::parse(config_it->second.GetString());
+      ADXL_CHK_STATUS_RET(hixl::ParseTlsConfig(json, tls_cfg), "Failed to parse tls_config");
+    } catch (const nlohmann::json::exception &e) {
+      LLMLOGE(PARAM_INVALID, "Failed to parse GlobalResourceConfig json: %s", e.what());
+      return PARAM_INVALID;
+    }
   }
 
   ADXL_CHK_STATUS_RET(ParseChannelPoolConfig(json_options), "Failed to parse channel pool config.");
   ADXL_CHK_STATUS_RET(ParseCommResourceListenPortConfig(json_options),
                       "Failed to parse comm resource listen port config.");
 
+  tls_config_ = std::move(tls_cfg);
   return SUCCESS;
 }
 
 Status AdxlInnerEngine::Initialize(const std::map<AscendString, AscendString> &options) {
   std::lock_guard<std::mutex> lk(mutex_);
 
+  ADXL_CHK_BOOL_RET_STATUS(!IsInitialized(), FAILED, "Engine is already initialized");
   ADXL_CHK_STATUS_RET(LoadGlobalResourceConfig(options), "Failed to load global resource config.");
+  ADXL_CHK_STATUS_RET(hixl::TlsManager::GetInstance().Initialize(tls_config_), "Failed to initialize TLS");
+  LLM_DISMISSABLE_GUARD(tls_guard, ([]() { hixl::TlsManager::GetInstance().Finalize(); }));
   ADXL_CHK_LLM_RET(llm::CommAdapter::GetInstance().Initialize(), "CommAdapter initialize failed.");
   int32_t device_id = -1;
   ADXL_CHK_ACL_RET(aclrtGetDevice(&device_id));
   hixl::TemporaryRtContext with_context(nullptr);
   ADXL_CHK_ACL_RET(aclrtCreateContext(&aclrt_context_, device_id));
   LLMEVENT("Switch new aclrt ctx:%p", aclrt_context_);
-  LLM_DISMISSABLE_GUARD(fail_guard, ([this]() {
-                          (void)aclrtDestroyContext(aclrt_context_);
-                          aclrt_context_ = nullptr;
-                        }));
+  LLM_DISMISSABLE_GUARD(fail_guard, ([this]() { Finalize(); }));
   segment_table_ = llm::MakeUnique<SegmentTable>();
   slot_pool_ = llm::MakeUnique<TransferSlotPool>(device_id, kMaxStreams);
   ADXL_CHECK_NOTNULL(slot_pool_, "Failed to create transfer slot pool.");
@@ -195,9 +206,10 @@ Status AdxlInnerEngine::Initialize(const std::map<AscendString, AscendString> &o
     notify_cv_.notify_all();  // Notify all waiting threads, but only the one with matching req_id will continue
   });
 
-  is_initialized_ = true;
   StatisticManager::GetInstance().StartPeriodicDumpIfNeeded();
   LLM_DISMISS_GUARD(fail_guard);
+  LLM_DISMISS_GUARD(tls_guard);
+  is_initialized_ = true;
   return SUCCESS;
 }
 
@@ -308,6 +320,7 @@ void AdxlInnerEngine::ClearTransferReqs() {
 }
 
 void AdxlInnerEngine::Finalize() {
+  const bool was_initialized = is_initialized_.exchange(false);
   ClearTransferReqs();
   {
     hixl::TemporaryRtContext with_context(aclrt_context_);
@@ -330,6 +343,9 @@ void AdxlInnerEngine::Finalize() {
   if (aclrt_context_ != nullptr) {
     (void)aclrtDestroyContext(aclrt_context_);
     aclrt_context_ = nullptr;
+  }
+  if (was_initialized) {
+    hixl::TlsManager::GetInstance().Finalize();
   }
 }
 
@@ -611,8 +627,8 @@ Status AdxlInnerEngine::SendNotify(const AscendString &remote_engine, const Noti
   notify_msg.name = notify.name.GetString();
   notify_msg.notify_msg = notify.notify_msg.GetString();
 
-  auto send_callback = [this, &notify_msg, timeout_in_millis](int32_t fd) -> Status {
-    return ControlMsgHandler::SendMsg(fd, ControlMsgType::kNotify, notify_msg, timeout_in_millis);
+  auto send_callback = [this, &notify_msg, timeout_in_millis](const hixl::CtrlMsgPluginPtr &connection) -> Status {
+    return ControlMsgHandler::SendMsg(connection, ControlMsgType::kNotify, notify_msg, timeout_in_millis);
   };
   ADXL_CHK_STATUS_RET(channel->SendControlMsg(send_callback), "Failed to send notify message.");
   std::unique_lock<std::mutex> lock(notify_mutex_);

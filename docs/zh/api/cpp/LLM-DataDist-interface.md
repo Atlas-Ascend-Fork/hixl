@@ -102,7 +102,7 @@ Status Initialize(const std::map<AscendString, AscendString> &options)
 | OPTION_SYNC_CACHE_WAIT_TIME | 可选 | kv相关操作的超时时间，单位：ms。不配置默认为1000ms。相关接口如下。<br><br>  - PullKvCache<br>  - PullKvBlocks<br>  - PushKvCache<br>  - PushKvBlocks |
 | OPTION_LOCAL_COMM_RES | 可选 | 配置本地通信资源信息，格式是json格式的字符串。 |
 | OPTION_TRANSFER_BACKEND | 可选 | 配置LLM-DataDist使用的传输后端引擎，当前支持配置的后端为"hixl"。hixl传输后端使用方法如下：<br><br>- 初始化option需指定OPTION_LISTEN_IP_INFO：当配置使用hixl传输后端时，每个传输端既可作为client也可以作为server。<br><br>- 与对端发起传输前需要调用LinkLlmClusters发起建链。 |
-| OPTION_GLOBAL_RESOURCE_CONFIG | 可选 | 配置HIXL全局通信资源信息，格式为json格式的字符串。仅当OPTION_TRANSFER_BACKEND配置为"hixl"时生效，LLM-DataDist仅将配置透传至HIXL，不新增校验或改变HIXL引擎选择逻辑；字段是否生效取决于HIXL所选引擎。字段说明和约束请参考[HIXL接口文档的Initialize章节](./HIXL-interface.md#initialize)。不配置时保持默认行为。<br>配置示例：'{"comm_resource_config.listen_port": 26666, "comm_resource_config.max_active_channels": 128}'。<br>非法JSON、字段类型错误或非法取值由HIXL解析校验并返回初始化失败。 |
+| OPTION_GLOBAL_RESOURCE_CONFIG | 可选 | 配置全局资源信息，格式为json格式的字符串。`tls_config.*`用于配置LLM-DataDist控制面TLS，不依赖OPTION_TRANSFER_BACKEND；其他字段仅在OPTION_TRANSFER_BACKEND配置为"hixl"时透传至HIXL。字段说明和约束请参考[OPTION_GLOBAL_RESOURCE_CONFIG控制面TLS配置](#llm_tls_config)及[HIXL接口文档的Initialize章节](./HIXL-interface.md#initialize)。不配置时保持默认行为。<br>配置示例：'{"comm_resource_config.listen_port": 26666, "comm_resource_config.max_active_channels": 128}'。<br>非法JSON、字段类型错误或非法取值会导致初始化失败。 |
 
 OPTION_LOCAL_COMM_RES参数补充说明如下：
 
@@ -128,6 +128,48 @@ OPTION_LOCAL_COMM_RES参数补充说明如下：
  <!-- end id4 -->
 
 如上表格中ranktable具体信息请参见《[HCCL集合通信库](https://gitcode.com/cann/hccl/blob/master/docs/zh/user_guide/README.md)》。<br>OPTION_LOCAL_COMM_RES配置version为"1.3"时，通信资源配置字段说明请参考[HIXL接口文档](./HIXL-interface.md#通信资源配置字段说明)。
+
+**OPTION_GLOBAL_RESOURCE_CONFIG控制面TLS配置**
+
+<a id="llm_tls_config"></a>
+
+在`OPTION_GLOBAL_RESOURCE_CONFIG`中配置`tls_config.*`字段可启用LLM-DataDist控制面TCP TLS。控制面TLS仅保护LLM-DataDist通过HIXL、HIXL CS或ADXL构建的控制面连接，不改变KV Cache数据面的传输和加密方式。
+
+| 字段名 | 数据类型 | 可选/必选 | 描述 |
+| --- | --- | --- | --- |
+| tls_config.cert_file | 字符串 | TLS启用时必选 | 控制面TLS证书文件路径。必须与`tls_config.key_file`成对配置。 |
+| tls_config.key_file | 字符串 | TLS启用时必选 | 控制面TLS私钥文件路径。必须与`tls_config.cert_file`成对配置。 |
+| tls_config.ca_file | 字符串 | 可选 | 用于校验对端证书的CA文件路径。`tls_config.verify_peer`为true时必选。 |
+| tls_config.verify_peer | 布尔 | 可选 | 是否校验对端证书，默认false。false表示不校验对端身份，仅建立加密连接；生产环境建议配置为true，此时对端必须提供有效证书。控制面按IP建连，不进行hostname或SNI校验。 |
+| tls_config.ciphers | 字符串 | 可选 | OpenSSL加密套件，仅对TLS 1.2生效。例如`ECDHE-RSA-AES256-GCM-SHA384`。 |
+| tls_config.enable_cert_refresh | 布尔 | 可选 | 是否自动加载变更后的证书文件，默认false。开启后，新证书仅对后续新建连接生效，已有连接不受影响；证书加载失败时继续使用原证书。 |
+
+约束说明如下：
+
+- 不配置任何`tls_config.*`字段时，控制面TLS关闭。
+- 同一进程中的所有LLM-DataDist、HIXL、HIXL CS和ADXL实例必须使用一致的控制面TLS配置，包括TLS开关。配置不一致时，初始化或创建对象失败。与其中任一组件混用时，上述要求同样适用。
+- 如需更换控制面TLS配置，必须先销毁进程内所有使用该配置的LLM-DataDist、HIXL、HIXL CS和ADXL对象，再重新初始化。
+- `tls_config.cert_file`和`tls_config.key_file`必须同时配置；`tls_config.verify_peer`为true时必须配置`tls_config.ca_file`。字段类型错误、文件无法加载或证书与私钥不匹配时初始化失败，不会降级为明文连接。
+- 控制面TLS会增加握手耗时。启用控制面TLS后，建议将`LinkLlmClusters`的超时时间配置为2000ms以上。
+
+使用示例如下：
+
+```cpp
+LlmDataDist llm_data_dist(0U, LlmRole::kDecoder);
+std::map<AscendString, AscendString> options;
+options[OPTION_DEVICE_ID] = "0";
+options[OPTION_GLOBAL_RESOURCE_CONFIG] = R"({
+    "tls_config.cert_file": "/path/to/cert.pem",
+    "tls_config.key_file": "/path/to/key.pem",
+    "tls_config.ca_file": "/path/to/ca.pem",
+    "tls_config.verify_peer": true,
+    "tls_config.enable_cert_refresh": true
+})";
+auto ret = llm_data_dist.Initialize(options);
+if (ret != LLM_SUCCESS) {
+  printf("[ERROR] Initialize failed, ret = %u\n", ret);
+}
+```
 
 **调用示例**
 
@@ -273,7 +315,7 @@ Status LinkLlmClusters(const std::vector<ClusterInfo> &clusters, std::vector<Sta
   <!-- end id12 -->
   <!-- end id10 -->
 - 当OPTION_LOCAL_COMM_RES配置version为"1.3"时（推荐使用，需要HDK版本大于等于25.5.0且toolkit包版本大于等于9.1.0），使用HixlCS能力进行建链，没有链路上限限制。
-- 建议超时时间配置为200ms以上。如果TLS处于开启状态，建议超时时间配置为2000ms以上。查询TLS状态可以使用如下命令：
+- 建议超时时间配置为200ms以上。如果设备TLS或控制面TLS处于开启状态，建议超时时间配置为2000ms以上。设备TLS状态可以使用如下命令查询；控制面TLS状态以是否配置`tls_config.*`为准：
 
   ```sh
   hccn_tool [-i %d] -tls -g [host]

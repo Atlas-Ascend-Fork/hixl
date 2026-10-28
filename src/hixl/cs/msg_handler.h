@@ -12,6 +12,7 @@
 #define CANN_HIXL_SRC_HIXL_CS_MSG_HANDLER_H_
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -31,15 +32,15 @@ class MsgHandler {
   ~MsgHandler();
   Status Initialize();
   void Finalize();
-  void SubmitMsg(int32_t fd, const CtrlMsgPtr &msg);
+  void SubmitMsg(const CtrlMsgPluginPtr &connection, const CtrlMsgPtr &msg);
   Status RegisterMsgProcessor(CtrlMsgType msg_type, MsgProcessor msg_processor);
 
  private:
   void HandleMsg();
-  static Status HandleMsg(int32_t fd, CtrlMsgPtr msg, MsgProcessor proc);
+  static Status HandleMsg(const CtrlMsgPluginPtr &connection, CtrlMsgPtr msg, MsgProcessor proc);
 
   std::mutex req_mutex_;
-  std::queue<std::pair<int32_t, CtrlMsgPtr>> req_queue_;
+  std::queue<std::pair<CtrlMsgPluginPtr, CtrlMsgPtr>> req_queue_;
   std::condition_variable req_cv_;
   std::mutex processors_mutex_;
   std::map<CtrlMsgType, MsgProcessor> processors_;

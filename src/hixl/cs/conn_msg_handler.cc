@@ -17,21 +17,24 @@
 #include "common/hixl_log.h"
 
 namespace {
-hixl::Status SendHeaderTypeBody(int32_t socket, const hixl::CtrlMsgHeader &header, hixl::CtrlMsgType msg_type,
-                                const void *body, uint64_t body_size) {
-  HIXL_LOGI("Start sending header, type and body. socket: %d, body_size: %lu", socket, body_size);
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Send(socket, &header, static_cast<uint64_t>(sizeof(header))));
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Send(socket, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Send(socket, body, body_size));
+hixl::Status SendHeaderTypeBody(const hixl::CtrlMsgPluginPtr &connection, const hixl::CtrlMsgHeader &header,
+                                hixl::CtrlMsgType msg_type, const void *body, uint64_t body_size) {
+  HIXL_LOGI("Start sending header, type and body. connection: %s, body_size: %lu", connection->Desc().c_str(),
+            body_size);
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+  HIXL_CHK_STATUS_RET(connection->Send(body, body_size));
   HIXL_LOGI("Successfully sent header, type and body.");
   return hixl::SUCCESS;
 }
 
-hixl::Status RecvAndCheckHeader(int32_t socket, uint64_t expect_body_size, hixl::CtrlMsgHeader &header,
-                                uint32_t timeout_ms) {
-  HIXL_LOGI("Start receiving and checking header. socket: %d, expect_body_size: %lu", socket, expect_body_size);
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Recv(socket, &header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
-                      "Failed to recv header. socket=%d, len=%lu, timeout=%u ms", socket, sizeof(header), timeout_ms);
+hixl::Status RecvAndCheckHeader(const hixl::CtrlMsgPluginPtr &connection, uint64_t expect_body_size,
+                                hixl::CtrlMsgHeader &header, uint32_t timeout_ms) {
+  HIXL_LOGI("Start receiving and checking header. connection: %s, expect_body_size: %lu", connection->Desc().c_str(),
+            expect_body_size);
+  HIXL_CHK_STATUS_RET(connection->Recv(&header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
+                      "Failed to recv header. connection=%s, len=%lu, timeout=%u ms", connection->Desc().c_str(),
+                      sizeof(header), timeout_ms);
   HIXL_LOGD("Header received. magic: 0x%X, body_size: %lu", header.magic, header.body_size);
   HIXL_CHK_BOOL_RET_STATUS(header.magic == hixl::kMagicNumber, hixl::PARAM_INVALID,
                            "Invalid magic for CreateChannelResp, expect:0x%X, actual:0x%X", hixl::kMagicNumber,
@@ -42,10 +45,11 @@ hixl::Status RecvAndCheckHeader(int32_t socket, uint64_t expect_body_size, hixl:
   return hixl::SUCCESS;
 }
 
-hixl::Status RecvBody(int32_t socket, uint64_t body_size, std::vector<uint8_t> &body, uint32_t timeout_ms) {
-  HIXL_LOGI("Start receiving body. socket: %d, body_size: %lu", socket, body_size);
+hixl::Status RecvBody(const hixl::CtrlMsgPluginPtr &connection, uint64_t body_size, std::vector<uint8_t> &body,
+                      uint32_t timeout_ms) {
+  HIXL_LOGI("Start receiving body. connection: %s, body_size: %lu", connection->Desc().c_str(), body_size);
   body.resize(static_cast<size_t>(body_size));
-  HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Recv(socket, body.data(), static_cast<uint32_t>(body_size), timeout_ms));
+  HIXL_CHK_STATUS_RET(connection->Recv(body.data(), static_cast<uint32_t>(body_size), timeout_ms));
   HIXL_LOGI("Successfully received body.");
   return hixl::SUCCESS;
 }
@@ -98,16 +102,16 @@ hixl::Status ParseMatchEndpointResp(const std::vector<uint8_t> &body, size_t off
   return hixl::SUCCESS;
 }
 
-hixl::Status RecvMatchEndpointHandleResponse(int32_t socket, uint64_t &remote_endpoint_handle,
+hixl::Status RecvMatchEndpointHandleResponse(const hixl::CtrlMsgPluginPtr &connection, uint64_t &remote_endpoint_handle,
                                              uint32_t &remote_listen_port, uint64_t &channel_index,
                                              uint32_t timeout_ms) {
   const uint64_t expect_body_size = static_cast<uint64_t>(sizeof(hixl::CtrlMsgType) + sizeof(hixl::MatchEndpointResp));
 
   hixl::CtrlMsgHeader header{};
-  HIXL_CHK_STATUS_RET(RecvAndCheckHeader(socket, expect_body_size, header, timeout_ms));
+  HIXL_CHK_STATUS_RET(RecvAndCheckHeader(connection, expect_body_size, header, timeout_ms));
 
   std::vector<uint8_t> body;
-  HIXL_CHK_STATUS_RET(RecvBody(socket, header.body_size, body, timeout_ms));
+  HIXL_CHK_STATUS_RET(RecvBody(connection, header.body_size, body, timeout_ms));
 
   size_t offset = 0U;
   hixl::CtrlMsgType msg_type{};
@@ -128,14 +132,14 @@ hixl::Status RecvMatchEndpointHandleResponse(int32_t socket, uint64_t &remote_en
   return hixl::SUCCESS;
 }
 
-hixl::Status RecvCreateChannelOnlyResponse(int32_t socket, uint32_t timeout_ms) {
+hixl::Status RecvCreateChannelOnlyResponse(const hixl::CtrlMsgPluginPtr &connection, uint32_t timeout_ms) {
   const uint64_t expect_body_size = static_cast<uint64_t>(sizeof(hixl::CtrlMsgType) + sizeof(hixl::CreateChannelResp));
 
   hixl::CtrlMsgHeader header{};
-  HIXL_CHK_STATUS_RET(RecvAndCheckHeader(socket, expect_body_size, header, timeout_ms));
+  HIXL_CHK_STATUS_RET(RecvAndCheckHeader(connection, expect_body_size, header, timeout_ms));
 
   std::vector<uint8_t> body;
-  HIXL_CHK_STATUS_RET(RecvBody(socket, header.body_size, body, timeout_ms));
+  HIXL_CHK_STATUS_RET(RecvBody(connection, header.body_size, body, timeout_ms));
 
   size_t offset = 0U;
   hixl::CtrlMsgType msg_type{};
@@ -150,15 +154,15 @@ hixl::Status RecvCreateChannelOnlyResponse(int32_t socket, uint32_t timeout_ms) 
 }
 }  // namespace
 namespace hixl {
-Status ConnMsgHandler::SendMatchEndpointRequest(int32_t socket, const EndpointDesc &dst) {
-  HIXL_EVENT("SendMatchEndpointRequest start. socket: %d", socket);
+Status ConnMsgHandler::SendMatchEndpointRequest(const CtrlMsgPluginPtr &connection, const EndpointDesc &dst) {
+  HIXL_EVENT("SendMatchEndpointRequest start. connection: %s", connection->Desc().c_str());
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(MatchEndpointReq));
   const CtrlMsgType msg_type = CtrlMsgType::kMatchEndpointReq;
   MatchEndpointReq body{};
   body.dst = dst;
-  const Status ret = SendHeaderTypeBody(socket, header, msg_type, &body, static_cast<uint64_t>(sizeof(body)));
+  const Status ret = SendHeaderTypeBody(connection, header, msg_type, &body, static_cast<uint64_t>(sizeof(body)));
   if (ret == SUCCESS) {
     HIXL_EVENT("SendMatchEndpointRequest success.");
   } else {
@@ -167,12 +171,12 @@ Status ConnMsgHandler::SendMatchEndpointRequest(int32_t socket, const EndpointDe
   return ret;
 }
 
-Status ConnMsgHandler::RecvMatchEndpointResponse(int32_t socket, uint64_t &remote_endpoint_handle,
+Status ConnMsgHandler::RecvMatchEndpointResponse(const CtrlMsgPluginPtr &connection, uint64_t &remote_endpoint_handle,
                                                  uint32_t &remote_listen_port, uint64_t &channel_index,
                                                  uint32_t timeout_ms) {
-  HIXL_EVENT("RecvMatchEndpointResponse start. socket: %d", socket);
-  const Status ret =
-      RecvMatchEndpointHandleResponse(socket, remote_endpoint_handle, remote_listen_port, channel_index, timeout_ms);
+  HIXL_EVENT("RecvMatchEndpointResponse start. connection: %s", connection->Desc().c_str());
+  const Status ret = RecvMatchEndpointHandleResponse(connection, remote_endpoint_handle, remote_listen_port,
+                                                     channel_index, timeout_ms);
   if (ret == SUCCESS) {
     HIXL_EVENT("RecvMatchEndpointResponse success. Remote handle: %lu, channel_index=%" PRIu64, remote_endpoint_handle,
                channel_index);
@@ -182,13 +186,13 @@ Status ConnMsgHandler::RecvMatchEndpointResponse(int32_t socket, uint64_t &remot
   return ret;
 }
 
-Status ConnMsgHandler::SendCreateChannelRequest(int32_t socket, const CreateChannelReq &body) {
-  HIXL_EVENT("SendCreateChannelRequest start. socket: %d", socket);
+Status ConnMsgHandler::SendCreateChannelRequest(const CtrlMsgPluginPtr &connection, const CreateChannelReq &body) {
+  HIXL_EVENT("SendCreateChannelRequest start. connection: %s", connection->Desc().c_str());
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(CreateChannelReq));
   const CtrlMsgType msg_type = CtrlMsgType::kCreateChannelReq;
-  const Status ret = SendHeaderTypeBody(socket, header, msg_type, &body, static_cast<uint64_t>(sizeof(body)));
+  const Status ret = SendHeaderTypeBody(connection, header, msg_type, &body, static_cast<uint64_t>(sizeof(body)));
   if (ret == SUCCESS) {
     HIXL_EVENT("SendCreateChannelRequest success.");
   } else {
@@ -197,9 +201,9 @@ Status ConnMsgHandler::SendCreateChannelRequest(int32_t socket, const CreateChan
   return ret;
 }
 
-Status ConnMsgHandler::RecvCreateChannelResponse(int32_t socket, uint32_t timeout_ms) {
-  HIXL_EVENT("RecvCreateChannelResponse start. socket: %d", socket);
-  const Status ret = RecvCreateChannelOnlyResponse(socket, timeout_ms);
+Status ConnMsgHandler::RecvCreateChannelResponse(const CtrlMsgPluginPtr &connection, uint32_t timeout_ms) {
+  HIXL_EVENT("RecvCreateChannelResponse start. connection: %s", connection->Desc().c_str());
+  const Status ret = RecvCreateChannelOnlyResponse(connection, timeout_ms);
   if (ret == SUCCESS) {
     HIXL_EVENT("RecvCreateChannelResponse success.");
   } else {

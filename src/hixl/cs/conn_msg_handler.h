@@ -21,12 +21,12 @@ namespace hixl {
 
 class ConnMsgHandler {
  public:
-  static Status SendMatchEndpointRequest(int32_t socket, const EndpointDesc &dst);
-  static Status RecvMatchEndpointResponse(int32_t socket, uint64_t &remote_endpoint_handle,
+  static Status SendMatchEndpointRequest(const CtrlMsgPluginPtr &connection, const EndpointDesc &dst);
+  static Status RecvMatchEndpointResponse(const CtrlMsgPluginPtr &connection, uint64_t &remote_endpoint_handle,
                                           uint32_t &remote_listen_port, uint64_t &channel_index, uint32_t timeout_ms);
   // 发送 CreateChannelReq：src、dst_ep_handle、tc、sl、channel_index（role 由收发两端各自固定）
-  static Status SendCreateChannelRequest(int32_t socket, const CreateChannelReq &body);
-  static Status RecvCreateChannelResponse(int32_t socket, uint32_t timeout_ms);
+  static Status SendCreateChannelRequest(const CtrlMsgPluginPtr &connection, const CreateChannelReq &body);
+  static Status RecvCreateChannelResponse(const CtrlMsgPluginPtr &connection, uint32_t timeout_ms);
 };
 
 }  // namespace hixl

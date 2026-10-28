@@ -28,6 +28,7 @@ file(GLOB LLM_V2_SRC_LIST
         "${HIXL_CODE_DIR}/src/llm_datadist/memory/type/*.cc"
         "${HIXL_CODE_DIR}/src/llm_datadist/memory/util/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/common/*.cc"
+        "${HIXL_CODE_DIR}/src/hixl/common/tls/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/endpoint_generator/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/cs/*.cc"
@@ -74,6 +75,8 @@ target_link_libraries(llm_datadist_base PRIVATE
         mmpa_stub
         sys_api_wrap
         json
+        ssl_static
+        crypto_static
         -ldl
         -Wl,--no-as-needed
         error_manager_stub

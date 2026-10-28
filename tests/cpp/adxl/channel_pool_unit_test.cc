@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "depends/ctrl_msg_test_helper.h"
 #include <thread>
 #include <chrono>
 #include <cstdint>
@@ -56,9 +57,10 @@ class MockChannelMsgHandler : public ChannelMsgHandler {
   }
 };
 
-class ChannelPoolUnitTest : public ::testing::Test {
+class ChannelPoolUnitTest : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     llm::MockMmpaForHcclApi::Install();
     llm::AutoCommResRuntimeMock::Install();
     llm::CommAdapter::GetInstance().Initialize();

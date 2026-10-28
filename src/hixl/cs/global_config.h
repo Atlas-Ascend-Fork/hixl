@@ -17,6 +17,7 @@
 
 #include "hixl/hixl_types.h"
 #include "common/transfer_config.h"
+#include "common/tls/tls_config.h"
 #include "cs/ubmem/ubmem_types.h"
 
 namespace hixl {
@@ -50,11 +51,13 @@ class GlobalConfig {
   const UbMemoryConfig &UbMemory() const;
   std::optional<size_t> UbMemMaxCapacity() const;
   std::optional<size_t> UbMemStartAddress() const;
+  const TlsConfig &TlsCfg() const;
 
  private:
   CommResourceConfig comm_resource_config_;
   TransferConfigDesc transfer_config_;
   UbMemoryConfig fabric_memory_;
+  TlsConfig tls_config_;
 };
 
 }  // namespace hixl

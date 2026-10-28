@@ -22,6 +22,7 @@ file(GLOB HIXL_SRC_LIST
         "${CMAKE_CURRENT_LIST_DIR}/engine/*.cc"
         "${CMAKE_CURRENT_LIST_DIR}/engine/endpoint_generator/*.cc"
         "${CMAKE_CURRENT_LIST_DIR}/common/*.cc"
+        "${CMAKE_CURRENT_LIST_DIR}/common/tls/*.cc"
         "${CMAKE_CURRENT_LIST_DIR}/cs/ubmem/*.cc"
         "${CMAKE_CURRENT_LIST_DIR}/cs/*.cc"
         "${CMAKE_CURRENT_LIST_DIR}/profiling/*.cc"
@@ -69,6 +70,8 @@ target_link_libraries(cann_hixl PRIVATE
         acl_rt
         runtime
         json
+        ssl_static
+        crypto_static
         -ldl
         -O2 -fPIC -Wextra -Wfloat-equal
         -Wl,--no-as-needed

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include "depends/llm_datadist/src/data_cache_engine_test_helper.h"
 #include "adxl_test_helpers.h"
 #include "hixl/hixl_types.h"
+#include "common/tls/tls_manager.h"
 
 using namespace std;
 using namespace llm;
@@ -164,6 +165,7 @@ TEST_F(AdxlEngineSTest, TestGlobalResourceConfigCommResourceListenPortValidation
     std::map<AscendString, AscendString> options;
     options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(global_resource_config.c_str());
     EXPECT_EQ(engine.Initialize("127.0.0.1", options), PARAM_INVALID) << "listen_port=" << listen_port;
+    EXPECT_FALSE(hixl::TlsManager::GetInstance().IsInitialized());
   }
 
   AdxlEngine engine;
@@ -172,7 +174,10 @@ TEST_F(AdxlEngineSTest, TestGlobalResourceConfigCommResourceListenPortValidation
   options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"comm_resource_config.listen_port":"65535"})";
   test_helpers::UseLegacyLocalCommRes(options);
   EXPECT_EQ(engine.Initialize("127.0.0.1", options), SUCCESS);
+  EXPECT_TRUE(hixl::TlsManager::GetInstance().IsInitialized());
   engine.Finalize();
+  engine.Finalize();
+  EXPECT_FALSE(hixl::TlsManager::GetInstance().IsInitialized());
 }
 
 TEST_F(AdxlEngineSTest, TestGlobalResourceConfigCommResourceListenPortInRankTable) {

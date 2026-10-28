@@ -54,15 +54,16 @@ Status HixlClient::Initialize(const std::vector<EndpointConfig> &local_endpoint_
                               bool is_lazy) {
   std::lock_guard<std::mutex> lock(mutex_);
   HIXL_CHK_BOOL_RET_STATUS(!local_endpoint_list.empty(), PARAM_INVALID, "The input local_endpoint_list is empty");
-  std::vector<EndpointConfig> remote_endpoint_list;
-  CtrlMsgPlugin::Initialize();
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Connect(server_ip_, server_port_, ctrl_socket_, timeout_ms),
-                      "Connect socket failed");
+  connection_ = MakeShared<CtrlMsgPlugin>();
+  HIXL_CHECK_NOTNULL(connection_);
   HIXL_DISMISSABLE_GUARD(close_ctrl_socket, [this] { CloseCtrlSocket(); });
-  HIXL_CHK_STATUS_RET(SendEndpointInfoReq(ctrl_socket_, CtrlMsgType::kGetEndpointInfoReq, timeout_ms),
-                      "HixlClient send GetEndpointInfoReq failed, socket:%d", ctrl_socket_);
-  HIXL_CHK_STATUS_RET(RecvEndpointInfoResp(ctrl_socket_, remote_endpoint_list, timeout_ms),
-                      "HixlClient receive GetEndpointInfoResp failed, socket:%d", ctrl_socket_);
+  HIXL_CHK_STATUS_RET(connection_->Initialize(), "Failed to initialize control connection");
+  std::vector<EndpointConfig> remote_endpoint_list;
+  HIXL_CHK_STATUS_RET(connection_->Connect(server_ip_, server_port_, timeout_ms), "Connect socket failed");
+  HIXL_CHK_STATUS_RET(SendEndpointInfoReq(connection_, CtrlMsgType::kGetEndpointInfoReq, timeout_ms),
+                      "HixlClient send GetEndpointInfoReq failed, connection:%s", connection_->Desc().c_str());
+  HIXL_CHK_STATUS_RET(RecvEndpointInfoResp(connection_, remote_endpoint_list, timeout_ms),
+                      "HixlClient receive GetEndpointInfoResp failed, connection:%s", connection_->Desc().c_str());
   HIXL_CHK_BOOL_RET_STATUS(!remote_endpoint_list.empty(), FAILED, "HixlClient received empty remote_endpoint_list");
   std::vector<HandlerCreateArgs::EndpointPair> matched_pairs;
   HandlerCreateArgs::HandlerType handler_type;
@@ -91,7 +92,7 @@ Status HixlClient::Initialize(const std::vector<EndpointConfig> &local_endpoint_
   args.global_config = global_config_;
   args.is_lazy = is_lazy;
   args.timeout_ms = timeout_ms;
-  args.ctrl_socket = ctrl_socket_;
+  args.connection = connection_;
   args.local_engine = local_engine_;
   args.remote_engine = remote_engine_;
   HIXL_CHK_STATUS_RET(ClientHandlerFactory::Create(args, client_handler_),
@@ -101,22 +102,23 @@ Status HixlClient::Initialize(const std::vector<EndpointConfig> &local_endpoint_
   return SUCCESS;
 }
 
-Status HixlClient::SendEndpointInfoReq(int32_t fd, CtrlMsgType msg_type, uint32_t timeout_ms) const {
+Status HixlClient::SendEndpointInfoReq(const CtrlMsgPluginPtr &connection, CtrlMsgType msg_type,
+                                       uint32_t timeout_ms) const {
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header)), timeout_ms),
-                      "HixlClient send header failed, fd:%d", fd);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), timeout_ms),
-                      "HixlClient send msg_type failed, fd:%d", fd);
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header)), timeout_ms),
+                      "HixlClient send header failed, connection:%s", connection->Desc().c_str());
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)), timeout_ms),
+                      "HixlClient send msg_type failed, connection:%s", connection->Desc().c_str());
   return SUCCESS;
 }
 
-Status HixlClient::RecvEndpointInfoResp(int32_t fd, std::vector<EndpointConfig> &remote_endpoint_list,
-                                        uint32_t timeout_ms) const {
+Status HixlClient::RecvEndpointInfoResp(const CtrlMsgPluginPtr &connection,
+                                        std::vector<EndpointConfig> &remote_endpoint_list, uint32_t timeout_ms) const {
   CtrlMsgHeader header{};
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Recv(fd, &header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
-                      "HixlClient receive header failed, fd:%d", fd);
+  HIXL_CHK_STATUS_RET(connection->Recv(&header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
+                      "HixlClient receive header failed, connection:%s", connection->Desc().c_str());
   HIXL_CHK_BOOL_RET_STATUS(header.magic == kMagicNumber, PARAM_INVALID,
                            "Invalid magic for HixlClient RecvEndpointInfoResp, expect:0x%X, actual:0x%X", kMagicNumber,
                            header.magic);
@@ -128,12 +130,12 @@ Status HixlClient::RecvEndpointInfoResp(int32_t fd, std::vector<EndpointConfig> 
   const uint64_t body_size = header.body_size;
   std::vector<uint8_t> body(body_size);
   HIXL_EVENT("[HixlClient] RecvEndpointInfoResp: receiving remote_endpoint_list body (%" PRIu64
-             " bytes) from fd=%d begin",
-             body_size, fd);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Recv(fd, body.data(), static_cast<uint32_t>(body_size), timeout_ms));
+             " bytes) from connection=%s begin",
+             body_size, connection->Desc().c_str());
+  HIXL_CHK_STATUS_RET(connection->Recv(body.data(), static_cast<uint32_t>(body_size), timeout_ms));
   HIXL_EVENT("[HixlClient] RecvEndpointInfoResp: receiving remote_endpoint_list body (%" PRIu64
-             " bytes) from fd=%d success",
-             body_size, fd);
+             " bytes) from connection=%s success",
+             body_size, connection->Desc().c_str());
 
   CtrlMsgType msg_type{};
   const void *src = static_cast<const void *>(body.data());
@@ -277,11 +279,11 @@ const std::string &HixlClient::GetRemoteEngine() const {
 }
 
 void HixlClient::CloseCtrlSocket() {
-  if (ctrl_socket_ >= 0) {
-    HIXL_LOGI("HixlClient close ctrl socket start, socket:%d", ctrl_socket_);
-    close(ctrl_socket_);
-    HIXL_LOGI("HixlClient close ctrl socket end, socket:%d", ctrl_socket_);
-    ctrl_socket_ = -1;
+  if (connection_ != nullptr) {
+    HIXL_LOGI("HixlClient close ctrl socket start, connection:%s", connection_->Desc().c_str());
+    (void)connection_->Close();
+    HIXL_LOGI("HixlClient close ctrl socket end, connection:%s", connection_->Desc().c_str());
+    connection_.reset();
   }
 }
 
@@ -323,10 +325,10 @@ void HixlClient::LogLinkPairs(const char *phase) const {
   }
 }
 
-Status HixlClient::RecvNotifyAck(int32_t fd, int32_t timeout_ms) const {
+Status HixlClient::RecvNotifyAck(const CtrlMsgPluginPtr &connection, int32_t timeout_ms) const {
   CtrlMsgHeader header{};
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Recv(fd, &header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
-                      "HixlClient receive NotifyAck header failed, fd:%d", fd);
+  HIXL_CHK_STATUS_RET(connection->Recv(&header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
+                      "HixlClient receive NotifyAck header failed, connection:%s", connection->Desc().c_str());
   HIXL_CHK_BOOL_RET_STATUS(header.magic == kMagicNumber, PARAM_INVALID,
                            "Invalid magic for NotifyAck, expect:0x%X, actual:0x%X", kMagicNumber, header.magic);
   HIXL_CHK_BOOL_RET_STATUS(header.body_size > sizeof(CtrlMsgType) && header.body_size <= kMaxRecvRespBodySize,
@@ -334,8 +336,8 @@ Status HixlClient::RecvNotifyAck(int32_t fd, int32_t timeout_ms) const {
 
   const uint64_t body_size = header.body_size;
   std::vector<uint8_t> body(body_size);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Recv(fd, body.data(), static_cast<uint32_t>(body_size), timeout_ms),
-                      "HixlClient receive NotifyAck body failed, fd:%d", fd);
+  HIXL_CHK_STATUS_RET(connection->Recv(body.data(), static_cast<uint32_t>(body_size), timeout_ms),
+                      "HixlClient receive NotifyAck body failed, connection:%s", connection->Desc().c_str());
 
   CtrlMsgType msg_type{};
   const void *src = static_cast<const void *>(body.data());
@@ -369,15 +371,21 @@ Status HixlClient::CheckAlive() {
 
 bool HixlClient::IsCtrlSocketWritable() const {
   struct pollfd pfd = {};
-  pfd.fd = ctrl_socket_;
+  pfd.fd = connection_->Fd();
   pfd.events = POLLOUT;
   return poll(&pfd, 1, 0) > 0;
 }
 
 Status HixlClient::CheckAliveLocked() {
-  HIXL_CHK_BOOL_RET_STATUS(ctrl_socket_ >= 0, FAILED,
-                           "HixlClient CheckAlive failed, peer_ip:%s, peer_port:%u, ctrl socket is invalid, fd:%d",
-                           server_ip_.c_str(), server_port_, ctrl_socket_);
+  HIXL_CHK_BOOL_RET_STATUS(connection_ != nullptr, FAILED,
+                           "HixlClient CheckAlive failed, peer_ip:%s, peer_port:%u, control connection is null",
+                           server_ip_.c_str(), server_port_);
+  if (!connection_->IsUsable()) {
+    HIXL_LOGE(FAILED, "HixlClient control connection is unusable, peer_ip:%s, peer_port:%u, fd:%d", server_ip_.c_str(),
+              server_port_, connection_->Fd());
+    CloseCtrlSocket();
+    return FAILED;
+  }
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = sizeof(CtrlMsgType);
@@ -390,23 +398,25 @@ Status HixlClient::CheckAliveLocked() {
   HIXL_CHK_BOOL_RET_STATUS(rc == EOK, FAILED, "memcpy_s heartbeat msg_type failed, rc=%d", static_cast<int32_t>(rc));
 
   if (!IsCtrlSocketWritable()) {
-    HIXL_LOGW("HixlClient CheckAlive skipped heartbeat, ctrl socket is not writable, peer_ip:%s, peer_port:%u, fd:%d",
-              server_ip_.c_str(), server_port_, ctrl_socket_);
+    HIXL_LOGW(
+        "HixlClient CheckAlive skipped heartbeat, ctrl socket is not writable, peer_ip:%s, peer_port:%u, connection:%s",
+        server_ip_.c_str(), server_port_, connection_->Desc().c_str());
     return SUCCESS;
   }
 
   int32_t err_no = 0;
-  Status ret = CtrlMsgPlugin::Send(ctrl_socket_, heartbeat_msg.data(), heartbeat_msg.size(),
-                                   CtrlMsgPlugin::kDefaultCtrlTimeoutMs, err_no);
+  Status ret =
+      connection_->Send(heartbeat_msg.data(), heartbeat_msg.size(), CtrlMsgPlugin::kDefaultCtrlTimeoutMs, err_no);
   if (ret != SUCCESS) {
-    if (IsSocketDisconnectedErrno(err_no)) {
-      HIXL_LOGE(FAILED, "HixlClient CheckAlive send heartbeat failed, peer_ip:%s, peer_port:%u, fd=%d, errno=%d",
-                server_ip_.c_str(), server_port_, ctrl_socket_, err_no);
+    if (!connection_->IsUsable() || IsSocketDisconnectedErrno(err_no)) {
+      HIXL_LOGE(FAILED,
+                "HixlClient CheckAlive send heartbeat failed, peer_ip:%s, peer_port:%u, connection=%s, errno=%d",
+                server_ip_.c_str(), server_port_, connection_->Desc().c_str(), err_no);
       CloseCtrlSocket();
       return FAILED;
     }
-    HIXL_LOGW("HixlClient CheckAlive send heartbeat failed, peer_ip:%s, peer_port:%u, fd=%d, errno=%d",
-              server_ip_.c_str(), server_port_, ctrl_socket_, err_no);
+    HIXL_LOGW("HixlClient CheckAlive send heartbeat failed, peer_ip:%s, peer_port:%u, connection=%s, errno=%d",
+              server_ip_.c_str(), server_port_, connection_->Desc().c_str(), err_no);
     return SUCCESS;
   }
   return SUCCESS;
@@ -446,23 +456,24 @@ Status HixlClient::SendNotify(const NotifyDesc &notify, int32_t timeout_ms) cons
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + msg_str.size());
   CtrlMsgType msg_type = CtrlMsgType::kNotify;
 
-  HIXL_CHK_BOOL_RET_STATUS(ctrl_socket_ >= 0, FAILED, "HixlClient SendNotify failed, ctrl socket is invalid, fd:%d",
-                           ctrl_socket_);
+  HIXL_CHK_BOOL_RET_STATUS(connection_ != nullptr, FAILED,
+                           "HixlClient SendNotify failed, control connection is null, peer_ip:%s, peer_port:%u",
+                           server_ip_.c_str(), server_port_);
 
-  const uint32_t send_timeout_ms = static_cast<uint32_t>(timeout_ms);
   HIXL_CHK_STATUS_RET(
-      CtrlMsgPlugin::Send(ctrl_socket_, &header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms),
-      "HixlClient send NotifyMsg header failed, socket:%d", ctrl_socket_);
+      connection_->Send(&header, static_cast<uint64_t>(sizeof(header)), static_cast<uint32_t>(timeout_ms)),
+      "HixlClient send NotifyMsg header failed, connection:%s", connection_->Desc().c_str());
   HIXL_CHK_STATUS_RET(
-      CtrlMsgPlugin::Send(ctrl_socket_, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms),
-      "HixlClient send NotifyMsg msg_type failed, socket:%d", ctrl_socket_);
+      connection_->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)), static_cast<uint32_t>(timeout_ms)),
+      "HixlClient send NotifyMsg msg_type failed, connection:%s", connection_->Desc().c_str());
   HIXL_CHK_STATUS_RET(
-      CtrlMsgPlugin::Send(ctrl_socket_, msg_str.c_str(), static_cast<uint64_t>(msg_str.size()), send_timeout_ms),
-      "HixlClient send NotifyMsg body failed, socket:%d", ctrl_socket_);
+      connection_->Send(msg_str.c_str(), static_cast<uint64_t>(msg_str.size()), static_cast<uint32_t>(timeout_ms)),
+      "HixlClient send NotifyMsg body failed, connection:%s", connection_->Desc().c_str());
 
-  HIXL_LOGI("HixlClient sent NotifyMsg, name:%s, socket:%d", notify_msg.name.c_str(), ctrl_socket_);
-  HIXL_CHK_STATUS_RET(RecvNotifyAck(ctrl_socket_, timeout_ms),
-                      "HixlClient receive NotifyAck failed, timeout:%d ms, socket:%d", timeout_ms, ctrl_socket_);
+  HIXL_LOGI("HixlClient sent NotifyMsg, name:%s, connection:%s", notify_msg.name.c_str(), connection_->Desc().c_str());
+  HIXL_CHK_STATUS_RET(RecvNotifyAck(connection_, timeout_ms),
+                      "HixlClient receive NotifyAck failed, timeout:%d ms, connection:%s", timeout_ms,
+                      connection_->Desc().c_str());
   return SUCCESS;
 }
 }  // namespace hixl

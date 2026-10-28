@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ constexpr int32_t kMaxServiceLevel = 7;
 // A daemon request (kConnect/kDisconnect) carries a self-declared channel id in "ip:port" form. Bind the claimed
 // id to the connection's real source ip so one peer cannot forge another engine's identity to hijack or tear
 // down that engine's links on this server.
-Status ValidatePeerIdentity(int32_t fd, const std::string &claimed_channel_id) {
+Status ValidatePeerIdentity(const hixl::CtrlMsgPluginPtr &connection, const std::string &claimed_channel_id) {
   std::string claimed_ip;
   int32_t claimed_port = -1;
   HIXL_CHK_STATUS_RET(hixl::ParseListenInfo(claimed_channel_id, claimed_ip, claimed_port),
@@ -48,11 +48,13 @@ Status ValidatePeerIdentity(int32_t fd, const std::string &claimed_channel_id) {
                       "Failed to canonicalize claimed ip:%s, channel id:%s.", claimed_ip.c_str(),
                       claimed_channel_id.c_str());
   std::string peer_ip;
-  HIXL_CHK_STATUS_RET(hixl::GetPeerIp(fd, peer_ip), "Failed to get peer ip, fd:%d.", fd);
-  ADXL_CHK_BOOL_RET_STATUS(peer_ip == canonical_claimed_ip, PARAM_INVALID,
-                           "Peer identity mismatch: claimed ip:%s in channel id:%s, actual source ip:%s, fd:%d. "
-                           "Reject the request to protect links of the claimed engine.",
-                           claimed_ip.c_str(), claimed_channel_id.c_str(), peer_ip.c_str(), fd);
+  HIXL_CHK_STATUS_RET(hixl::GetPeerIp(connection->Fd(), peer_ip), "Failed to get peer ip, connection:%s.",
+                      connection->Desc().c_str());
+  ADXL_CHK_BOOL_RET_STATUS(
+      peer_ip == canonical_claimed_ip, PARAM_INVALID,
+      "Peer identity mismatch: claimed ip:%s in channel id:%s, actual source ip:%s, connection:%s. "
+      "Reject the request to protect links of the claimed engine.",
+      claimed_ip.c_str(), claimed_channel_id.c_str(), peer_ip.c_str(), connection->Desc().c_str());
   return SUCCESS;
 }
 }  // namespace
@@ -130,18 +132,20 @@ Status ChannelMsgHandler::Deserialize(const char *msg_str, uint64_t msg_len, T &
 }
 
 template <typename T>
-Status ChannelMsgHandler::SendMsg(int32_t fd, ChannelMsgType msg_type, const T &msg) {
+Status ChannelMsgHandler::SendMsg(const hixl::CtrlMsgPluginPtr &connection, ChannelMsgType msg_type, const T &msg) {
   std::string msg_str;
   ADXL_CHK_STATUS_RET(ChannelMsgHandler::Serialize(msg, msg_str), "Failed to serialize msg");
-  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::SendMsg(fd, static_cast<int32_t>(msg_type), msg_str), "Failed to send msg");
+  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::SendMsg(connection, static_cast<int32_t>(msg_type), msg_str),
+                   "Failed to send msg");
   return SUCCESS;
 }
 
 template <typename T>
-Status ChannelMsgHandler::RecvMsg(int32_t fd, ChannelMsgType msg_type, T &msg) {
+Status ChannelMsgHandler::RecvMsg(const hixl::CtrlMsgPluginPtr &connection, ChannelMsgType msg_type, T &msg,
+                                  int32_t timeout_ms) {
   std::vector<char> msg_str;
   int32_t type = 0;
-  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::RecvMsg(fd, type, msg_str), "Failed to recv msg");
+  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::RecvMsg(connection, type, msg_str, timeout_ms), "Failed to recv msg");
   ADXL_CHK_BOOL_RET_STATUS(msg_type == static_cast<ChannelMsgType>(type), FAILED,
                            "Failed to check recv msg type:%d, expect type:%d", type, static_cast<int32_t>(msg_type));
   ADXL_CHK_STATUS_RET(ChannelMsgHandler::Deserialize(&msg_str[0], msg_str.size(), msg), "Failed to deserialize msg");
@@ -209,7 +213,7 @@ Status ChannelMsgHandler::Initialize(const std::map<AscendString, AscendString> 
   llm::CommAdapter::GetInstance().DlHcclCommConfigInit(&comm_config_);
   ADXL_CHK_STATUS_RET(ParseTrafficClass(options), "Failed to parse traffic class");
   ADXL_CHK_STATUS_RET(ParseServiceLevel(options), "Failed to parse service level");
-  handler_plugin_.Initialize();
+  ADXL_CHK_LLM_RET(handler_plugin_.Initialize(), "Failed to initialize control listener");
   if (listen_port_ > 0) {
     ADXL_CHK_STATUS_RET(StartDaemon(local_ip_, listen_port_), "Failed to start listen daemon, ip:%s, port:%u",
                         local_ip_.c_str(), listen_port_);
@@ -288,23 +292,27 @@ Status ChannelMsgHandler::RegisterCallbackProcessor(int32_t msg_type, CallbackPr
 }
 
 Status ChannelMsgHandler::StartDaemon(const std::string &ip, uint32_t listen_port) {
-  handler_plugin_.RegisterConnectedProcess([this](int32_t fd, bool &keep_fd) { (void)ConnectedProcess(fd, keep_fd); });
-  ADXL_CHK_STATUS_RET(
-      RegisterCallbackProcessor(static_cast<int32_t>(ChannelMsgType::kConnect),
-                                [this](int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd) -> Status {
-                                  ADXL_CHK_STATUS_RET(ProcessConnectRequest(fd, msg, msg_len, keep_fd),
+  handler_plugin_.RegisterConnectedProcess([this](const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection) {
+    (void)ConnectedProcess(connection, keep_connection);
+  });
+  ADXL_CHK_STATUS_RET(RegisterCallbackProcessor(static_cast<int32_t>(ChannelMsgType::kConnect),
+                                                [this](const hixl::CtrlMsgPluginPtr &connection, const char *msg,
+                                                       uint64_t msg_len, bool &keep_connection) -> Status {
+                                                  ADXL_CHK_STATUS_RET(
+                                                      ProcessConnectRequest(connection, msg, msg_len, keep_connection),
                                                       "Failed to process connect request");
-                                  return SUCCESS;
-                                }),
-      "Failed to register connect callback");
-  ADXL_CHK_STATUS_RET(
-      RegisterCallbackProcessor(static_cast<int32_t>(ChannelMsgType::kDisconnect),
-                                [this](int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd) -> Status {
-                                  ADXL_CHK_STATUS_RET(ProcessDisconnectRequest(fd, msg, msg_len, keep_fd),
-                                                      "Failed to process disconnect request");
-                                  return SUCCESS;
-                                }),
-      "Failed to register connect callback");
+                                                  return SUCCESS;
+                                                }),
+                      "Failed to register connect callback");
+  ADXL_CHK_STATUS_RET(RegisterCallbackProcessor(static_cast<int32_t>(ChannelMsgType::kDisconnect),
+                                                [this](const hixl::CtrlMsgPluginPtr &connection, const char *msg,
+                                                       uint64_t msg_len, bool &keep_connection) -> Status {
+                                                  ADXL_CHK_STATUS_RET(ProcessDisconnectRequest(connection, msg, msg_len,
+                                                                                               keep_connection),
+                                                                      "Failed to process disconnect request");
+                                                  return SUCCESS;
+                                                }),
+                      "Failed to register connect callback");
   ADXL_CHK_LLM_RET(handler_plugin_.StartDaemon(ip, listen_port), "Failed to start daemon.");
   return SUCCESS;
 }
@@ -417,22 +425,23 @@ Status ChannelMsgHandler::FillLocalConnectInfo(ChannelConnectInfo &channel_conne
   return SUCCESS;
 }
 
-Status ChannelMsgHandler::StartChannelHeartbeat(const std::string &channel_id, ChannelType channel_type, int32_t fd,
-                                                bool &keep_fd) {
+Status ChannelMsgHandler::StartChannelHeartbeat(const std::string &channel_id, ChannelType channel_type,
+                                                const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection) {
   auto channel = channel_manager_->GetChannel(channel_type, channel_id);
   ADXL_CHK_BOOL_RET_STATUS(channel != nullptr, FAILED, "Failed to get channel, local engine:%s, remote engine:%s.",
                            listen_info_.c_str(), channel_id.c_str());
-  ADXL_CHK_STATUS_RET(channel->SetSocketNonBlocking(fd),
+  ADXL_CHK_STATUS_RET(channel->SetSocketNonBlocking(connection),
                       "Failed to start heartbeat, local engine:%s, remote engine:%s.", listen_info_.c_str(),
                       channel_id.c_str());
-  ADXL_CHK_STATUS_RET(channel_manager_->AddSocketToEpoll(fd, channel),
+  ADXL_CHK_STATUS_RET(channel_manager_->AddSocketToEpoll(connection, channel),
                       "Failed to add fd to epoll, local engine:%s, remote engine:%s.", listen_info_.c_str(),
                       channel_id.c_str());
-  keep_fd = true;
+  keep_connection = true;
   return SUCCESS;
 }
 
-Status ChannelMsgHandler::ProcessConnectRequest(int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd) {
+Status ChannelMsgHandler::ProcessConnectRequest(const hixl::CtrlMsgPluginPtr &connection, const char *msg,
+                                                uint64_t msg_len, bool &keep_connection) {
   const auto start = std::chrono::steady_clock::now();
   ADXL_CHK_BOOL_RET_STATUS(msg != nullptr && msg_len > 0, PARAM_INVALID,
                            "Failed to check connect msg, local engine:%s, msg_len:%lu.", listen_info_.c_str(), msg_len);
@@ -440,19 +449,20 @@ Status ChannelMsgHandler::ProcessConnectRequest(int32_t fd, const char *msg, uin
   ADXL_CHK_STATUS_RET(ChannelMsgHandler::Deserialize(msg, msg_len, peer_connect_info),
                       "Failed to deserialize connect msg");
   // Validate identity before exchanging local info or touching any existing channel of the claimed engine.
-  const Status identity_ret = ValidatePeerIdentity(fd, peer_connect_info.channel_id);
+  const Status identity_ret = ValidatePeerIdentity(connection, peer_connect_info.channel_id);
   if (identity_ret != SUCCESS) {
-    ADXL_CHK_STATUS(identity_ret, "Failed to validate peer identity, local engine:%s, claimed engine:%s, fd:%d.",
-                    listen_info_.c_str(), peer_connect_info.channel_id.c_str(), fd);
+    ADXL_CHK_STATUS(identity_ret, "Failed to validate peer identity, local engine:%s, claimed engine:%s.",
+                    listen_info_.c_str(), peer_connect_info.channel_id.c_str());
     ChannelStatus status{};
     status.error_code = static_cast<uint32_t>(identity_ret);
     status.error_message = "Peer identity validation failed";
-    (void)ChannelMsgHandler::SendMsg(fd, ChannelMsgType::kStatus, status);
+    (void)ChannelMsgHandler::SendMsg(connection, ChannelMsgType::kStatus, status);
     return identity_ret;
   }
   ChannelConnectInfo channel_connect_info = {};
   ADXL_CHK_STATUS_RET(FillLocalConnectInfo(channel_connect_info), "Failed to fill local connect info");
-  ADXL_CHK_STATUS_RET(SendMsg(fd, ChannelMsgType::kConnect, channel_connect_info), "Failed to send connect msg");
+  ADXL_CHK_STATUS_RET(SendMsg(connection, ChannelMsgType::kConnect, channel_connect_info),
+                      "Failed to send connect msg");
   LLMLOGI("Start to process connect info, local engine:%s, remote engine:%s, timeout:%d ms.", listen_info_.c_str(),
           peer_connect_info.channel_id.c_str(), peer_connect_info.timeout);
   peer_connect_info.comm_name = "hixl_" + peer_connect_info.channel_id + "_" + listen_info_;
@@ -464,8 +474,9 @@ Status ChannelMsgHandler::ProcessConnectRequest(int32_t fd, const char *msg, uin
   ADXL_CHK_STATUS(ret, "Failed to process connect info, local engine:%s, remote engine:%s, timeout:%d ms.",
                   listen_info_.c_str(), peer_connect_info.channel_id.c_str(), peer_connect_info.timeout);
   if (ret == SUCCESS) {
-    ADXL_CHK_STATUS_RET(StartChannelHeartbeat(peer_connect_info.channel_id, ChannelType::kServer, fd, keep_fd),
-                        "Failed to start server channel heartbeat");
+    ADXL_CHK_STATUS_RET(
+        StartChannelHeartbeat(peer_connect_info.channel_id, ChannelType::kServer, connection, keep_connection),
+        "Failed to start server channel heartbeat");
     const auto cost =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
     StatisticManager::GetInstance().UpdateConnectTotalCost(
@@ -473,7 +484,7 @@ Status ChannelMsgHandler::ProcessConnectRequest(int32_t fd, const char *msg, uin
   }
   ChannelStatus status{};
   status.error_code = ret;
-  ChannelMsgHandler::SendMsg(fd, ChannelMsgType::kStatus, status);
+  ChannelMsgHandler::SendMsg(connection, ChannelMsgType::kStatus, status);
   return ret;
 }
 
@@ -483,16 +494,17 @@ Status ChannelMsgHandler::DisconnectInfoProcess(ChannelType channel_type,
   return channel_manager_->DestroyChannel(channel_type, peer_disconnect_info.channel_id);
 }
 
-Status ChannelMsgHandler::ProcessDisconnectRequest(int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd) {
-  keep_fd = false;
+Status ChannelMsgHandler::ProcessDisconnectRequest(const hixl::CtrlMsgPluginPtr &connection, const char *msg,
+                                                   uint64_t msg_len, bool &keep_connection) {
+  keep_connection = false;
   ADXL_CHK_BOOL_RET_STATUS(msg != nullptr && msg_len > 0, PARAM_INVALID,
                            "Failed to check disconnect msg, local engine:%s, msg_len:%lu.", listen_info_.c_str(),
                            msg_len);
   auto ret = SUCCESS;
-  LLM_MAKE_GUARD(send_status, ([fd, &ret]() {
+  LLM_MAKE_GUARD(send_status, ([connection, &ret]() {
                    ChannelStatus status{};
                    status.error_code = ret;
-                   ChannelMsgHandler::SendMsg(fd, ChannelMsgType::kStatus, status);
+                   ChannelMsgHandler::SendMsg(connection, ChannelMsgType::kStatus, status);
                  }));
 
   ChannelDisconnectInfo peer_disconnect_info{};
@@ -502,9 +514,9 @@ Status ChannelMsgHandler::ProcessDisconnectRequest(int32_t fd, const char *msg, 
   LLMLOGI("Start to process disconnect info, local engine:%s, remote engine:%s.", listen_info_.c_str(),
           peer_disconnect_info.channel_id.c_str());
   // Assign ret before any early return: the send_status guard below reports ret to the peer.
-  ret = ValidatePeerIdentity(fd, peer_disconnect_info.channel_id);
-  ADXL_CHK_STATUS(ret, "Failed to validate peer identity, local engine:%s, claimed engine:%s, fd:%d.",
-                  listen_info_.c_str(), peer_disconnect_info.channel_id.c_str(), fd);
+  ret = ValidatePeerIdentity(connection, peer_disconnect_info.channel_id);
+  ADXL_CHK_STATUS(ret, "Failed to validate peer identity, local engine:%s, claimed engine:%s.", listen_info_.c_str(),
+                  peer_disconnect_info.channel_id.c_str());
   if (ret != SUCCESS) {
     return ret;
   }
@@ -518,11 +530,12 @@ Status ChannelMsgHandler::ProcessDisconnectRequest(int32_t fd, const char *msg, 
   return ret;
 }
 
-Status ChannelMsgHandler::ConnectedProcess(int32_t fd, bool &keep_fd) {
-  keep_fd = false;
+Status ChannelMsgHandler::ConnectedProcess(const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection) {
+  keep_connection = false;
   int32_t msg_type = 0;
   std::vector<char> msg;
-  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::RecvMsg(fd, msg_type, msg), "Failed to recv msg");
+  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::RecvMsg(connection, msg_type, msg, llm::kServerReadTimeoutMs),
+                   "Failed to recv msg");
   CallbackProcessor processor;
   {
     std::lock_guard<std::mutex> lock(callback_mutex_);
@@ -530,7 +543,8 @@ Status ChannelMsgHandler::ConnectedProcess(int32_t fd, bool &keep_fd) {
     ADXL_CHK_BOOL_RET_STATUS(iter != callbacks_.cend(), PARAM_INVALID, "Failed to check msg type:%d", msg_type);
     processor = iter->second;
   }
-  ADXL_CHK_STATUS_RET(processor(fd, &msg[0], msg.size(), keep_fd), "Failed to process msg, type:%d", msg_type);
+  ADXL_CHK_STATUS_RET(processor(connection, &msg[0], msg.size(), keep_connection), "Failed to process msg, type:%d",
+                      msg_type);
   return SUCCESS;
 }
 
@@ -552,15 +566,25 @@ Status ChannelMsgHandler::Connect(const std::string &remote_engine, int32_t time
 }
 
 Status ChannelMsgHandler::ConnectToPeer(const std::string &remote_engine, int32_t timeout_in_millis,
-                                        int32_t &conn_fd) const {
+                                        hixl::CtrlMsgPluginPtr &connection) const {
   std::string remote_ip;
   int32_t remote_port = -1;
   HIXL_CHK_STATUS_RET(hixl::ParseListenInfo(remote_engine, remote_ip, remote_port), "Failed to parse listen info");
   const auto tcp_start = std::chrono::steady_clock::now();
-  ADXL_CHK_LLM_RET(
-      llm::MsgHandlerPlugin::Connect(remote_ip, static_cast<uint32_t>(remote_port), conn_fd, timeout_in_millis, FAILED),
-      "Failed to connect, local engine:%s, remote engine:%s, timeout:%d ms.", listen_info_.c_str(),
-      remote_engine.c_str(), timeout_in_millis);
+  connection.reset();
+  auto new_connection = llm::MakeShared<hixl::CtrlMsgPlugin>();
+  ADXL_CHECK_NOTNULL(new_connection);
+  const auto init_ret = new_connection->Initialize();
+  ADXL_CHK_BOOL_RET_STATUS(init_ret == hixl::SUCCESS, FAILED,
+                           "Call api:CtrlMsgPlugin::Initialize failed, local engine:%s, remote engine:%s, ret:%u",
+                           listen_info_.c_str(), remote_engine.c_str(), init_ret);
+  const auto connect_ret = new_connection->Connect(remote_ip, static_cast<uint32_t>(remote_port), timeout_in_millis);
+  ADXL_CHK_BOOL_RET_STATUS(connect_ret == hixl::SUCCESS,
+                           (connect_ret == hixl::PARAM_INVALID || connect_ret == hixl::TIMEOUT) ? connect_ret : FAILED,
+                           "Call api:CtrlMsgPlugin::Connect failed, local engine:%s, remote engine:%s, "
+                           "timeout:%d ms, hixl_status:%u",
+                           listen_info_.c_str(), remote_engine.c_str(), timeout_in_millis, connect_ret);
+  connection = std::move(new_connection);
   const auto tcp_end = std::chrono::steady_clock::now();
   const auto tcp_cost = std::chrono::duration_cast<std::chrono::microseconds>(tcp_end - tcp_start).count();
   StatisticManager::GetInstance().UpdateTcpConnectCost(StatisticManager::GetClientStatisticChannelId(remote_engine),
@@ -568,33 +592,34 @@ Status ChannelMsgHandler::ConnectToPeer(const std::string &remote_engine, int32_
   return SUCCESS;
 }
 
-Status ChannelMsgHandler::ExchangeConnectInfo(int32_t conn_fd, int32_t timeout_in_millis,
+Status ChannelMsgHandler::ExchangeConnectInfo(const hixl::CtrlMsgPluginPtr &connection, int32_t timeout_in_millis,
                                               ChannelConnectInfo &peer_connect_info) const {
   ChannelConnectInfo connect_info = {};
   connect_info.channel_id = listen_info_;
   connect_info.comm_res = local_comm_res_;
   connect_info.timeout = timeout_in_millis;
-  ADXL_CHK_STATUS_RET(SendMsg(conn_fd, ChannelMsgType::kConnect, connect_info), "Failed to send connect msg");
-  ADXL_CHK_STATUS_RET(RecvMsg(conn_fd, ChannelMsgType::kConnect, peer_connect_info), "Failed to recv connect msg");
+  ADXL_CHK_STATUS_RET(SendMsg(connection, ChannelMsgType::kConnect, connect_info), "Failed to send connect msg");
+  ADXL_CHK_STATUS_RET(RecvMsg(connection, ChannelMsgType::kConnect, peer_connect_info, timeout_in_millis),
+                      "Failed to recv connect msg");
   peer_connect_info.comm_name = "hixl_" + listen_info_ + "_" + peer_connect_info.channel_id;
   return SUCCESS;
 }
 
 Status ChannelMsgHandler::DoConnect(const std::string &remote_engine, int32_t timeout_in_millis) {
-  int32_t conn_fd = 0;
-  ADXL_CHK_STATUS_RET(ConnectToPeer(remote_engine, timeout_in_millis, conn_fd), "Failed to connect peer");
-  LLM_DISMISSABLE_GUARD(close_fd, ([conn_fd, this, &remote_engine]() {
-                          llm::MsgHandlerPlugin::Disconnect(conn_fd);
+  hixl::CtrlMsgPluginPtr connection;
+  ADXL_CHK_STATUS_RET(ConnectToPeer(remote_engine, timeout_in_millis, connection), "Failed to connect peer");
+  LLM_DISMISSABLE_GUARD(close_connection, ([connection, this, &remote_engine]() {
+                          (void)connection->Close();
                           if (channel_manager_->GetChannel(ChannelType::kClient, remote_engine) != nullptr) {
                             (void)channel_manager_->DestroyChannel(ChannelType::kClient, remote_engine);
                           }
                         }));
   ChannelConnectInfo peer_connect_info = {};
-  ADXL_CHK_STATUS_RET(ExchangeConnectInfo(conn_fd, timeout_in_millis, peer_connect_info),
+  ADXL_CHK_STATUS_RET(ExchangeConnectInfo(connection, timeout_in_millis, peer_connect_info),
                       "Failed to exchange connect info");
   auto ret = ConnectInfoProcess(peer_connect_info, timeout_in_millis, true);
   ChannelStatus status{};
-  ADXL_CHK_STATUS_RET(RecvMsg(conn_fd, ChannelMsgType::kStatus, status),
+  ADXL_CHK_STATUS_RET(RecvMsg(connection, ChannelMsgType::kStatus, status, timeout_in_millis),
                       "Failed to recv status msg, local engine:%s, remote engine:%s, timeout:%d ms.",
                       listen_info_.c_str(), remote_engine.c_str(), timeout_in_millis);
   ADXL_CHK_STATUS_RET(status.error_code,
@@ -607,17 +632,17 @@ Status ChannelMsgHandler::DoConnect(const std::string &remote_engine, int32_t ti
   ADXL_CHK_BOOL_RET_STATUS(channel != nullptr, FAILED,
                            "Failed to get channel, local engine:%s, remote engine:%s, timeout:%d ms.",
                            listen_info_.c_str(), remote_engine.c_str(), timeout_in_millis);
-  ADXL_CHK_STATUS_RET(channel->SetSocketNonBlocking(conn_fd), "Failed to start heartbeat, remote_engine:%s.",
+  ADXL_CHK_STATUS_RET(channel->SetSocketNonBlocking(connection), "Failed to start heartbeat, remote_engine:%s.",
                       remote_engine.c_str());
-  ADXL_CHK_STATUS_RET(channel_manager_->AddSocketToEpoll(conn_fd, channel),
+  ADXL_CHK_STATUS_RET(channel_manager_->AddSocketToEpoll(connection, channel),
                       "Failed to add fd to epoll, local engine:%s, remote engine:%s.", listen_info_.c_str(),
                       peer_connect_info.channel_id.c_str());
-  LLM_DISMISS_GUARD(close_fd);
+  LLM_DISMISS_GUARD(close_connection);
   return SUCCESS;
 }
 
 Status ChannelMsgHandler::PrepareDisconnect(const std::string &remote_engine, int32_t timeout_in_millis,
-                                            int32_t &conn_fd) const {
+                                            hixl::CtrlMsgPluginPtr &connection) const {
   std::string remote_ip;
   int32_t remote_port = -1;
   HIXL_CHK_STATUS_RET(hixl::ParseListenInfo(remote_engine, remote_ip, remote_port),
@@ -627,18 +652,38 @@ Status ChannelMsgHandler::PrepareDisconnect(const std::string &remote_engine, in
     return NOT_CONNECTED;
   }
   channel->StopHeartbeat();
-  ADXL_CHK_LLM_RET(llm::MsgHandlerPlugin::Connect(remote_ip, static_cast<uint32_t>(remote_port), conn_fd,
-                                                  timeout_in_millis, SUCCESS),
-                   "Disconnect prepare failed to connect peer %s:%d, local:%s, remote:%s, timeout:%d ms.",
-                   remote_ip.c_str(), remote_port, listen_info_.c_str(), remote_engine.c_str(), timeout_in_millis);
+  connection.reset();
+  auto new_connection = llm::MakeShared<hixl::CtrlMsgPlugin>();
+  ADXL_CHECK_NOTNULL(new_connection);
+  const auto init_ret = new_connection->Initialize();
+  if (init_ret != hixl::SUCCESS) {
+    LLMLOGW(
+        "Call api:CtrlMsgPlugin::Initialize failed during disconnect, continue local cleanup, "
+        "local:%s, remote:%s, ret:%u",
+        listen_info_.c_str(), remote_engine.c_str(), init_ret);
+    return SUCCESS;
+  }
+  const auto connect_ret = new_connection->Connect(remote_ip, static_cast<uint32_t>(remote_port), timeout_in_millis);
+  if (connect_ret != hixl::SUCCESS) {
+    ADXL_CHK_BOOL_RET_STATUS(connect_ret != hixl::PARAM_INVALID, connect_ret,
+                             "Call api:CtrlMsgPlugin::Connect failed during disconnect, local:%s, "
+                             "remote:%s, timeout:%d ms, hixl_status:%u",
+                             listen_info_.c_str(), remote_engine.c_str(), timeout_in_millis, connect_ret);
+    LLMLOGW(
+        "Call api:CtrlMsgPlugin::Connect failed during disconnect, continue local cleanup, "
+        "local:%s, remote:%s, timeout:%d ms, hixl_status:%u",
+        listen_info_.c_str(), remote_engine.c_str(), timeout_in_millis, connect_ret);
+    return SUCCESS;
+  }
+  connection = std::move(new_connection);
   return SUCCESS;
 }
 
-void ChannelMsgHandler::SendDisconnectRequest(int32_t conn_fd, Status &send_status) const {
-  if (conn_fd >= 0) {
+void ChannelMsgHandler::SendDisconnectRequest(const hixl::CtrlMsgPluginPtr &connection, Status &send_status) const {
+  if (connection != nullptr) {
     ChannelDisconnectInfo disconnect_info = {};
     disconnect_info.channel_id = listen_info_;
-    send_status = SendMsg(conn_fd, ChannelMsgType::kDisconnect, disconnect_info);
+    send_status = SendMsg(connection, ChannelMsgType::kDisconnect, disconnect_info);
   }
 }
 
@@ -650,18 +695,19 @@ Status ChannelMsgHandler::CleanupDisconnectResources(const std::string &remote_e
   return SUCCESS;
 }
 
-Status ChannelMsgHandler::ValidateDisconnectResponse(int32_t conn_fd, Status send_status) const {
+Status ChannelMsgHandler::ValidateDisconnectResponse(const hixl::CtrlMsgPluginPtr &connection, Status send_status,
+                                                     int32_t timeout_ms) const {
   if (send_status != SUCCESS) {
     // Peer may already be down; local cleanup is done, skip recv.
     return SUCCESS;
   }
   ChannelStatus status{};
-  ADXL_CHK_STATUS_RET(RecvMsg(conn_fd, ChannelMsgType::kStatus, status),
-                      "Disconnect failed to recv peer status response, local:%s, conn_fd:%d.", listen_info_.c_str(),
-                      conn_fd);
+  ADXL_CHK_STATUS_RET(RecvMsg(connection, ChannelMsgType::kStatus, status, timeout_ms),
+                      "Disconnect failed to recv peer status response, local:%s, timeout:%d ms.", listen_info_.c_str(),
+                      timeout_ms);
   if (status.error_code != SUCCESS) {
-    LLMLOGE(status.error_code, "Disconnect rejected by peer, local:%s, conn_fd:%d, peer_error_code:%u, peer_msg:%s.",
-            listen_info_.c_str(), conn_fd, status.error_code, status.error_message.c_str());
+    LLMLOGE(status.error_code, "Disconnect rejected by peer, local:%s, connection:%s, peer_error_code:%u, peer_msg:%s.",
+            listen_info_.c_str(), connection->Desc().c_str(), status.error_code, status.error_message.c_str());
     return static_cast<Status>(status.error_code);
   }
   return SUCCESS;
@@ -683,24 +729,24 @@ Status ChannelMsgHandler::CheckPrepareDisconnectResult(Status prepare_ret, const
 Status ChannelMsgHandler::Disconnect(const std::string &remote_engine, int32_t timeout_in_millis) {
   LLMEVENT("Start to disconnect, local engine:%s, remote engine:%s, timeout:%d ms.", listen_info_.c_str(),
            remote_engine.c_str(), timeout_in_millis);
-  int32_t conn_fd = -1;
-  LLM_MAKE_GUARD(close_fd, ([&conn_fd]() {
-                   if (conn_fd >= 0) {
-                     llm::MsgHandlerPlugin::Disconnect(conn_fd);
+  hixl::CtrlMsgPluginPtr connection;
+  LLM_MAKE_GUARD(close_connection, ([&connection]() {
+                   if (connection != nullptr) {
+                     (void)connection->Close();
                    }
                  }));
-  const Status prepare_ret = PrepareDisconnect(remote_engine, timeout_in_millis, conn_fd);
+  const Status prepare_ret = PrepareDisconnect(remote_engine, timeout_in_millis, connection);
   const Status check_ret = CheckPrepareDisconnectResult(prepare_ret, remote_engine, timeout_in_millis);
   if (check_ret != SUCCESS) {
     return check_ret;
   }
   Status send_status = FAILED;
-  SendDisconnectRequest(conn_fd, send_status);
-  if (conn_fd >= 0 && send_status != SUCCESS) {
+  SendDisconnectRequest(connection, send_status);
+  if (connection != nullptr && send_status != SUCCESS) {
     LLMLOGE(send_status,
             "Disconnect failed at send_disconnect_msg, peer may be down, continue local cleanup, local:%s, "
-            "remote:%s, conn_fd:%d.",
-            listen_info_.c_str(), remote_engine.c_str(), conn_fd);
+            "remote:%s, connection:%s.",
+            listen_info_.c_str(), remote_engine.c_str(), connection->Desc().c_str());
   }
   const Status cleanup_ret = CleanupDisconnectResources(remote_engine);
   if (cleanup_ret != SUCCESS) {
@@ -716,10 +762,10 @@ Status ChannelMsgHandler::Disconnect(const std::string &remote_engine, int32_t t
             remote_engine.c_str());
     return destroy_ret;
   }
-  const Status validate_ret = ValidateDisconnectResponse(conn_fd, send_status);
+  const Status validate_ret = ValidateDisconnectResponse(connection, send_status, timeout_in_millis);
   if (validate_ret != SUCCESS) {
-    LLMLOGE(validate_ret, "Disconnect failed at validate_peer_response, local:%s, remote:%s, conn_fd:%d.",
-            listen_info_.c_str(), remote_engine.c_str(), conn_fd);
+    LLMLOGE(validate_ret, "Disconnect failed at validate_peer_response, local:%s, remote:%s.", listen_info_.c_str(),
+            remote_engine.c_str());
     return validate_ret;
   }
   LLMEVENT("Success to disconnect, local engine:%s, remote engine:%s, timeout:%d ms.", listen_info_.c_str(),
@@ -745,17 +791,13 @@ Status ChannelMsgHandler::StartEvictionThread() {
 }
 
 Status ChannelMsgHandler::SetupChannelManagerCallbacks() {
-  channel_manager_->SetDisconnectCallback([this](const std::string &channel_id, int32_t timeout_ms) {
+  channel_manager_->SetDisconnectCallback([this](const ChannelPtr &client_channel, int32_t timeout_ms) {
+    ADXL_CHK_BOOL_RET_STATUS(client_channel->GetChannelType() == ChannelType::kClient, NOT_CONNECTED,
+                             "Channel %s is not a client channel", client_channel->GetChannelId().c_str());
     EvictItem item;
-    item.channel_id = channel_id;
-    auto client_channel = channel_manager_->GetChannel(ChannelType::kClient, channel_id);
-    if (client_channel != nullptr) {
-      item.channel_type = ChannelType::kClient;
-      client_channel->SetDisconnecting(true);
-    } else {
-      LLMLOGI("Channel %s not found for disconnect", channel_id.c_str());
-      return NOT_CONNECTED;
-    }
+    item.channel_id = client_channel->GetChannelId();
+    item.channel_type = ChannelType::kClient;
+    client_channel->SetDisconnecting(true);
     item.timeout_ms = timeout_ms;
     {
       std::lock_guard<std::mutex> lock(evict_mutex_);
@@ -869,15 +911,19 @@ std::vector<EvictItem> ChannelMsgHandler::SelectEvictionCandidates(int32_t need_
 void ChannelMsgHandler::EvictionLoop() {
   aclrtSetCurrentContext(aclrt_context_);
   while (true) {
-    std::unique_lock<std::mutex> lock(evict_mutex_);
-    evict_cv_.wait(lock, [this] { return stop_eviction_ || !evict_queue_.empty(); });
-    if (stop_eviction_) {
-      break;
+    std::queue<EvictItem> pending_items;
+    {
+      std::unique_lock<std::mutex> lock(evict_mutex_);
+      evict_cv_.wait(lock, [this] { return stop_eviction_ || !evict_queue_.empty(); });
+      if (stop_eviction_) {
+        break;
+      }
+      pending_items.swap(evict_queue_);
     }
 
-    while (!evict_queue_.empty()) {
-      EvictItem item = evict_queue_.front();
-      evict_queue_.pop();
+    while (!pending_items.empty()) {
+      EvictItem item = std::move(pending_items.front());
+      pending_items.pop();
       ProcessEviction(item);
     }
     ResetAllTransferFlags();
@@ -905,8 +951,8 @@ Status ChannelMsgHandler::ProcessEviction(const EvictItem &item) {
 }
 
 Status ChannelMsgHandler::ProcessServerEviction(const std::string &channel_id, ChannelPtr channel) {
-  int32_t fd = channel->GetFd();
-  if (fd < 0) {
+  const auto connection = channel->Connection();
+  if (connection == nullptr || connection->Fd() < 0) {
     LLMLOGW("Channel %s has invalid fd, cannot send request disconnect", channel_id.c_str());
     channel->SetDisconnecting(false);
     return SUCCESS;
@@ -920,8 +966,8 @@ Status ChannelMsgHandler::ProcessServerEviction(const std::string &channel_id, C
   RequestDisconnectMsg req_msg;
   req_msg.channel_id = listen_info_;
   req_msg.req_id = req_id;
-  Status ret = channel->SendControlMsg([&req_msg](int32_t fd) {
-    return ControlMsgHandler::SendMsg(fd, ControlMsgType::kRequestDisconnect, req_msg, req_msg.timeout);
+  Status ret = channel->SendControlMsg([&req_msg](const hixl::CtrlMsgPluginPtr &connection) {
+    return ControlMsgHandler::SendMsg(connection, ControlMsgType::kRequestDisconnect, req_msg, req_msg.timeout);
   });
   if (ret != SUCCESS) {
     LLMLOGW("Failed to send request disconnect for channel: %s, ret=%d", channel_id.c_str(), ret);

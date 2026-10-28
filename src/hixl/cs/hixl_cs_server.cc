@@ -238,22 +238,10 @@ Status HixlCSServer::Initialize(const EndpointDesc *endpoint_list, uint32_t list
                             NeedServerHostVaMapping(endpoint_list[i], ub_ctp_endpoints_all_device), global_config_),
                         "Failed to create endpoint, index:%u, %s", i, EndpointToString(endpoint_list[i]).c_str());
   }
-  msg_handler_.RegisterMsgProcessor(CtrlMsgType::kMatchEndpointReq,
-                                    [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-                                      return this->MatchEndpointMsg(fd, msg, msg_len);
-                                    });
-  msg_handler_.RegisterMsgProcessor(CtrlMsgType::kCreateChannelReq,
-                                    [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-                                      return this->CreateChannel(fd, msg, msg_len);
-                                    });
-  msg_handler_.RegisterMsgProcessor(
-      CtrlMsgType::kGetRemoteMemReq,
-      [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status { return this->ExportMem(fd, msg, msg_len); });
-  msg_handler_.RegisterMsgProcessor(CtrlMsgType::kDestroyChannelReq,
-                                    [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-                                      return this->DestroyChannel(fd, msg, msg_len);
-                                    });
-  CtrlMsgPlugin::Initialize();
+  HIXL_CHK_STATUS_RET(RegisterMsgProcessors(), "Failed to register server message processors");
+  listener_connection_ = MakeShared<CtrlMsgPlugin>();
+  HIXL_CHECK_NOTNULL(listener_connection_);
+  HIXL_CHK_STATUS_RET(listener_connection_->Initialize(), "Failed to initialize listener TLS");
   HIXL_CHK_STATUS_RET(msg_handler_.Initialize(), "Failed to initialize msg handler");
   HIXL_CHK_STATUS_RET(InitTransFinishedFlag(), "Failed to init trans finished flag");
   HIXL_DISMISS_GUARD(init_rollback);
@@ -261,7 +249,40 @@ Status HixlCSServer::Initialize(const EndpointDesc *endpoint_list, uint32_t list
   return SUCCESS;
 }
 
-Status HixlCSServer::DestroyChannel(int32_t fd, const char *msg, uint64_t msg_len) {
+Status HixlCSServer::RegisterMsgProcessors() {
+  HIXL_CHK_STATUS_RET(RegProc(CtrlMsgType::kMatchEndpointReq,
+                              [this](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+                                return this->MatchEndpointMsg(connection, msg, msg_len);
+                              }),
+                      "Failed to register processor, msg type:%d",
+                      static_cast<int32_t>(CtrlMsgType::kMatchEndpointReq));
+  HIXL_CHK_STATUS_RET(RegProc(CtrlMsgType::kCreateChannelReq,
+                              [this](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+                                return this->CreateChannel(connection, msg, msg_len);
+                              }),
+                      "Failed to register processor, msg type:%d",
+                      static_cast<int32_t>(CtrlMsgType::kCreateChannelReq));
+  HIXL_CHK_STATUS_RET(RegProc(CtrlMsgType::kGetRemoteMemReq,
+                              [this](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+                                return this->ExportMem(connection, msg, msg_len);
+                              }),
+                      "Failed to register processor, msg type:%d", static_cast<int32_t>(CtrlMsgType::kGetRemoteMemReq));
+  HIXL_CHK_STATUS_RET(RegProc(CtrlMsgType::kDestroyChannelReq,
+                              [this](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+                                const Status close_ret = connection->Close();
+                                const Status destroy_ret = this->DestroyChannel(connection, msg, msg_len);
+                                HIXL_CHK_STATUS_RET(close_ret, "Failed to close disconnected client");
+                                HIXL_CHK_STATUS_RET(destroy_ret, "Failed to destroy disconnected client channel");
+                                std::lock_guard<std::mutex> lock(client_mutex_);
+                                disconnected_clients_.erase(connection);
+                                return SUCCESS;
+                              }),
+                      "Failed to register processor, msg type:%d",
+                      static_cast<int32_t>(CtrlMsgType::kDestroyChannelReq));
+  return SUCCESS;
+}
+
+Status HixlCSServer::DestroyChannel(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) {
   (void)msg;
   (void)msg_len;
   EndpointChannelInfo info{};
@@ -270,7 +291,7 @@ Status HixlCSServer::DestroyChannel(int32_t fd, const char *msg, uint64_t msg_le
     // 临界区内仅做 find + erase，销毁放到锁外：HcommChannelDestroy 为毫秒级驱动操作，
     // 持锁销毁会在断连风暴下串行化所有客户端的 channel 销毁与建链插入。
     std::lock_guard<std::mutex> lock(chn_mutex_);
-    auto it = channels_.find(fd);
+    auto it = channels_.find(connection);
     if (it != channels_.end()) {
       info = it->second;
       channels_.erase(it);
@@ -282,13 +303,16 @@ Status HixlCSServer::DestroyChannel(int32_t fd, const char *msg, uint64_t msg_le
   }
   auto ep = endpoint_store_.GetEndpoint(info.endpoint_handle);
   if (ep == nullptr) {
-    HIXL_LOGW("Endpoint is not found when destroying channel, fd:%d, endpoint_handle:%p, channel_handle:0x%lx", fd,
-              info.endpoint_handle, info.channel_handle);
+    HIXL_LOGW("Endpoint is not found when destroying channel, connection:%s, endpoint_handle:%p, channel_handle:0x%lx",
+              connection->Desc().c_str(), info.endpoint_handle, info.channel_handle);
     return SUCCESS;
   }
-  HIXL_CHK_STATUS(ep->DestroyChannel(info.channel_handle),
-                  "Failed to destroy channel, fd:%d, endpoint_handle:%p, channel_handle:0x%lx", fd,
-                  info.endpoint_handle, info.channel_handle);
+  // Finalization and cleanup workers may need to switch to the endpoint's runtime context.
+  auto ctx_guard = GetContextGuard();
+  (void)ctx_guard;
+  HIXL_CHK_STATUS_RET(ep->DestroyChannel(info.channel_handle),
+                      "Failed to destroy channel, connection:%s, endpoint_handle:%p, channel_handle:0x%lx",
+                      connection->Desc().c_str(), info.endpoint_handle, info.channel_handle);
   return SUCCESS;
 }
 
@@ -317,6 +341,7 @@ Status HixlCSServer::Finalize() {
         listener_.join();
       }
     }
+    ShutdownAllClients();
     msg_handler_.Finalize();
     CloseAllClients();
     ret = endpoint_store_.Finalize();
@@ -336,9 +361,9 @@ Status HixlCSServer::Finalize() {
     device_id_ = -1;
   }
 
-  if (listen_fd_ != -1) {
-    (void)close(listen_fd_);
-    listen_fd_ = -1;
+  if (listener_connection_ != nullptr) {
+    (void)listener_connection_->Close();
+    listener_connection_.reset();
   }
 
   if (epoll_fd_ != -1) {
@@ -411,33 +436,33 @@ Status HixlCSServer::DeregisterMem(MemHandle mem_handle) {
   return SUCCESS;
 }
 
-Status HixlCSServer::SendCreateChannelResp(int32_t fd, const CreateChannelResp &resp) {
+Status HixlCSServer::SendCreateChannelResp(const CtrlMsgPluginPtr &connection, const CreateChannelResp &resp) {
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(CreateChannelResp));
   CtrlMsgType msg_type = CtrlMsgType::kCreateChannelResp;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &resp, static_cast<uint64_t>(sizeof(resp))));
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+  HIXL_CHK_STATUS_RET(connection->Send(&resp, static_cast<uint64_t>(sizeof(resp))));
   return SUCCESS;
 }
 
-Status HixlCSServer::SendMatchEndpointResp(int32_t fd, const MatchEndpointResp &resp) {
+Status HixlCSServer::SendMatchEndpointResp(const CtrlMsgPluginPtr &connection, const MatchEndpointResp &resp) {
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + sizeof(MatchEndpointResp));
   CtrlMsgType msg_type = CtrlMsgType::kMatchEndpointResp;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &resp, static_cast<uint64_t>(sizeof(resp))));
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+  HIXL_CHK_STATUS_RET(connection->Send(&resp, static_cast<uint64_t>(sizeof(resp))));
   return SUCCESS;
 }
 
-Status HixlCSServer::MatchEndpointMsg(int32_t fd, const char *msg, uint64_t msg_len) const {
-  HIXL_DISMISSABLE_GUARD(failed, ([fd, this]() {
+Status HixlCSServer::MatchEndpointMsg(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) const {
+  HIXL_DISMISSABLE_GUARD(failed, ([connection, this]() {
                            MatchEndpointResp resp{};
                            resp.result = FAILED;
-                           HIXL_CHK_STATUS(SendMatchEndpointResp(fd, resp));
+                           HIXL_CHK_STATUS(SendMatchEndpointResp(connection, resp));
                          }));
   HIXL_CHECK_NOTNULL(msg);
   HIXL_CHK_BOOL_RET_STATUS(msg_len == sizeof(MatchEndpointReq), PARAM_INVALID,
@@ -448,7 +473,7 @@ Status HixlCSServer::MatchEndpointMsg(int32_t fd, const char *msg, uint64_t msg_
   MatchEndpointResp resp{};
   if (ep == nullptr) {
     resp.result = PARAM_INVALID;
-    HIXL_CHK_STATUS_RET(SendMatchEndpointResp(fd, resp), "Failed to send match endpoint resp");
+    HIXL_CHK_STATUS_RET(SendMatchEndpointResp(connection, resp), "Failed to send match endpoint resp");
     HIXL_DISMISS_GUARD(failed);
     return SUCCESS;
   }
@@ -469,18 +494,18 @@ Status HixlCSServer::MatchEndpointMsg(int32_t fd, const char *msg, uint64_t msg_
   resp.dst_ep_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
   resp.port = ep->GetPort();
   resp.channel_index = g_next_server_channel_index.fetch_add(1U, std::memory_order_relaxed);
-  HIXL_CHK_STATUS_RET(SendMatchEndpointResp(fd, resp), "Failed to send match endpoint resp");
+  HIXL_CHK_STATUS_RET(SendMatchEndpointResp(connection, resp), "Failed to send match endpoint resp");
   HIXL_DISMISS_GUARD(failed);
   HIXL_LOGI("SendMatchEndpointResp success, channel_index=%" PRIu64, resp.channel_index);
   return SUCCESS;
 }
 
-Status HixlCSServer::CreateChannel(int32_t fd, const char *msg, uint64_t msg_len) {
-  HIXL_DISMISSABLE_GUARD(failed, ([fd, this]() {
+Status HixlCSServer::CreateChannel(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) {
+  HIXL_DISMISSABLE_GUARD(failed, ([connection, this]() {
                            CreateChannelResp resp{};
                            resp.result = FAILED;
                            HIXL_LOGI("SendCreateChannelResp start");
-                           HIXL_CHK_STATUS(SendCreateChannelResp(fd, resp));
+                           HIXL_CHK_STATUS(SendCreateChannelResp(connection, resp));
                          }));
   HIXL_CHECK_NOTNULL(msg);
   HIXL_CHK_BOOL_RET_STATUS(msg_len == sizeof(CreateChannelReq), PARAM_INVALID,
@@ -504,33 +529,33 @@ Status HixlCSServer::CreateChannel(int32_t fd, const char *msg, uint64_t msg_len
   channel_desc.qos = req.qos;
   channel_desc.configurable_transfer_supported = configurable_transfer_supported_;
   HIXL_CHK_STATUS_RET(ep->CreateChannel(channel_desc, channel_handle, req.timeout_ms), "Failed to create channel");
-  bool client_disconnected = false;
-  {
-    // 校验 fd 存活并插入，与断连清理互斥避免孤儿表项；锁序 client_mutex_ -> chn_mutex_。
-    std::lock_guard<std::mutex> client_lock(client_mutex_);
-    if (clients_.find(fd) == clients_.end()) {
-      client_disconnected = true;
-    } else {
-      std::lock_guard<std::mutex> chn_lock(chn_mutex_);
-      EndpointChannelInfo info{};
-      info.endpoint_handle = handle;
-      info.channel_handle = channel_handle;
-      channels_[fd] = std::move(info);
-    }
-  }
-  if (client_disconnected) {
+  if (!TrackChannelIfConnected(connection, handle, channel_handle)) {
     // client 已断开：不回响应（fd 已关，复用后污染新连接），锁外销毁刚建的 channel。
     HIXL_DISMISS_GUARD(failed);
-    HIXL_LOGE(FAILED, "client fd:%d disconnected during channel creation, discard channel:%lu", fd, channel_handle);
+    HIXL_LOGE(FAILED, "client connection:%s disconnected during channel creation, discard channel:%lu",
+              connection->Desc().c_str(), channel_handle);
     HIXL_CHK_STATUS_RET(ep->DestroyChannel(channel_handle), "Failed to destroy channel after client disconnect");
     return FAILED;
   }
   HIXL_DISMISS_GUARD(failed);
   CreateChannelResp resp{};
   resp.result = SUCCESS;
-  HIXL_CHK_STATUS_RET(SendCreateChannelResp(fd, resp), "Failed to send create channel resp");
+  HIXL_CHK_STATUS_RET(SendCreateChannelResp(connection, resp), "Failed to send create channel resp");
   HIXL_LOGI("CreateChannel success, channel_index=%" PRIu64, req.channel_index);
   return SUCCESS;
+}
+
+bool HixlCSServer::TrackChannelIfConnected(const CtrlMsgPluginPtr &connection, EndpointHandle endpoint,
+                                           ChannelHandle channel) {
+  // Serialize insertion with disconnect removal; lock order: client_mutex_ -> chn_mutex_.
+  std::lock_guard<std::mutex> client_lock(client_mutex_);
+  const auto it = clients_.find(connection->Fd());
+  if (it == clients_.end() || it->second->Connection() != connection) {
+    return false;
+  }
+  std::lock_guard<std::mutex> chn_lock(chn_mutex_);
+  channels_[connection] = {endpoint, channel};
+  return true;
 }
 
 static inline void to_json(nlohmann::json &j, const HixlMemDesc &m) {
@@ -567,26 +592,26 @@ Status HixlCSServer::Serialize(const T &msg, std::string &msg_str) {
   return SUCCESS;
 }
 
-Status HixlCSServer::SendRemoteMemResp(int32_t fd, const GetRemoteMemResp &resp) {
+Status HixlCSServer::SendRemoteMemResp(const CtrlMsgPluginPtr &connection, const GetRemoteMemResp &resp) {
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   std::string msg_str;
   HIXL_CHK_STATUS_RET(Serialize(resp, msg_str), "Failed to serialize msg");
   // Do not log msg_str content: it carries memory addresses and RDMA export descriptors.
-  HIXL_LOGD("remote mem serialize success, fd:%d, size:%zu bytes", fd, msg_str.size());
+  HIXL_LOGD("remote mem serialize success, connection:%s, size:%zu bytes", connection->Desc().c_str(), msg_str.size());
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + msg_str.size());
   CtrlMsgType msg_type = CtrlMsgType::kGetRemoteMemResp;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, msg_str.c_str(), static_cast<uint64_t>(msg_str.size())));
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+  HIXL_CHK_STATUS_RET(connection->Send(msg_str.c_str(), static_cast<uint64_t>(msg_str.size())));
   return SUCCESS;
 }
 
-Status HixlCSServer::ExportMem(int32_t fd, const char *msg, uint64_t msg_len) const {
-  HIXL_DISMISSABLE_GUARD(failed, ([fd, this]() {
+Status HixlCSServer::ExportMem(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) const {
+  HIXL_DISMISSABLE_GUARD(failed, ([connection, this]() {
                            GetRemoteMemResp resp{};
                            resp.result = FAILED;
-                           HIXL_CHK_STATUS(SendRemoteMemResp(fd, resp));
+                           HIXL_CHK_STATUS(SendRemoteMemResp(connection, resp));
                          }));
   HIXL_CHECK_NOTNULL(msg);
   HIXL_CHK_BOOL_RET_STATUS(msg_len == sizeof(GetRemoteMemReq), PARAM_INVALID, "invalid msg len:%lu of get remote mem",
@@ -600,29 +625,27 @@ Status HixlCSServer::ExportMem(int32_t fd, const char *msg, uint64_t msg_len) co
   HIXL_CHK_STATUS_RET(ep->ExportMem(resp.mem_descs), "Failed to export mem");
   resp.result = SUCCESS;
   HIXL_DISMISS_GUARD(failed);
-  HIXL_CHK_STATUS_RET(SendRemoteMemResp(fd, resp), "Failed to send remote mem resp.");
+  HIXL_CHK_STATUS_RET(SendRemoteMemResp(connection, resp), "Failed to send remote mem resp.");
   return SUCCESS;
 }
 
 Status HixlCSServer::Listen(uint32_t backlog) {
   auto ctx_guard = GetContextGuard();
   (void)ctx_guard;
-  HIXL_CHK_BOOL_RET_STATUS(listen_fd_ == -1 && !listener_.joinable(), FAILED,
+  HIXL_CHECK_NOTNULL(listener_connection_);
+  HIXL_CHK_BOOL_RET_STATUS(listener_connection_->Fd() == -1 && !listener_.joinable(), FAILED,
                            "Server is already listening, ip:%s, port:%u", ip_.c_str(), port_);
-  int32_t fd = -1;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Listen(ip_, port_, backlog, fd), "Failed to server listen, ip:%s, port:%u",
-                      ip_.c_str(), port_);
-  HIXL_DISMISSABLE_GUARD(close_fd, ([fd]() { (void)close(fd); }));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::AddFdToEpoll(epoll_fd_, fd), "Failed to add listen fd to epoll");
-  listen_fd_ = fd;
-  HIXL_DISMISS_GUARD(close_fd);
+  HIXL_CHK_STATUS_RET(listener_connection_->Listen(ip_, port_, backlog), "Failed to listen on %s:%u", ip_.c_str(),
+                      port_);
+  HIXL_DISMISSABLE_GUARD(close_connection, ([this]() { (void)listener_connection_->Close(); }));
+  HIXL_CHK_STATUS_RET(listener_connection_->AddToEpoll(epoll_fd_), "Failed to register listener with epoll");
+  HIXL_DISMISS_GUARD(close_connection);
   HIXL_EVENT("[HixlServer] start to listen on %s:%u", ip_.c_str(), port_);
   listener_running_ = true;
   listener_ = std::thread([this]() {
     while (listener_running_) {
       (void)DoWait();
     }
-    return;
   });
   return SUCCESS;
 }
@@ -630,104 +653,251 @@ Status HixlCSServer::Listen(uint32_t backlog) {
 Status HixlCSServer::RegProc(CtrlMsgType msg_type, MsgProcessor proc) {
   auto ctx_guard = GetContextGuard();
   (void)ctx_guard;
-  HIXL_CHK_STATUS_RET(msg_handler_.RegisterMsgProcessor(msg_type, proc), "Failed to reg msg processor, msg type:%d",
-                      static_cast<int32_t>(msg_type));
+  auto processor = [this, proc](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) {
+    const Status ret = proc(connection, msg, msg_len);
+    if (ret != SUCCESS && !connection->IsUsable()) {
+      CleanupClient(connection);
+    }
+    return ret;
+  };
+  HIXL_CHK_STATUS_RET(msg_handler_.RegisterMsgProcessor(msg_type, processor),
+                      "Failed to reg msg processor, msg type:%d", static_cast<int32_t>(msg_type));
   return SUCCESS;
 }
 
-Status HixlCSServer::ProClientMsg(int32_t fd, std::shared_ptr<MsgReceiver> receiver) {
+Status HixlCSServer::ProClientMsg(const CtrlMsgPluginPtr &connection, std::shared_ptr<MsgReceiver> receiver) {
   std::vector<CtrlMsgPtr> msgs;
   const Status ret = receiver->IRecv(msgs);
   for (auto msg : msgs) {
-    msg_handler_.SubmitMsg(fd, msg);
+    msg_handler_.SubmitMsg(connection, msg);
   }
   return ret;
 }
 
-void HixlCSServer::CloseClientSocket(int32_t fd) const {
-  (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-  const int32_t close_ret = close(fd);
-  if (close_ret != 0) {
-    HIXL_LOGE(FAILED, "Call api:close failed, ret:%d, errno:%d, errmsg:%s, fd:%d", close_ret, errno, strerror(errno),
-              fd);
+void HixlCSServer::CloseClientSocket(const CtrlMsgPluginPtr &connection) const {
+  (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, connection->Fd(), nullptr);
+  (void)connection->Close();
+}
+
+void HixlCSServer::ShutdownAllClients() {
+  std::vector<CtrlMsgPluginPtr> connections;
+  {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    for (const auto &entry : clients_) {
+      connections.push_back(entry.second->Connection());
+    }
+    connections.insert(connections.end(), disconnected_clients_.begin(), disconnected_clients_.end());
+  }
+  for (const auto &entry : pending_handshakes_) {
+    connections.push_back(entry.second.connection);
+  }
+  for (const auto &connection : connections) {
+    HIXL_CHK_STATUS(connection->ShutdownSocket(), "Failed to interrupt client during server finalization");
   }
 }
 
 void HixlCSServer::CloseAllClients() {
-  std::lock_guard<std::mutex> lock(client_mutex_);
-  const size_t client_num = clients_.size();
-  for (const auto &it : clients_) {
-    CloseClientSocket(it.first);
+  for (const auto &entry : pending_handshakes_) {
+    CloseClientSocket(entry.second.connection);
   }
-  clients_.clear();
-  HIXL_EVENT("[HixlServer] closed remaining client sockets, count:%zu", client_num);
+  pending_handshakes_.clear();
+  std::map<int32_t, std::shared_ptr<MsgReceiver>> clients;
+  std::set<CtrlMsgPluginPtr> disconnected;
+  {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    clients.swap(clients_);
+    disconnected.swap(disconnected_clients_);
+  }
+  for (const auto &entry : clients) {
+    auto connection = entry.second->Connection();
+    CloseClientSocket(connection);
+  }
+  for (const auto &connection : disconnected) {
+    CloseClientSocket(connection);
+  }
+  {
+    std::lock_guard<std::mutex> lock(chn_mutex_);
+    channels_.clear();
+  }
+  HIXL_EVENT("[HixlServer] closed remaining client sockets, count:%zu", clients.size() + disconnected.size());
 }
 
-void HixlCSServer::CleanupClient(int32_t fd) {
-  // 清理 channel
-  std::lock_guard<std::mutex> lock(client_mutex_);
-  auto it = clients_.find(fd);
-  if (it != clients_.end()) {
-    auto msg = MakeShared<CtrlMsg>();
-    if (msg != nullptr) {
-      msg->msg_type = CtrlMsgType::kDestroyChannelReq;
-      msg_handler_.SubmitMsg(fd, msg);
+void HixlCSServer::CleanupClient(const CtrlMsgPluginPtr &connection) {
+  auto msg = MakeShared<CtrlMsg>();
+  if (msg == nullptr) {
+    HIXL_LOGE(FAILED, "Failed to allocate disconnected client cleanup message");
+    return;
+  }
+  msg->msg_type = CtrlMsgType::kDestroyChannelReq;
+  const int32_t fd = connection->Fd();
+  {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    const auto it = clients_.find(fd);
+    if (it == clients_.end() || it->second->Connection() != connection) {
+      return;
+    }
+    disconnected_clients_.insert(connection);
+    clients_.erase(it);
+  }
+  (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+  HIXL_CHK_STATUS(connection->ShutdownSocket(), "Failed to interrupt disconnected client, fd:%d", fd);
+  msg_handler_.SubmitMsg(connection, msg);
+  HIXL_EVENT("[HixlServer] client disconnected, fd:%d cleanup scheduled", fd);
+}
+
+bool HixlCSServer::ProcessPendingMsg() {
+  if (!global_config_.TlsCfg().Enabled()) {
+    return false;
+  }
+  std::vector<std::shared_ptr<MsgReceiver>> receivers;
+  {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    receivers.reserve(clients_.size());
+    for (const auto &entry : clients_) {
+      receivers.push_back(entry.second);
     }
   }
+  bool processed = false;
+  for (const auto &receiver : receivers) {
+    auto connection = receiver->Connection();
+    if (!connection->HasPending()) {
+      continue;
+    }
+    processed = true;
+    if (ProClientMsg(connection, receiver) != SUCCESS) {
+      CleanupClient(connection);
+    }
+  }
+  return processed;
+}
 
-  CloseClientSocket(fd);
-  clients_.erase(fd);
+Status HixlCSServer::UpdateClientEvents(int32_t fd, uint32_t events) const {
+  epoll_event event{};
+  event.events = events | EPOLLRDHUP;
+  event.data.fd = fd;
+  const int ret = epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &event);
+  const int saved_errno = errno;
+  HIXL_CHK_BOOL_RET_STATUS(ret == 0, FAILED,
+                           "Call api:epoll_ctl failed, ret:%d, fd:%d, events:0x%x, errno:%d, error_msg:%s", ret, fd,
+                           event.events, saved_errno, strerror(saved_errno));
+  return SUCCESS;
+}
 
-  HIXL_EVENT("[HixlServer] client disconnected, fd:%d cleaned up", fd);
+Status HixlCSServer::AdvanceHandshake(int32_t fd) {
+  const auto it = pending_handshakes_.find(fd);
+  HIXL_CHK_BOOL_RET_STATUS(it != pending_handshakes_.end(), FAILED, "Missing pending TLS connection, fd:%d", fd);
+  auto connection = it->second.connection;
+  HIXL_DISMISSABLE_GUARD(rollback, ([this, connection, fd]() {
+                           pending_handshakes_.erase(fd);
+                           CloseClientSocket(connection);
+                         }));
+  HIXL_CHK_BOOL_RET_STATUS(std::chrono::steady_clock::now() < it->second.deadline, TIMEOUT,
+                           "Server TLS handshake timed out, fd:%d, timeout:%d ms", fd,
+                           CtrlMsgPlugin::kServerHandshakeTimeoutMs);
+  TlsHandshakeState state;
+  HIXL_CHK_STATUS_RET(connection->HandshakeServerStep(state), "Failed to advance server TLS handshake, fd:%d", fd);
+  const uint32_t events = state == TlsHandshakeState::kWantWrite ? EPOLLOUT : EPOLLIN;
+  HIXL_CHK_STATUS_RET(UpdateClientEvents(fd, events), "Failed to update control connection events, fd:%d", fd);
+  if (state == TlsHandshakeState::kComplete) {
+    auto receiver = MakeShared<MsgReceiver>(connection);
+    HIXL_CHECK_NOTNULL(receiver);
+    {
+      std::lock_guard<std::mutex> lock(client_mutex_);
+      const bool inserted = clients_.emplace(fd, std::move(receiver)).second;
+      HIXL_CHK_BOOL_RET_STATUS(inserted, FAILED,
+                               "Failed to publish established control connection, duplicate client fd:%d", fd);
+    }
+    pending_handshakes_.erase(it);
+  }
+  HIXL_DISMISS_GUARD(rollback);
+  return SUCCESS;
+}
+
+void HixlCSServer::ExpireHandshakes() {
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = pending_handshakes_.begin(); it != pending_handshakes_.end();) {
+    if (it->second.deadline > now) {
+      ++it;
+      continue;
+    }
+    HIXL_LOGW("Server TLS handshake timed out, fd:%d, timeout:%d ms", it->first,
+              CtrlMsgPlugin::kServerHandshakeTimeoutMs);
+    CloseClientSocket(it->second.connection);
+    it = pending_handshakes_.erase(it);
+  }
+}
+
+Status HixlCSServer::AcceptClient() {
+  CtrlMsgPluginPtr connection;
+  HIXL_CHK_STATUS_RET(listener_connection_->Accept(connection), "Failed to accept connection");
+  if (connection == nullptr) {
+    return SUCCESS;
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(CtrlMsgPlugin::kServerHandshakeTimeoutMs);
+  HIXL_DISMISSABLE_GUARD(rollback, ([this, connection]() { CloseClientSocket(connection); }));
+  HIXL_CHK_BOOL_RET_STATUS(!global_config_.TlsCfg().Enabled() || pending_handshakes_.size() < kMaxPendingHandshakes,
+                           RESOURCE_EXHAUSTED, "Pending TLS handshake limit reached, limit:%zu", kMaxPendingHandshakes);
+  HIXL_CHK_STATUS_RET(connection->SetTcpNoDelay(), "Failed to set TCP_NODELAY");
+  HIXL_CHK_STATUS_RET(connection->SetTcpKeepAlive(), "Failed to set TCP keepalive");
+  HIXL_CHK_STATUS_RET(connection->SetSendTimeout(CtrlMsgPlugin::kDefaultCtrlTimeoutMs),
+                      "Failed to set SO_SNDTIMEO, fd:%d, timeout:%u ms", connection->Fd(),
+                      CtrlMsgPlugin::kDefaultCtrlTimeoutMs);
+  HIXL_CHK_STATUS_RET(connection->AddToEpoll(epoll_fd_), "Failed to register connection with epoll");
+  const int32_t fd = connection->Fd();
+  pending_handshakes_.emplace(fd, PendingHandshake{connection, deadline});
+  HIXL_CHK_STATUS_RET(AdvanceHandshake(fd), "Failed to initialize server TLS handshake, fd:%d", fd);
+  HIXL_DISMISS_GUARD(rollback);
+  return SUCCESS;
+}
+
+void HixlCSServer::HandleClientEvent(int32_t fd, uint32_t events) {
+  const auto pending = pending_handshakes_.find(fd);
+  if (pending != pending_handshakes_.end()) {
+    if ((events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) {
+      CloseClientSocket(pending->second.connection);
+      pending_handshakes_.erase(pending);
+    } else {
+      HIXL_CHK_STATUS(AdvanceHandshake(fd), "Failed to advance server TLS handshake, fd:%d", fd);
+    }
+    return;
+  }
+  std::shared_ptr<MsgReceiver> receiver;
+  {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    const auto it = clients_.find(fd);
+    if (it != clients_.end()) {
+      receiver = it->second;
+    }
+  }
+  if (receiver != nullptr) {
+    auto connection = receiver->Connection();
+    if ((events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U ||
+        ((events & EPOLLIN) != 0U && ProClientMsg(connection, receiver) != SUCCESS)) {
+      HIXL_EVENT("[HixlServer] detected client disconnect event, fd:%d, events:%u", fd, events);
+      CleanupClient(connection);
+    }
+  }
 }
 
 Status HixlCSServer::DoWait() {
-  struct epoll_event event_infos[kMaxEventsNum];
-  int32_t event_num = epoll_wait(epoll_fd_, event_infos, kMaxEventsNum, kEpollWaitTimeInMillis);
-  for (int32_t i = 0; i < event_num; ++i) {
-    // new connection
-    int32_t fd = event_infos[i].data.fd;
-    uint32_t revents = event_infos[i].events;
-    if (fd == listen_fd_) {
-      int32_t connect_fd = -1;
-      HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Accept(listen_fd_, connect_fd), "Failed to accept fd");
-      if (connect_fd < 0) {
-        continue;
-      }
-      HIXL_CHK_STATUS_RET(CtrlMsgPlugin::SetTcpNoDelay(connect_fd), "Failed to set tcp nodelay, fd:%d", connect_fd);
-      HIXL_CHK_STATUS_RET(CtrlMsgPlugin::SetTcpKeepAlive(connect_fd), "Failed to set tcp keep alive, fd:%d",
-                          connect_fd);
-      HIXL_CHK_STATUS_RET(CtrlMsgPlugin::SetSendTimeout(connect_fd, CtrlMsgPlugin::kDefaultCtrlTimeoutMs),
-                          "Failed to set SO_SNDTIMEO, fd:%d, timeout:%u ms", connect_fd,
-                          CtrlMsgPlugin::kDefaultCtrlTimeoutMs);
-      HIXL_CHK_STATUS_RET(CtrlMsgPlugin::AddFdToEpoll(epoll_fd_, connect_fd), "Failed to add connect fd to epoll");
-      HIXL_EVENT("[HixlServer] accept socket success, client fd:%d", connect_fd);
-      auto receiver = MakeShared<MsgReceiver>(connect_fd);
-      HIXL_CHECK_NOTNULL(receiver);
-      std::lock_guard<std::mutex> lock(client_mutex_);
-      clients_[connect_fd] = receiver;
+  const bool processed_pending = ProcessPendingMsg();
+  ExpireHandshakes();
+  struct epoll_event events[kMaxEventsNum];
+  const int32_t timeout_ms = processed_pending ? 0 : kEpollWaitTimeInMillis;
+  const int count = epoll_wait(epoll_fd_, events, kMaxEventsNum, timeout_ms);
+  bool accept_ready = false;
+  for (int i = 0; i < count; ++i) {
+    if (events[i].data.fd == listener_connection_->Fd()) {
+      accept_ready = true;
     } else {
-      // 检测客户端断开事件
-      if ((revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) {
-        HIXL_EVENT("[HixlServer] detected client disconnect event, fd:%d, events:0x%x", fd, revents);
-        CleanupClient(fd);
-        continue;
-      }
-
-      // client msg
-      bool should_cleanup = false;
-      {
-        std::lock_guard<std::mutex> lock(client_mutex_);
-        auto it = clients_.find(fd);
-        HIXL_EVENT("[HixlServer] recv socket msg, client fd:%d", fd);
-        if ((it != clients_.end()) && ((revents & EPOLLIN) != 0U)) {
-          should_cleanup = ProClientMsg(fd, it->second) != SUCCESS;
-        }
-      }
-      if (should_cleanup) {
-        CleanupClient(fd);
-      }
+      HandleClientEvent(events[i].data.fd, events[i].events);
     }
+  }
+  ExpireHandshakes();
+  // Accept last so a closed fd cannot be reused before this event batch has been consumed.
+  if (accept_ready) {
+    HIXL_CHK_STATUS_RET(AcceptClient(), "Failed to accept client");
   }
   return SUCCESS;
 }

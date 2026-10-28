@@ -23,14 +23,17 @@ enum class RecvState : int32_t { WAITING_FOR_HEADER, WAITING_FOR_BODY };
 
 class MsgReceiver {
  public:
-  explicit MsgReceiver(int32_t fd) : fd_(fd) {}
+  explicit MsgReceiver(CtrlMsgPluginPtr connection) : connection_(connection) {}
+  CtrlMsgPluginPtr Connection() const {
+    return connection_;
+  }
   Status IRecv(std::vector<CtrlMsgPtr> &msgs);
 
  private:
   Status RecvHeader();
-  bool CheckRecv(ssize_t recv_size) const;
+  Status CheckRecv(ssize_t recv_size) const;
 
-  int32_t fd_ = -1;
+  CtrlMsgPluginPtr connection_;
   RecvState recv_state_ = RecvState::WAITING_FOR_HEADER;
   std::vector<char> recv_buffer_;
   size_t received_size_ = 0U;

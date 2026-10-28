@@ -82,7 +82,7 @@ class HixlServer {
 
  private:
   Status RegisterNotifyHandlers();
-  Status ProcessNotifyMsg(int32_t fd, const char *msg, uint64_t msg_len);
+  Status ProcessNotifyMsg(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len);
   Status RegisterProcessors();
 
   void *server_handle_ = nullptr;

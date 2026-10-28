@@ -18,6 +18,7 @@
 #include "adxl/adxl_utils.h"
 #include "common/hixl_utils.h"
 #include "common/llm_scope_guard.h"
+#include "common/ctrl_msg_plugin.h"
 #include "common/def_types.h"
 #include "common/llm_log.h"
 #include "statistic_manager.h"
@@ -127,9 +128,9 @@ Status CommChannel::Finalize() {
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (fd_ >= 0) {
-      (void)close(fd_);
-      fd_ = -1;
+    if (connection_ != nullptr) {
+      (void)connection_->Close();
+      connection_.reset();
     }
     with_heartbeat_.store(false, std::memory_order_release);
   }
@@ -550,15 +551,18 @@ Status CommChannel::TransferSync(TransferOp operation, const std::vector<Transfe
   return SUCCESS;
 }
 
-Status CommChannel::SetSocketNonBlocking(int32_t fd) {
+Status CommChannel::SetSocketNonBlocking(const hixl::CtrlMsgPluginPtr &connection) {
   std::lock_guard<std::mutex> lock(mutex_);
-  int flags = fcntl(fd, F_GETFL, 0);
+  ADXL_CHK_BOOL_RET_STATUS(connection != nullptr && connection_ == nullptr, FAILED,
+                           "Channel already owns a connection or received null connection");
+  int flags = fcntl(connection->Fd(), F_GETFL, 0);
   ADXL_CHK_BOOL_RET_STATUS(flags != -1, FAILED, "Failed to get fd flags: %s", strerror(errno));
 
-  ADXL_CHK_BOOL_RET_STATUS(fcntl(fd, F_SETFL, static_cast<uint32_t>(flags) | static_cast<uint32_t>(O_NONBLOCK)) != -1,
-                           FAILED, "Failed to set fd to non-blocking: %s", strerror(errno));
+  ADXL_CHK_BOOL_RET_STATUS(
+      fcntl(connection->Fd(), F_SETFL, static_cast<uint32_t>(flags) | static_cast<uint32_t>(O_NONBLOCK)) != -1, FAILED,
+      "Failed to set fd to non-blocking: %s", strerror(errno));
 
-  fd_ = fd;
+  connection_ = connection;
   last_heartbeat_time_ = std::chrono::steady_clock::now();
   with_heartbeat_.store(true, std::memory_order_release);
   return SUCCESS;
@@ -570,19 +574,19 @@ void CommChannel::StopHeartbeat() {
   disconnect_flag_.store(true, std::memory_order_release);
 }
 
-Status CommChannel::CommWithFd(const std::function<Status(int32_t)> &func) const {
+Status CommChannel::CommWithFd(const std::function<Status(const hixl::CtrlMsgPluginPtr &)> &func) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (fd_ < 0) {
+  if (connection_ == nullptr) {
     return FAILED;
   }
-  return func(fd_);
+  return func(connection_);
 }
 
-Status CommChannel::SendControlMsg(const std::function<Status(int32_t)> &func) const {
+Status CommChannel::SendControlMsg(const std::function<Status(const hixl::CtrlMsgPluginPtr &)> &func) const {
   return CommWithFd(func);
 }
 
-Status CommChannel::SendHeartBeat(const std::function<Status(int32_t)> &func) const {
+Status CommChannel::SendHeartBeat(const std::function<Status(const hixl::CtrlMsgPluginPtr &)> &func) const {
   if (with_heartbeat_.load(std::memory_order_acquire)) {
     return CommWithFd(func);
   }

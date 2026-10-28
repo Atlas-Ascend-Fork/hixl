@@ -20,6 +20,7 @@
 #include <vector>
 #include <map>
 #include "cs/hixl_cs.h"
+#include "common/ctrl_msg_plugin.h"
 #include "common/hixl_inner_types.h"
 #include "common/hixl_utils.h"
 #include "endpoint.h"
@@ -95,6 +96,7 @@ class HixlCSClient {
  private:
   void ReleaseFlagIndex(int32_t flag_index);
   void CloseSocket();
+  Status ParseGlobalConfig(const HixlClientDesc *client_desc, const HixlClientConfig *config);
   Status InitBaseClient(const HixlClientDesc *client_desc);
   Status InitDeviceResource(const EndpointDesc &ep);
   Status InitNotifyResources(const EndpointDesc &ep);
@@ -163,6 +165,7 @@ class HixlCSClient {
   uint32_t retry_cnt_{kRdmaRetryCntDefault};
   uint32_t retry_interval_{kRdmaRetryIntervalDefault};
   GlobalConfig global_config_;
+  bool tls_initialized_ = false;
   bool configurable_transfer_supported_{false};
   ChannelHandle client_channel_handle_ = 0UL;
   uint64_t remote_endpoint_handle_{0U};
@@ -171,7 +174,7 @@ class HixlCSClient {
   std::array<uint32_t, kFlagQueueSize> available_indices_{};
   size_t top_index_ = 0;                                             // 栈顶指针
   std::array<CompleteHandleInfo *, kFlagQueueSize> live_handles_{};  // 用来记录读写生成的 query_handle
-  int32_t socket_ = -1;
+  CtrlMsgPluginPtr connection_;
   bool is_connected_{false};
   std::map<std::string, CommMem> tag_mem_descs_;
   std::vector<CommMem> remote_mems_out_;

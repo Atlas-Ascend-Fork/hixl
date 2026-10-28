@@ -76,6 +76,8 @@ init(options: Dict[str, str])
 | --- | --- | --- |
 | options | Dict[str, str] | 配置项。<br>传入的options可以通过LLMConfig来生成。<br><br>  - device_id必填。<br>  - enable_cache_manager为True或者设置local_comm_res。 |
 
+如需启用控制面TLS，可通过[LLMConfig.global_resource_config](LLMConfig.md#global_resource_config)配置`tls_config.*`。
+
 **调用示例**
 
 ```python
@@ -174,7 +176,7 @@ link_clusters(clusters: Union[List[LLMClusterInfo], Tuple[LLMClusterInfo]], time
   - 当local_comm_res配置为空、version为"1.0"或"1.2"时，使用集合通信的通信域方式进行建链，允许创建的最大通信数量=512。
   - 当local_comm_res配置version为"1.3"时（推荐使用，需要HDK版本大于等于25.5.0且toolkit包版本大于等于9.1.0），使用HixlCS能力进行建链，没有链路上限限制。
 
-- 建议超时时间配置200ms以上。如果TLS处于开启状态，建议超时时间配置为2000ms以上。查询TLS状态可以使用如下命令：
+- 建议超时时间配置200ms以上。如果设备TLS或控制面TLS处于开启状态，建议超时时间配置为2000ms以上。设备TLS状态可以使用如下命令查询；控制面TLS状态以是否配置`tls_config.*`为准：
 
     ```sh
     hccn_tool [-i %d] -tls -g [host]

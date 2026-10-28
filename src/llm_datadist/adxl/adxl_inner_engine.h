@@ -20,6 +20,8 @@
 #include "segment_table.h"
 #include "common/hixl_inner_types.h"
 
+#include "common/tls/tls_config.h"
+
 namespace adxl {
 class AdxlInnerEngine {
  public:
@@ -62,6 +64,7 @@ class AdxlInnerEngine {
   Status RegisterCallbackProcessor(int32_t msg_type, CallbackProcessor processor);
 
  private:
+  hixl::TlsConfig tls_config_;
   Status GetTransferType(const ChannelPtr &channel, TransferOp operation, const std::vector<TransferOpDesc> &op_descs,
                          bool &need_buffer, TransferType &type) const;
   // Handle the sync transfer through the buffer transfer service. Sets handled=true when the buffer path produced

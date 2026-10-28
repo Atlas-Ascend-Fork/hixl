@@ -662,11 +662,12 @@ Status BufferTransferService::HandleCtrlMsg(const ChannelPtr &channel, const Buf
   buffer_resp.buffer_lens = std::move(buffer_req.buffer_lens);
   buffer_resp.total_buffer_len = buffer_req.total_buffer_len;
   buffer_resp.timeout = buffer_req.timeout;
-  auto func = [&buffer_resp, &buffer_req, &start](int32_t fd) {
+  auto func = [&buffer_resp, &buffer_req, &start](const hixl::CtrlMsgPluginPtr &connection) {
     uint64_t time_cost =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
     ADXL_CHK_BOOL_RET_STATUS(time_cost < buffer_req.timeout, TIMEOUT, "Transfer timeout.");
-    return ControlMsgHandler::SendMsg(fd, ControlMsgType::kBufferResp, buffer_resp, buffer_req.timeout - time_cost);
+    return ControlMsgHandler::SendMsg(connection, ControlMsgType::kBufferResp, buffer_resp,
+                                      buffer_req.timeout - time_cost);
   };
   ADXL_CHK_STATUS_RET(channel->SendControlMsg(func), "Send resp msg failed.");
   return SUCCESS;
@@ -840,8 +841,8 @@ Status BufferTransferService::SendBufferReq(const ChannelPtr &channel, BufferReq
   LLMLOGI("Time cost:%lu us.", time_cost);
   ADXL_CHK_BOOL_RET_STATUS(time_cost < timeout, TIMEOUT, "Transfer timeout.");
   buffer_req.timeout = timeout - time_cost;
-  auto func = [&buffer_req](int32_t fd) {
-    return ControlMsgHandler::SendMsg(fd, ControlMsgType::kBufferReq, buffer_req, buffer_req.timeout);
+  auto func = [&buffer_req](const hixl::CtrlMsgPluginPtr &connection) {
+    return ControlMsgHandler::SendMsg(connection, ControlMsgType::kBufferReq, buffer_req, buffer_req.timeout);
   };
   ADXL_CHK_STATUS_RET(channel->SendControlMsg(func), "Send req msg failed.");
   LLMLOGI("End send buffer req control msg, req id:%lu.", buffer_req.req_id);

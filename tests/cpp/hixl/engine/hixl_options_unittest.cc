@@ -1134,4 +1134,30 @@ TEST_F(HixlOptionsUTest, ParseLocalCommResOversizedFileInvalid) {
   EXPECT_EQ(HixlOptions::Parse(options, result), PARAM_INVALID);
   unlink(file_path.c_str());
 }
+
+TEST_F(HixlOptionsUTest, ParseTlsConfigPair) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] =
+      R"({"tls_config.cert_file":"/tmp/cert.pem","tls_config.key_file":"/tmp/key.pem"})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.GlobalResourceCfg().has_value());
+  EXPECT_TRUE(result.GlobalResourceCfg()->tls_config.Enabled());
+  EXPECT_EQ(result.GlobalResourceCfg()->tls_config.cert_file, "/tmp/cert.pem");
+}
+
+TEST_F(HixlOptionsUTest, ParseTlsConfigUnpairedRejected) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"tls_config.cert_file":"/tmp/cert.pem"})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), PARAM_INVALID);
+}
+
+TEST_F(HixlOptionsUTest, ParseTlsConfigVerifyPeerRequiresCa) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] =
+      R"({"tls_config.cert_file":"/tmp/cert.pem","tls_config.key_file":"/tmp/key.pem","tls_config.verify_peer":true})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), PARAM_INVALID);
+}
 }  // namespace hixl

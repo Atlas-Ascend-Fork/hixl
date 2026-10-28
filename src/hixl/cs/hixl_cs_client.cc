@@ -25,6 +25,7 @@
 #include "common/hixl_utils.h"
 #include "common/llm_utils.h"
 #include "common/scope_guard.h"
+#include "common/tls/tls_manager.h"
 #include "common/ctrl_msg_plugin.h"
 #include "conn_msg_handler.h"
 #include "host_register_proxy.h"
@@ -270,13 +271,15 @@ Status HixlCSClient::InitFlagQueue() noexcept {
 }
 
 Status HixlCSClient::InitBaseClient(const HixlClientDesc *client_desc) {
+  connection_ = MakeShared<CtrlMsgPlugin>();
+  HIXL_CHECK_NOTNULL(connection_);
+  HIXL_CHK_STATUS_RET(connection_->Initialize(), "Failed to initialize control connection");
   server_ip_ = client_desc->server_ip;
   server_port_ = client_desc->server_port;
   const EndpointDesc &local_ep = local_endpoint_->GetEndpoint();
   tc_ = client_desc->tc;
   sl_ = client_desc->sl;
   remote_endpoint_ = *(client_desc->remote_endpoint);
-  CtrlMsgPlugin::Initialize();
   HIXL_LOGD("[HixlClient] CtrlMsgPlugin initialized");
   auto ctx_guard = GetContextGuard();
   (void)ctx_guard;
@@ -329,11 +332,7 @@ Status HixlCSClient::InitNotifyResources(const EndpointDesc &ep) {
   return SUCCESS;
 }
 
-Status HixlCSClient::Create(const HixlClientDesc *client_desc, const HixlClientConfig *config) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  transfer_failure_latched_ = false;
-  abort_active_slot_ = false;
-  transfer_failure_status_ = SUCCESS;
+Status HixlCSClient::ParseGlobalConfig(const HixlClientDesc *client_desc, const HixlClientConfig *config) {
   HIXL_CHECK_NOTNULL(client_desc->server_ip);
   HIXL_CHECK_NOTNULL(client_desc->local_endpoint);
   HIXL_CHECK_NOTNULL(client_desc->remote_endpoint);
@@ -350,6 +349,22 @@ Status HixlCSClient::Create(const HixlClientDesc *client_desc, const HixlClientC
               global_config_.MaxTransferCountPerBatch(), kMaxFixedQueueTransferCountPerBatch);
     return PARAM_INVALID;
   }
+  return SUCCESS;
+}
+
+Status HixlCSClient::Create(const HixlClientDesc *client_desc, const HixlClientConfig *config) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  HIXL_CHK_BOOL_RET_STATUS(!tls_initialized_, FAILED, "[HixlClient] TLS is already initialized");
+  transfer_failure_latched_ = false;
+  abort_active_slot_ = false;
+  transfer_failure_status_ = SUCCESS;
+  HIXL_CHK_STATUS_RET(ParseGlobalConfig(client_desc, config), "[HixlClient] Invalid client configuration");
+  HIXL_CHK_STATUS_RET(TlsManager::GetInstance().Initialize(global_config_.TlsCfg()),
+                      "[HixlClient] Failed to initialize TLS from global_resource_config");
+  HIXL_DISMISSABLE_GUARD(tls_guard, ([this]() {
+                           CloseSocket();
+                           TlsManager::GetInstance().Finalize();
+                         }));
   HIXL_EVENT(
       "[HixlClient] Create begin. Server=%s:%u. "
       "SrcEndpoint[Loc:%d, protocol:%s, commAddr.Type:%d, commAddr.id:0x%x], "
@@ -379,6 +394,8 @@ Status HixlCSClient::Create(const HixlClientDesc *client_desc, const HixlClientC
     HIXL_CHECK_NOTNULL(ubmem_engine_);
   }
   HIXL_DISMISS_GUARD(pool_rollback);
+  HIXL_DISMISS_GUARD(tls_guard);
+  tls_initialized_ = true;
   EndpointHandle endpoint_handle = local_endpoint_->GetHandle();
   HIXL_EVENT("[HixlClient] Create success. server=%s:%u, src_ep_handle=%p", server_ip_.c_str(), server_port_,
              endpoint_handle);
@@ -1255,64 +1272,73 @@ Status HixlCSClient::Connect(uint32_t timeout_ms) {
   HIXL_CHK_BOOL_RET_STATUS(remote_endpoint_.protocol != COMM_PROTOCOL_RESERVED, PARAM_INVALID,
                            "[HixlClient] Connect called but remote_endpoint is not set in Create");
   if (is_connected_) {
-    HIXL_LOGW("[HixlClient] Already connected. fd=%d, Target=%s:%u", socket_, server_ip_.c_str(), server_port_);
+    HIXL_LOGW("[HixlClient] Already connected. connection=%s, Target=%s:%u", connection_->Desc().c_str(),
+              server_ip_.c_str(), server_port_);
     return ALREADY_CONNECTED;
   }
+  if (connection_ == nullptr) {
+    connection_ = MakeShared<CtrlMsgPlugin>();
+    HIXL_CHECK_NOTNULL(connection_);
+    HIXL_CHK_STATUS_RET(connection_->Initialize(), "Failed to initialize control connection");
+  }
   HIXL_EVENT("[HixlClient] Connect start. Target=%s:%u, timeout=%u ms", server_ip_.c_str(), server_port_, timeout_ms);
-  const Status sock_ret = CtrlMsgPlugin::Connect(server_ip_, server_port_, socket_, timeout_ms);
+  const Status sock_ret = connection_->Connect(server_ip_, server_port_, timeout_ms);
   if (sock_ret != SUCCESS) {
     // CtrlMsgPlugin::Connect 失败时内部已关闭 fd，此处仅清除残留句柄，避免误判为已连接
-    socket_ = -1;
+    connection_.reset();
     HIXL_CHK_STATUS_RET(sock_ret, "[HixlClient] Connect socket to %s:%u failed", server_ip_.c_str(), server_port_);
   }
-  HIXL_LOGI("[HixlClient] Socket connected (TCP ready). fd=%d", socket_);
+  HIXL_LOGI("[HixlClient] Socket connected (TCP ready). connection=%s", connection_->Desc().c_str());
   HIXL_DISMISSABLE_GUARD(close_socket, [this] { CloseSocket(); });
   HIXL_CHK_STATUS_RET(ExchangeEndpointAndCreateChannel(timeout_ms),
-                      "[HixlClient] Exchange endpoint info failed. fd=%d, Target=%s:%u", socket_, server_ip_.c_str(),
-                      server_port_);
+                      "[HixlClient] Exchange endpoint info failed. connection=%s, Target=%s:%u",
+                      connection_->Desc().c_str(), server_ip_.c_str(), server_port_);
   HIXL_DISMISS_GUARD(close_socket);
   is_connected_ = true;
-  HIXL_EVENT("[HixlClient] Connect success. target=%s:%u, fd=%d, remote_ep_handle=%" PRIu64 ", ch=%p",
-             server_ip_.c_str(), server_port_, socket_, remote_endpoint_handle_, client_channel_handle_);
+  HIXL_EVENT("[HixlClient] Connect success. target=%s:%u, connection=%s, remote_ep_handle=%" PRIu64 ", ch=%p",
+             server_ip_.c_str(), server_port_, connection_->Desc().c_str(), remote_endpoint_handle_,
+             client_channel_handle_);
   return SUCCESS;
 }
 
 void HixlCSClient::CloseSocket() {
-  if (socket_ != -1) {
-    HIXL_LOGI("[HixlClient] Closing socket. fd=%d", socket_);
-    close(socket_);
-    socket_ = -1;
+  if (connection_ != nullptr) {
+    HIXL_LOGI("[HixlClient] Closing socket. connection=%s", connection_->Desc().c_str());
+    (void)connection_->Close();
+    connection_.reset();
   }
 }
 
 Status HixlCSClient::ExchangeEndpointAndCreateChannel(uint32_t timeout_ms) {
   const EndpointDesc &src_ep = local_endpoint_->GetEndpoint();
   HIXL_LOGD(
-      "[HixlClient] MatchEndpoint then CreateChannel. socket: %d, timeout: %u ms, "
+      "[HixlClient] MatchEndpoint then CreateChannel. connection: %s, timeout: %u ms, "
       "Src[protocol:%s, type:%d, id:%u], Dst[protocol:%s, type:%d, id:%u]",
-      socket_, timeout_ms, ProtocolToString(src_ep.protocol).c_str(), static_cast<int32_t>(src_ep.commAddr.type),
-      src_ep.commAddr.id, ProtocolToString(remote_endpoint_.protocol).c_str(),
-      static_cast<int32_t>(remote_endpoint_.commAddr.type), remote_endpoint_.commAddr.id);
-  HIXL_CHK_STATUS_RET(ConnMsgHandler::SendMatchEndpointRequest(socket_, remote_endpoint_),
-                      "[HixlClient] SendMatchEndpointRequest failed. fd=%d", socket_);
+      connection_->Desc().c_str(), timeout_ms, ProtocolToString(src_ep.protocol).c_str(),
+      static_cast<int32_t>(src_ep.commAddr.type), src_ep.commAddr.id,
+      ProtocolToString(remote_endpoint_.protocol).c_str(), static_cast<int32_t>(remote_endpoint_.commAddr.type),
+      remote_endpoint_.commAddr.id);
+  HIXL_CHK_STATUS_RET(ConnMsgHandler::SendMatchEndpointRequest(connection_, remote_endpoint_),
+                      "[HixlClient] SendMatchEndpointRequest failed. connection=%s", connection_->Desc().c_str());
   uint32_t remote_listen_port = 0;
   uint64_t channel_index = 0UL;
-  HIXL_CHK_STATUS_RET(ConnMsgHandler::RecvMatchEndpointResponse(socket_, remote_endpoint_handle_, remote_listen_port,
-                                                                channel_index, timeout_ms),
-                      "[HixlClient] RecvMatchEndpointResponse failed. fd=%d, timeout=%u ms", socket_, timeout_ms);
+  HIXL_CHK_STATUS_RET(ConnMsgHandler::RecvMatchEndpointResponse(connection_, remote_endpoint_handle_,
+                                                                remote_listen_port, channel_index, timeout_ms),
+                      "[HixlClient] RecvMatchEndpointResponse failed. connection=%s, timeout=%u ms",
+                      connection_->Desc().c_str(), timeout_ms);
   local_endpoint_->SetPort(remote_listen_port);
   CommMem *prefetch_mems = nullptr;
   char **prefetch_tags = nullptr;
   uint32_t prefetch_num = 0U;
   HIXL_LOGI("[HixlClient] Connect: prefetch remote mem before CreateChannel");
   HIXL_CHK_STATUS_RET(GetRemoteMemImpl(timeout_ms, &prefetch_mems, &prefetch_tags, &prefetch_num),
-                      "[HixlClient] Connect prefetch GetRemoteMem/Import failed. fd=%d, timeout=%u ms", socket_,
-                      timeout_ms);
+                      "[HixlClient] Connect prefetch GetRemoteMem/Import failed. connection=%s, timeout=%u ms",
+                      connection_->Desc().c_str(), timeout_ms);
   const uint8_t qos = global_config_.Qos().value_or(kQosUnset);
   CreateChannelReq create_body{src_ep,          remote_endpoint_handle_, tc_, sl_,       retry_cnt_,
                                retry_interval_, channel_index,           qos, timeout_ms};
-  HIXL_CHK_STATUS_RET(ConnMsgHandler::SendCreateChannelRequest(socket_, create_body),
-                      "[HixlClient] SendCreateChannelRequest failed. fd=%d", socket_);
+  HIXL_CHK_STATUS_RET(ConnMsgHandler::SendCreateChannelRequest(connection_, create_body),
+                      "[HixlClient] SendCreateChannelRequest failed. connection=%s", connection_->Desc().c_str());
   ChannelHandle channel_handle = 0UL;
   ChannelDesc channel_desc{remote_endpoint_,
                            tc_,
@@ -1333,8 +1359,9 @@ Status HixlCSClient::ExchangeEndpointAndCreateChannel(uint32_t timeout_ms) {
                                        channel_handle, static_cast<uint32_t>(ret));
                            }
                          }));
-  HIXL_CHK_STATUS_RET(ConnMsgHandler::RecvCreateChannelResponse(socket_, timeout_ms),
-                      "[HixlClient] RecvCreateChannelResponse failed. fd=%d, timeout=%u ms", socket_, timeout_ms);
+  HIXL_CHK_STATUS_RET(ConnMsgHandler::RecvCreateChannelResponse(connection_, timeout_ms),
+                      "[HixlClient] RecvCreateChannelResponse failed. connection=%s, timeout=%u ms",
+                      connection_->Desc().c_str(), timeout_ms);
   HIXL_LOGI("[HixlClient] Connect: remote endpoint handle = %" PRIu64, remote_endpoint_handle_);
   client_channel_handle_ = channel_handle;
   HIXL_LOGI("[HixlClient] Channel Ready. client_channel_handle_=%p", client_channel_handle_);
@@ -1382,12 +1409,15 @@ Status HixlCSClient::InitRdmaRetryConfig() {
 Status HixlCSClient::GetRemoteMemImpl(uint32_t timeout_ms, CommMem **remote_mem_list, char ***mem_tag_list,
                                       uint32_t *list_num) {
   HIXL_CHECK_NOTNULL(local_endpoint_);
-  HIXL_CHK_STATUS_RET(MemMsgHandler::SendGetRemoteMemRequest(socket_, remote_endpoint_handle_, timeout_ms),
-                      "[HixlClient] SendGetRemoteMemRequest failed. fd=%d, remote_ep_handle=%" PRIu64, socket_,
-                      remote_endpoint_handle_);
+  HIXL_CHK_BOOL_RET_STATUS(connection_ != nullptr, FAILED,
+                           "[HixlClient] Cannot get remote memory: control connection is missing");
+  HIXL_CHK_STATUS_RET(MemMsgHandler::SendGetRemoteMemRequest(connection_, remote_endpoint_handle_, timeout_ms),
+                      "[HixlClient] SendGetRemoteMemRequest failed. connection=%s, remote_ep_handle=%" PRIu64,
+                      connection_->Desc().c_str(), remote_endpoint_handle_);
   std::vector<HixlMemDesc> mem_descs;
-  HIXL_CHK_STATUS_RET(MemMsgHandler::RecvGetRemoteMemResponse(socket_, mem_descs, timeout_ms),
-                      "[HixlClient] RecvGetRemoteMemResponse failed. fd=%d, timeout=%u ms", socket_, timeout_ms);
+  HIXL_CHK_STATUS_RET(MemMsgHandler::RecvGetRemoteMemResponse(connection_, mem_descs, timeout_ms),
+                      "[HixlClient] RecvGetRemoteMemResponse failed. connection=%s, timeout=%u ms",
+                      connection_->Desc().c_str(), timeout_ms);
   HIXL_LOGD("[HixlClient] Recv remote mem descs success. Count=%zu", mem_descs.size());
   HIXL_CHK_STATUS_RET(ImportRemoteMem(mem_descs, remote_mem_list, mem_tag_list, list_num),
                       "[HixlClient] ImportRemoteMem failed. desc_count=%zu", mem_descs.size());
@@ -1404,8 +1434,8 @@ Status HixlCSClient::GetRemoteMem(CommMem **remote_mem_list, char ***mem_tag_lis
   std::lock_guard<std::mutex> lock(mutex_);
   auto ctx_guard = GetContextGuard();
   (void)ctx_guard;
-  HIXL_EVENT("[HixlClient] GetRemoteMem begin. fd=%d, remote_ep_handle=%" PRIu64 ", timeout=%u ms", socket_,
-             remote_endpoint_handle_, timeout_ms);
+  HIXL_EVENT("[HixlClient] GetRemoteMem begin. remote_ep_handle=%" PRIu64 ", timeout=%u ms", remote_endpoint_handle_,
+             timeout_ms);
   HIXL_CHECK_NOTNULL(remote_mem_list);
   HIXL_CHECK_NOTNULL(mem_tag_list);
   HIXL_CHECK_NOTNULL(list_num);
@@ -1414,8 +1444,8 @@ Status HixlCSClient::GetRemoteMem(CommMem **remote_mem_list, char ***mem_tag_lis
   HIXL_CHECK_NOTNULL(local_endpoint_);
   HIXL_CHK_STATUS_RET(GetRemoteMemImpl(timeout_ms, remote_mem_list, mem_tag_list, list_num),
                       "[HixlClient] GetRemoteMemImpl failed");
-  HIXL_EVENT("[HixlClient] GetRemoteMem success. fd=%d, remote_ep_handle=%" PRIu64 ", imported=%u", socket_,
-             remote_endpoint_handle_, *list_num);
+  HIXL_EVENT("[HixlClient] GetRemoteMem success. connection=%s, remote_ep_handle=%" PRIu64 ", imported=%u",
+             connection_->Desc().c_str(), remote_endpoint_handle_, *list_num);
   return SUCCESS;
 }
 
@@ -1558,8 +1588,8 @@ Status HixlCSClient::Destroy() {
   {
     auto ctx_guard = GetContextGuard();
     (void)ctx_guard;
-    HIXL_EVENT("[HixlClient] Destroy start. fd=%d, imported_bufs=%zu, recorded_addrs=%zu", socket_,
-               imported_remote_bufs_.size(), recorded_remote_addrs_.size());
+    HIXL_EVENT("[HixlClient] Destroy start. imported_bufs=%zu, recorded_addrs=%zu", imported_remote_bufs_.size(),
+               recorded_remote_addrs_.size());
     ReleaseLegacyHandles();
     if (ubmem_engine_ != nullptr) {
       ubmem_engine_->Finalize();
@@ -1569,7 +1599,7 @@ Status HixlCSClient::Destroy() {
     ReleaseDeviceResources();
     Status ret = ClearRemoteMemInfo();
     if (ret != SUCCESS) {
-      HIXL_LOGW("[HixlClient] ClearRemoteMemInfo failed. fd=%d, ret=%u", socket_, static_cast<uint32_t>(ret));
+      HIXL_LOGW("[HixlClient] ClearRemoteMemInfo failed. ret=%u", static_cast<uint32_t>(ret));
       first_error = (first_error == SUCCESS) ? ret : first_error;
     }
     CloseSocket();
@@ -1591,6 +1621,10 @@ Status HixlCSClient::Destroy() {
       pool->Finalize();
     }
     device_id_ = -1;
+  }
+  if (tls_initialized_) {
+    tls_initialized_ = false;
+    TlsManager::GetInstance().Finalize();
   }
   HIXL_EVENT("[HixlClient] Destroy done. first_error=%u", static_cast<uint32_t>(first_error));
   return first_error;

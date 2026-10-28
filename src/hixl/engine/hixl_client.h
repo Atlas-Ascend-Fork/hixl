@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include "cs/hixl_cs.h"
+#include "common/ctrl_msg_plugin.h"
 #include "common/hixl_inner_types.h"
 #include "common/ctrl_msg.h"
 #include "engine/client_handler.h"
@@ -126,9 +127,10 @@ class HixlClient {
   const std::string &GetRemoteEngine() const;
 
  private:
-  Status SendEndpointInfoReq(int32_t fd, CtrlMsgType msg_type, uint32_t timeout_ms) const;
-  Status RecvEndpointInfoResp(int32_t fd, std::vector<EndpointConfig> &remote_endpoint_list, uint32_t timeout_ms) const;
-  Status RecvNotifyAck(int32_t fd, int32_t timeout_ms) const;
+  Status SendEndpointInfoReq(const CtrlMsgPluginPtr &connection, CtrlMsgType msg_type, uint32_t timeout_ms) const;
+  Status RecvEndpointInfoResp(const CtrlMsgPluginPtr &connection, std::vector<EndpointConfig> &remote_endpoint_list,
+                              uint32_t timeout_ms) const;
+  Status RecvNotifyAck(const CtrlMsgPluginPtr &connection, int32_t timeout_ms) const;
   void CloseCtrlSocket();
   Status CheckAliveLocked();
   bool IsCtrlSocketWritable() const;
@@ -146,7 +148,7 @@ class HixlClient {
   std::optional<uint8_t> rdma_sl_;
   bool is_connected_{false};  // true为已建链；false未建链
   bool is_finalized_{false};
-  int32_t ctrl_socket_{-1};
+  CtrlMsgPluginPtr connection_;
   std::unique_ptr<IClientHandler> client_handler_;
   std::vector<HandlerCreateArgs::EndpointPair> link_pairs_;
   mutable std::mutex mutex_;  // 所有方法串行执行，不支持并发调用

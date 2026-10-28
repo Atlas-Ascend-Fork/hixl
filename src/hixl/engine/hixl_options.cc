@@ -333,6 +333,7 @@ Status ParseGlobalResourceConfigJson(const nlohmann::json &json, GlobalResourceC
   HIXL_CHK_STATUS_RET(ParseTransferConfig(json, cfg.transfer_config), "Failed to parse TransferConfig");
   HIXL_CHK_STATUS_RET(ParseLocalCommResPath(json, cfg), "Failed to parse local_comm_res_path");
   HIXL_CHK_STATUS_RET(ParseTopoFilePath(json, cfg), "Failed to parse topo_file_path");
+  HIXL_CHK_STATUS_RET(ParseTlsConfig(json, cfg.tls_config), "Failed to parse tls_config");
   return SUCCESS;
 }
 
@@ -349,6 +350,18 @@ void AppendFabricMemoryJson(nlohmann::json &json, const UbMemoryConfig &cfg) {
   if (cfg.enable_aicpu_unfold.has_value()) {
     json[kGlobalResCfgEnableAicpuUnfold] = cfg.enable_aicpu_unfold.value();
   }
+}
+
+void AppendTlsConfigJson(nlohmann::json &json, const TlsConfig &config) {
+  if (!config.Enabled()) {
+    return;
+  }
+  json["tls_config.cert_file"] = config.cert_file;
+  json["tls_config.key_file"] = config.key_file;
+  json["tls_config.ca_file"] = config.ca_file;
+  json["tls_config.ciphers"] = config.ciphers;
+  json["tls_config.verify_peer"] = config.verify_peer;
+  json["tls_config.enable_cert_refresh"] = config.enable_cert_refresh;
 }
 
 std::string DumpGlobalResourceConfig(const nlohmann::json &json) {
@@ -620,6 +633,7 @@ std::string SerializeGlobalResourceConfigForServer(const GlobalResourceConfig &c
     json[kGlobalResCfgMaxActiveChannels] = comm.max_active_channels.value();
   }
   AppendFabricMemoryJson(json, config.fabric_memory);
+  AppendTlsConfigJson(json, config.tls_config);
   return DumpGlobalResourceConfig(json);
 }
 
@@ -636,6 +650,7 @@ std::string SerializeGlobalResourceConfigForClient(const GlobalResourceConfig &c
     json[kGlobalResCfgMaxActiveChannels] = comm.max_active_channels.value();
   }
   AppendFabricMemoryJson(json, config.fabric_memory);
+  AppendTlsConfigJson(json, config.tls_config);
   if (config.transfer_config.max_transfer_count_per_batch_configured) {
     json[kGlobalResCfgTransferCount] = config.transfer_config.max_transfer_count_per_batch;
   }

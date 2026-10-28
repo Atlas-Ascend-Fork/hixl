@@ -28,23 +28,24 @@ ge::Status HixlEntity::Initialize(int32_t timeout_ms) {
                    "Failed to connect to remote engine, remote_engine:%s, timeout:%d ms.", remote_engine_.c_str(),
                    timeout_ms);
 
-  int32_t client_fd = -1;
-  LLM_CHK_HIXL_RET(hixl::CtrlMsgPlugin::Connect(remote_ip_, remote_port_, client_fd, timeout_ms),
-                   "Connect server %s failed", remote_engine_.c_str());
-  ScopeGuard socket_guard([client_fd]() { close(client_fd); });
+  auto client_connection = std::shared_ptr<hixl::CtrlMsgPlugin>(new (std::nothrow) hixl::CtrlMsgPlugin());
+  LLM_CHECK_NOTNULL(client_connection);
+  LLM_CHK_HIXL_RET(client_connection->Initialize(), "Failed to initialize cache-table TLS");
+  LLM_CHK_HIXL_RET(client_connection->Connect(remote_ip_, remote_port_, timeout_ms), "Connect server %s failed",
+                   remote_engine_.c_str());
+  ScopeGuard socket_guard([client_connection]() { (void)client_connection->Close(); });
   hixl::CtrlMsgHeader header{};
   header.magic = hixl::kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(hixl::CtrlMsgType));
   auto msg_type = hixl::CtrlMsgType::kGetCacheTableReq;
-  const uint32_t send_timeout_ms = static_cast<uint32_t>(timeout_ms);
   LLM_CHK_HIXL_RET(
-      hixl::CtrlMsgPlugin::Send(client_fd, &header, static_cast<uint64_t>(sizeof(header)), send_timeout_ms),
+      client_connection->Send(&header, static_cast<uint64_t>(sizeof(header)), static_cast<uint32_t>(timeout_ms)),
       "Failed to send cache table header");
   LLM_CHK_HIXL_RET(
-      hixl::CtrlMsgPlugin::Send(client_fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type)), send_timeout_ms),
+      client_connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type)), static_cast<uint32_t>(timeout_ms)),
       "Failed to send cache table type");
   CacheTableInfo info{};
-  LLM_CHK_STATUS_RET(RecvCacheTableResp(client_fd, info, timeout_ms), "Failed to recv cache table info");
+  LLM_CHK_STATUS_RET(RecvCacheTableResp(client_connection, info, timeout_ms), "Failed to recv cache table info");
   auto &remote_mems = GetRemoteMems();
   CommMem remote_mem{};
   remote_mem.type = CommMemType::COMM_MEM_TYPE_DEVICE;
@@ -54,9 +55,10 @@ ge::Status HixlEntity::Initialize(int32_t timeout_ms) {
   return ge::SUCCESS;
 }
 
-ge::Status HixlEntity::RecvCacheTableResp(int32_t fd, CacheTableInfo &cache_table_info, int32_t timeout_ms) {
+ge::Status HixlEntity::RecvCacheTableResp(const hixl::CtrlMsgPluginPtr &connection, CacheTableInfo &cache_table_info,
+                                          int32_t timeout_ms) {
   hixl::CtrlMsgHeader header{};
-  LLM_CHK_HIXL_RET(hixl::CtrlMsgPlugin::Recv(fd, &header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
+  LLM_CHK_HIXL_RET(connection->Recv(&header, static_cast<uint32_t>(sizeof(header)), timeout_ms),
                    "Failed to recv cache table header, timeout:%d ms", timeout_ms);
   LLM_CHK_BOOL_RET_STATUS(header.magic == hixl::kMagicNumber, ge::LLM_PARAM_INVALID,
                           "Invalid magic:0x%X for cache table resp", header.magic);
@@ -65,14 +67,13 @@ ge::Status HixlEntity::RecvCacheTableResp(int32_t fd, CacheTableInfo &cache_tabl
                           header.body_size, sizeof(hixl::CtrlMsgType) + sizeof(CacheTableInfo));
 
   hixl::CtrlMsgType msg_type{};
-  LLM_CHK_HIXL_RET(hixl::CtrlMsgPlugin::Recv(fd, &msg_type, static_cast<uint32_t>(sizeof(msg_type)), timeout_ms),
+  LLM_CHK_HIXL_RET(connection->Recv(&msg_type, static_cast<uint32_t>(sizeof(msg_type)), timeout_ms),
                    "Failed to recv cache table msg type");
   LLM_CHK_BOOL_RET_STATUS(msg_type == hixl::CtrlMsgType::kGetCacheTableResp, ge::LLM_PARAM_INVALID,
                           "Unexpected msg type in RecvCacheTableInfoResp: %d", static_cast<int32_t>(msg_type));
 
-  LLM_CHK_HIXL_RET(
-      hixl::CtrlMsgPlugin::Recv(fd, &cache_table_info, static_cast<uint32_t>(sizeof(CacheTableInfo)), timeout_ms),
-      "Failed to recv cache table body");
+  LLM_CHK_HIXL_RET(connection->Recv(&cache_table_info, static_cast<uint32_t>(sizeof(CacheTableInfo)), timeout_ms),
+                   "Failed to recv cache table body");
   return ge::SUCCESS;
 }
 

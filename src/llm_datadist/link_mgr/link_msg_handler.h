@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #include "comm_entity_manager.h"
 #include "cache_mgr/cache_manager.h"
 #include "common/msg_handler_plugin.h"
+#include "common/tls/tls_config.h"
 
 namespace llm {
 enum class LinkMsgType : int32_t { kConnect = 1, kDisconnect = 2, kStatus = 3, kEnd };
@@ -59,7 +60,7 @@ class LinkMsgHandler {
         cache_manager_(cache_manager),
         comm_config_{},
         aclrt_context_(nullptr) {}
-  ~LinkMsgHandler() = default;
+  ~LinkMsgHandler();
   ge::Status Initialize(const std::map<ge::AscendString, ge::AscendString> &options);
   void Finalize();
 
@@ -71,20 +72,23 @@ class LinkMsgHandler {
   void SetMemHandlesCallback(GetMemHandles callback);
 
  private:
+  ge::Status InitializeControlListener(const std::map<ge::AscendString, ge::AscendString> &options);
   template <typename T>
-  static ge::Status SendMsg(int32_t fd, LinkMsgType msg_type, const T &msg);
+  static ge::Status SendMsg(const hixl::CtrlMsgPluginPtr &connection, LinkMsgType msg_type, const T &msg);
   template <typename T>
-  static ge::Status RecvMsg(int32_t fd, LinkMsgType msg_type, T &msg);
-  ge::Status ConnectedProcess(int32_t fd, bool &keep_fd);
+  static ge::Status RecvMsg(const hixl::CtrlMsgPluginPtr &connection, LinkMsgType msg_type, T &msg, int32_t timeout_ms);
+  ge::Status ConnectedProcess(const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection);
   ge::Status ExchangeInfoProcess(const LLMExchangeInfo &peer_exchange_info, int32_t timeout, bool force_link,
                                  const std::string &peer_ip, EntityMemInfoPtr &mem_info_ptr) const;
   ge::Status GenerateRankInfo(const std::string &peer_comm_res, std::string &rank_table, int32_t &local_rank_id,
                               int32_t &peer_rank_id) const;
   ge::Status DisconnectInfoProcess(const LLMDisconnectInfo &peer_disconnect_info) const;
-  ge::Status ProcessDisconnectRequest(int32_t fd, const std::vector<char> &msg) const;
-  ge::Status ProcessConnectRequest(int32_t fd, const std::vector<char> &msg);
+  ge::Status ProcessDisconnectRequest(const hixl::CtrlMsgPluginPtr &connection, const std::vector<char> &msg) const;
+  ge::Status ProcessConnectRequest(const hixl::CtrlMsgPluginPtr &connection, const std::vector<char> &msg);
   ge::Status GenerateLocalCommRes(const ClusterInfo &cluster);
   ge::Status CreateEntityMemInfo(EntityMemInfoPtr &mem_info_ptr) const;
+  LLMExchangeInfo BuildExchangeInfo(const ClusterInfo &cluster, int32_t timeout,
+                                    const EntityMemInfoPtr &mem_info_ptr) const;
   ge::Status SetEntityMemInfo(const LLMExchangeInfo &peer_exchange_info, EntityPtr entity,
                               EntityMemInfoPtr &mem_info_ptr) const;
   template <typename T>
@@ -98,6 +102,8 @@ class LinkMsgHandler {
   CommEntityManager *comm_entity_manager_;
   CacheManager *cache_manager_;
   MsgHandlerPlugin handler_plugin_;
+  hixl::TlsConfig tls_config_;
+  bool tls_initialized_ = false;
   std::string local_comm_name_;
   HcclCommConfig comm_config_;
   aclrtContext aclrt_context_;

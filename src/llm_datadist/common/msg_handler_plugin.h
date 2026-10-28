@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -12,50 +12,39 @@
 #define CANN_GRAPH_ENGINE_RUNTIME_LLM_DATADIST_V2_MSG_HANDLER_PLUGIN_H_
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <unistd.h>
 #include "acl/acl.h"
+#include "common/ctrl_msg_plugin.h"
 #include "llm_datadist/llm_error_codes.h"
 #include "common/llm_thread_pool.h"
 
 namespace llm {
-using ConnectedProcess = std::function<void(int32_t conn_fd, bool &keep_fd)>;
+constexpr int32_t kServerReadTimeoutMs = 60000;
+
+using ConnectedProcess = std::function<void(const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection)>;
 class MsgHandlerPlugin {
  public:
   MsgHandlerPlugin() = default;
   ~MsgHandlerPlugin();
-  void Initialize();
+  ge::Status Initialize();
   void Finalize();
   ge::Status StartDaemon(const std::string &ip, uint32_t listen_port);
   void RegisterConnectedProcess(ConnectedProcess proc);
-  static ge::Status Connect(const std::string &ip, uint32_t port, int32_t &conn_fd, int32_t timeout,
-                            ge::Status default_err);
-  static ssize_t Read(int32_t fd, void *buf, size_t len);
-  static ssize_t Write(int32_t fd, const void *buf, size_t len);
-  static void Disconnect(int32_t conn_fd);
-  static ge::Status SendMsg(int32_t fd, int32_t msg_type, const std::string &msg_str);
-  static ge::Status RecvMsg(int32_t fd, int32_t &msg_type, std::vector<char> &msg);
+  static ge::Status SendMsg(const hixl::CtrlMsgPluginPtr &connection, int32_t msg_type, const std::string &msg_str);
+  static ge::Status RecvMsg(const hixl::CtrlMsgPluginPtr &connection, int32_t &msg_type, std::vector<char> &msg,
+                            int32_t timeout_ms);
 
  private:
   void ListenClose();
-  ge::Status DoConnectedProcess(int32_t conn_fd);
+  ge::Status DoConnectedProcess(const hixl::CtrlMsgPluginPtr &connection);
   ge::Status DoAccept();
-  static ge::Status DoConnect(struct ::addrinfo *addr, int32_t &conn_fd, int32_t &err_no, int32_t timeout,
-                              ge::Status default_err);
-  static ge::Status GetAiFamily(const std::string &ip, int32_t &ai_family);
-  ge::Status SockAddrInit(const std::string &ip, uint32_t listen_port, int32_t ai_family,
-                          struct sockaddr_storage &server_addr, socklen_t &addr_len) const;
 
-  int32_t listen_fd_ = -1;
+  hixl::CtrlMsgPluginPtr listener_connection_;
   std::atomic<bool> listener_running_{false};
   std::thread listener_;
   std::unique_ptr<LLMThreadPool> thread_pool_ = nullptr;

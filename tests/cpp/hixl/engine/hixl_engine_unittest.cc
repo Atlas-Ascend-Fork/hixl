@@ -24,6 +24,9 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+#include "depends/ctrl_msg_test_helper.h"
+
 #include "ascendcl_stub.h"
 #include "engine/endpoint_test_utils.h"
 #define private public
@@ -44,6 +47,11 @@
 #include "depends/sys_api/src/sys_api_wrap.h"
 #include "depends/mmpa/src/mmpa_stub.h"
 #include "hixl_test_helpers.h"
+
+#include "common/tls/tls_manager.h"
+#include "common/tls/tls_test_helper.h"
+#include "common/scope_guard.h"
+#include "nlohmann/json.hpp"
 
 namespace hixl {
 
@@ -480,6 +488,121 @@ TEST_F(HixlEngineTest, InitializeWithoutListenPortDoesNotSetServerListenPort) {
   engine.Finalize();
 }
 
+TEST_F(HixlEngineTest, CsSerializationPreservesAllTlsFields) {
+  GlobalResourceConfig config{};
+  config.tls_config = TlsConfig{true, "/cert.pem", "/key.pem", "/ca.pem", "HIGH", true, true};
+  const std::vector<std::string> serialized{SerializeGlobalResourceConfigForServer(config),
+                                            SerializeGlobalResourceConfigForClient(config, {}, {})};
+  for (const auto &text : serialized) {
+    GlobalConfig parsed;
+    ASSERT_EQ(GlobalConfig::Parse(text.c_str(), parsed), SUCCESS);
+    const auto &tls = parsed.TlsCfg();
+    EXPECT_TRUE(tls.Enabled());
+    EXPECT_EQ(tls.cert_file, config.tls_config.cert_file);
+    EXPECT_EQ(tls.key_file, config.tls_config.key_file);
+    EXPECT_EQ(tls.ca_file, config.tls_config.ca_file);
+    EXPECT_EQ(tls.ciphers, config.tls_config.ciphers);
+    EXPECT_TRUE(tls.verify_peer);
+    EXPECT_TRUE(tls.enable_cert_refresh);
+  }
+}
+
+TEST_F(HixlEngineTest, SharedTlsConfigurationReachesServerAndClient) {
+  const auto dir = test::MakeTempDir();
+  HIXL_MAKE_GUARD(cleanup, ([&]() {
+                    test::RemovePath(dir + "/cert.pem");
+                    test::RemovePath(dir + "/key.pem");
+                    test::RemovePath(dir);
+                  }));
+  ASSERT_FALSE(dir.empty());
+  ASSERT_TRUE(test::GenerateSelfSignedCert(dir));
+  const nlohmann::json config{{"tls_config.cert_file", dir + "/cert.pem"},
+                              {"tls_config.key_file", dir + "/key.pem"},
+                              {"tls_config.ca_file", dir + "/cert.pem"},
+                              {"tls_config.verify_peer", true}};
+  auto opts = options1;
+  opts[OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(config.dump().c_str());
+  HixlEngine engine_a("127.0.0.1");
+  HixlEngine engine_b("127.0.0.1");
+  HIXL_MAKE_GUARD(finalize, ([&]() {
+                    engine_b.Finalize();
+                    engine_a.Finalize();
+                  }));
+  const std::vector<HixlEngine *> engines{&engine_a, &engine_b};
+  for (auto *engine : engines) {
+    CreateAndInitEngine(*engine, opts);
+    auto *server = static_cast<HixlCSServer *>(engine->server_.server_handle_);
+    ASSERT_NE(server, nullptr);
+    EXPECT_TRUE(CtrlMsgPluginTestAccess::IsTlsEnabled(server->listener_connection_));
+    EXPECT_EQ(TlsManager::GetInstance().GetConfig().ca_file, dir + "/cert.pem");
+    ClientConfig client{};
+    engine->BuildClientConfig(AscendString("127.0.0.1:26300"), client, kTimeOut, false);
+    EXPECT_EQ(client.global_config.tls_config.ca_file, dir + "/cert.pem");
+  }
+  const auto context = TlsManager::GetInstance().GetContext();
+  engine_a.Finalize();
+  engine_a.Finalize();
+  EXPECT_EQ(TlsManager::GetInstance().GetContext(), context);
+  auto *server_b = static_cast<HixlCSServer *>(engine_b.server_.server_handle_);
+  EXPECT_EQ(TlsManager::GetInstance().GetConfig().ca_file, dir + "/cert.pem");
+  EXPECT_TRUE(CtrlMsgPluginTestAccess::IsTlsEnabled(server_b->listener_connection_));
+  EXPECT_EQ(server_b->listener_connection_->Close(), SUCCESS);
+  EXPECT_EQ(TlsManager::GetInstance().GetContext(), context);
+  engine_b.Finalize();
+  EXPECT_FALSE(TlsManager::GetInstance().IsInitialized());
+}
+
+TEST_F(HixlEngineTest, ConflictingTlsEngineInitializationPreservesActiveEngine) {
+  const auto dir = test::MakeTempDir();
+  HIXL_MAKE_GUARD(cleanup, ([&]() {
+                    test::RemovePath(dir + "/cert.pem");
+                    test::RemovePath(dir + "/key.pem");
+                    test::RemovePath(dir);
+                  }));
+  ASSERT_FALSE(dir.empty());
+  ASSERT_TRUE(test::GenerateSelfSignedCert(dir));
+  nlohmann::json config{{"tls_config.cert_file", dir + "/cert.pem"}, {"tls_config.key_file", dir + "/key.pem"}};
+  auto opts = options1;
+  opts[OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(config.dump().c_str());
+  HixlEngine active("127.0.0.1");
+  HixlEngine conflict("127.0.0.1");
+  HIXL_MAKE_GUARD(finalize, ([&]() {
+                    conflict.Finalize();
+                    active.Finalize();
+                  }));
+  CreateAndInitEngine(active, opts);
+  ASSERT_TRUE(active.IsInitialized());
+  config["tls_config.enable_cert_refresh"] = true;
+  opts[OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(config.dump().c_str());
+  HixlOptions parsed;
+  ASSERT_EQ(HixlOptions::Parse(opts, parsed), SUCCESS);
+  EXPECT_NE(conflict.Initialize(parsed), SUCCESS);
+  EXPECT_FALSE(conflict.IsInitialized());
+  const auto context = TlsManager::GetInstance().GetContext();
+  conflict.Finalize();
+  EXPECT_EQ(TlsManager::GetInstance().GetContext(), context);
+  ASSERT_EQ(HixlOptions::Parse(options1, parsed), SUCCESS);
+  EXPECT_NE(conflict.Initialize(parsed), SUCCESS);
+  auto *server = static_cast<HixlCSServer *>(active.server_.server_handle_);
+  ASSERT_NE(server, nullptr);
+  EXPECT_TRUE(CtrlMsgPluginTestAccess::IsTlsEnabled(server->listener_connection_));
+  EXPECT_EQ(TlsManager::GetInstance().GetConfig().cert_file, dir + "/cert.pem");
+  active.Finalize();
+  EXPECT_EQ(conflict.Initialize(parsed), SUCCESS);
+}
+
+TEST_F(HixlEngineTest, FailedInitializationAndRepeatedFinalizeDoNotRetainTlsOwner) {
+  HixlEngine failed("127.0.0.1:65536");
+  HIXL_MAKE_GUARD(finalize, ([&]() { failed.Finalize(); }));
+  HixlOptions parsed;
+  ASSERT_EQ(HixlOptions::Parse(options1, parsed), SUCCESS);
+  EXPECT_FALSE(TlsManager::GetInstance().IsInitialized());
+  EXPECT_NE(failed.Initialize(parsed), SUCCESS);
+  EXPECT_FALSE(TlsManager::GetInstance().IsInitialized());
+  failed.Finalize();
+  EXPECT_FALSE(TlsManager::GetInstance().IsInitialized());
+}
+
 TEST_F(HixlEngineTest, InitializeRestoresCallerCurrentContext) {
   auto *const user_context = reinterpret_cast<aclrtContext>(static_cast<uintptr_t>(0xACEU));
   acl_stub_->current_context_ = user_context;
@@ -737,14 +860,14 @@ TEST_F(HixlEngineTest, TestSendAndGetNotifies) {
   EXPECT_EQ(engine1.Connect("127.0.0.1:26300", kTimeOut), SUCCESS);
   auto client = engine1.client_manager_.GetClient("127.0.0.1:26300");
   ASSERT_NE(client, nullptr);
-  EXPECT_GE(client->ctrl_socket_, 0);
+  EXPECT_NE(client->connection_, nullptr);
   NotifyDesc notify;
   std::string notify_name = "test_notify";
   notify.name = AscendString(notify_name.c_str());
   std::string notify_msg = "message";
   notify.notify_msg = AscendString(notify_msg.c_str());
   EXPECT_EQ(engine1.SendNotify("127.0.0.1:26300", notify, kTimeOut), SUCCESS);
-  EXPECT_GE(client->ctrl_socket_, 0);
+  EXPECT_NE(client->connection_, nullptr);
   std::vector<NotifyDesc> notifies;
   EXPECT_EQ(engine2.GetNotifies(notifies), SUCCESS);
   ASSERT_EQ(notifies.size(), 1U);
@@ -1353,26 +1476,28 @@ static bool AttachClosedCtrlSocket(const ClientPtr &client) {
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
     return false;
   }
-  client->ctrl_socket_ = fds[0];
+  client->connection_ = test::Connection(fds[0]);
   close(fds[1]);
   return true;
 }
 
-TEST(ClientManagerTest, HeartbeatInitializeStartsAndStopsThread) {
+class ClientManagerTest : public hixl::test::PlainTlsTest {};
+
+TEST_F(ClientManagerTest, HeartbeatInitializeStartsAndStopsThread) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(true), SUCCESS);
   EXPECT_TRUE(manager.heartbeat_sender_.joinable());
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, HeartbeatInitializeWithoutAutoConnectDoesNotStartThread) {
+TEST_F(ClientManagerTest, HeartbeatInitializeWithoutAutoConnectDoesNotStartThread) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   EXPECT_FALSE(manager.heartbeat_sender_.joinable());
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, GetOrCreateClientReturnsExistingClient) {
+TEST_F(ClientManagerTest, GetOrCreateClientReturnsExistingClient) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
 
@@ -1387,7 +1512,7 @@ TEST(ClientManagerTest, GetOrCreateClientReturnsExistingClient) {
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, FinalizePropagatesFailureAfterFinalizingAllClients) {
+TEST_F(ClientManagerTest, FinalizePropagatesFailureAfterFinalizingAllClients) {
   ClientManager manager;
   ASSERT_EQ(manager.Initialize(false), SUCCESS);
 
@@ -1430,10 +1555,9 @@ TEST(HixlEngineLifecycleTest, AutoConnectRejectsWhenNotInitialized) {
   EXPECT_EQ(client_ptr, nullptr);
 }
 
-TEST(ClientManagerTest, HeartbeatDestroysUnhealthyClient) {
+TEST_F(ClientManagerTest, HeartbeatDestroysUnhealthyClient) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
-  CtrlMsgPlugin::Initialize();
   auto client = CreateMockClient();
   ASSERT_TRUE(AttachClosedCtrlSocket(client));
   manager.clients_["127.0.0.1:26300"] = client;
@@ -1442,7 +1566,7 @@ TEST(ClientManagerTest, HeartbeatDestroysUnhealthyClient) {
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, HeartbeatDestroysClientWithInvalidSocket) {
+TEST_F(ClientManagerTest, HeartbeatDestroysClientWithInvalidSocket) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   auto client = CreateMockClient();
@@ -1452,7 +1576,7 @@ TEST(ClientManagerTest, HeartbeatDestroysClientWithInvalidSocket) {
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, TransferReqIndexKeepsSubmitOrderAndFindsClient) {
+TEST_F(ClientManagerTest, TransferReqIndexKeepsSubmitOrderAndFindsClient) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   auto client = CreateMockClient();
@@ -1484,7 +1608,7 @@ TEST(ClientManagerTest, TransferReqIndexKeepsSubmitOrderAndFindsClient) {
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, RegisterDuplicateTransferReqRemovesOldOrderNode) {
+TEST_F(ClientManagerTest, RegisterDuplicateTransferReqRemovesOldOrderNode) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   auto client = CreateMockClient();
@@ -1507,7 +1631,7 @@ TEST(ClientManagerTest, RegisterDuplicateTransferReqRemovesOldOrderNode) {
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, DestroyClientClearsTransferReqIndex) {
+TEST_F(ClientManagerTest, DestroyClientClearsTransferReqIndex) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   auto client = CreateMockClient();
@@ -1837,7 +1961,7 @@ TEST_F(HixlEngineTest, DeregisterMemWhileConnectedReturnsSuccess) {
   engine2.Finalize();
 }
 
-TEST(ClientManagerTest, DeregisterMemInvokesEveryClient) {
+TEST_F(ClientManagerTest, DeregisterMemInvokesEveryClient) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   auto handler_a = std::make_unique<MockClientHandler>();
@@ -1856,7 +1980,7 @@ TEST(ClientManagerTest, DeregisterMemInvokesEveryClient) {
   EXPECT_EQ(manager.Finalize(), SUCCESS);
 }
 
-TEST(ClientManagerTest, DeregisterMemStopsOnFailure) {
+TEST_F(ClientManagerTest, DeregisterMemStopsOnFailure) {
   ClientManager manager;
   EXPECT_EQ(manager.Initialize(false), SUCCESS);
   auto handler_a = std::make_unique<MockClientHandler>();

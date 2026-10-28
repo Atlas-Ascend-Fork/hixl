@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 #include "common/def_types.h"
 #include "common/rank_table_generator.h"
 #include "common/hixl_utils.h"
+#include "common/tls/tls_manager.h"
 #include "common/llm_utils.h"
 #include "common/llm_checker.h"
 #include "common/llm_scope_guard.h"
@@ -26,6 +27,18 @@ constexpr const char kOptionRdmaTrafficClass[] = "llm.RdmaTrafficClass";
 constexpr const char kOptionRdmaServiceLevel[] = "llm.RdmaServiceLevel";
 constexpr uint64_t kDefaultReqBufferSize = 112U * 1024U;
 constexpr uint64_t kDefaultRespBufferSize = 16U * 1024U;
+
+ge::Status ParseControlTlsConfig(const std::string &text, hixl::TlsConfig &config) {
+  try {
+    const auto status = hixl::ParseTlsConfig(nlohmann::json::parse(text), config);
+    LLM_CHK_BOOL_RET_STATUS(status == hixl::SUCCESS, ge::LLM_PARAM_INVALID,
+                            "Failed to parse TLS configuration, hixl_status:%u", status);
+  } catch (const nlohmann::json::exception &error) {
+    LLM_CHK_BOOL_RET_STATUS(false, ge::LLM_PARAM_INVALID, "Failed to parse global resource configuration, error:%s",
+                            error.what());
+  }
+  return ge::SUCCESS;
+}
 
 bool IsVersionOnlyCommRes(const std::string &comm_res) {
   if (comm_res.empty()) {
@@ -142,6 +155,10 @@ ge::Status LinkMsgHandler::Deserialize(const std::vector<char> &msg_str, T &msg)
   return ge::SUCCESS;
 }
 
+LinkMsgHandler::~LinkMsgHandler() {
+  Finalize();
+}
+
 ge::Status LinkMsgHandler::Initialize(const std::map<ge::AscendString, ge::AscendString> &options) {
   LLM_CHECK_NOTNULL(comm_entity_manager_);
   LLM_CHECK_NOTNULL(cache_manager_);
@@ -181,18 +198,42 @@ ge::Status LinkMsgHandler::Initialize(const std::map<ge::AscendString, ge::Ascen
     LLMLOGI("set rdma service level to %u.", service_level);
   }
   LLM_ASSERT_RT_OK(aclrtGetCurrentContext(&aclrt_context_));
-  handler_plugin_.Initialize();
+  return InitializeControlListener(options);
+}
+
+ge::Status LinkMsgHandler::InitializeControlListener(const std::map<ge::AscendString, ge::AscendString> &options) {
+  LLM_CHK_BOOL_RET_STATUS(!tls_initialized_, ge::FAILED, "TLS is already initialized");
+  tls_config_ = hixl::TlsConfig{};
+  const auto config_it = options.find(llm_datadist::OPTION_GLOBAL_RESOURCE_CONFIG);
+  if (config_it != options.end()) {
+    LLM_CHK_STATUS_RET(ParseControlTlsConfig(config_it->second.GetString(), tls_config_),
+                       "Failed to parse TLS configuration");
+  }
+  LLM_CHK_HIXL_RET(hixl::TlsManager::GetInstance().Initialize(tls_config_), "Failed to initialize TLS");
+  LLM_DISMISSABLE_GUARD(tls_guard, ([this]() {
+                          handler_plugin_.Finalize();
+                          hixl::TlsManager::GetInstance().Finalize();
+                        }));
+  LLM_CHK_STATUS_RET(handler_plugin_.Initialize(), "Failed to initialize control listener");
+  LLM_DISMISS_GUARD(tls_guard);
+  tls_initialized_ = true;
   return ge::SUCCESS;
 }
 
 void LinkMsgHandler::Finalize() {
   handler_plugin_.Finalize();
+  if (tls_initialized_) {
+    tls_initialized_ = false;
+    hixl::TlsManager::GetInstance().Finalize();
+  }
   comm_entity_manager_ = nullptr;
   cache_manager_ = nullptr;
 }
 
 ge::Status LinkMsgHandler::StartDaemon(const std::string &ip, uint32_t listen_port) {
-  handler_plugin_.RegisterConnectedProcess([this](int32_t fd, bool &keep_fd) { (void)ConnectedProcess(fd, keep_fd); });
+  handler_plugin_.RegisterConnectedProcess([this](const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection) {
+    (void)ConnectedProcess(connection, keep_connection);
+  });
   return handler_plugin_.StartDaemon(ip, listen_port);
 }
 
@@ -202,25 +243,28 @@ ge::Status LinkMsgHandler::StopDaemon() {
 }
 
 template <typename T>
-ge::Status LinkMsgHandler::SendMsg(int32_t fd, LinkMsgType msg_type, const T &msg) {
+ge::Status LinkMsgHandler::SendMsg(const hixl::CtrlMsgPluginPtr &connection, LinkMsgType msg_type, const T &msg) {
   std::string msg_str;
   LLM_CHK_STATUS_RET(LinkMsgHandler::Serialize(msg, msg_str), "Failed to serialize msg");
-  LLM_CHK_STATUS_RET(MsgHandlerPlugin::SendMsg(fd, static_cast<int32_t>(msg_type), msg_str), "Failed to send msg");
+  LLM_CHK_STATUS_RET(MsgHandlerPlugin::SendMsg(connection, static_cast<int32_t>(msg_type), msg_str),
+                     "Failed to send msg");
   return ge::SUCCESS;
 }
 
 template <typename T>
-ge::Status LinkMsgHandler::RecvMsg(int32_t fd, LinkMsgType msg_type, T &msg) {
+ge::Status LinkMsgHandler::RecvMsg(const hixl::CtrlMsgPluginPtr &connection, LinkMsgType msg_type, T &msg,
+                                   int32_t timeout_ms) {
   std::vector<char> msg_str;
   int32_t type = 0;
-  LLM_CHK_STATUS_RET(MsgHandlerPlugin::RecvMsg(fd, type, msg_str), "Failed to recv msg");
+  LLM_CHK_STATUS_RET(MsgHandlerPlugin::RecvMsg(connection, type, msg_str, timeout_ms), "Failed to recv msg");
   LLM_CHK_BOOL_RET_STATUS(msg_type == static_cast<LinkMsgType>(type), ge::FAILED,
                           "Failed to check recv msg type:%d, expect type:%d", type, static_cast<int32_t>(msg_type));
   LLM_CHK_STATUS_RET(LinkMsgHandler::Deserialize(msg_str, msg), "Failed to deserialize msg");
   return ge::SUCCESS;
 }
 
-ge::Status LinkMsgHandler::ProcessConnectRequest(int32_t fd, const std::vector<char> &msg) {
+ge::Status LinkMsgHandler::ProcessConnectRequest(const hixl::CtrlMsgPluginPtr &connection,
+                                                 const std::vector<char> &msg) {
   EntityMemInfoPtr mem_info_ptr = nullptr;
   LLM_CHK_STATUS_RET(CreateEntityMemInfo(mem_info_ptr), "Failed to create entity mem info");
   LLMExchangeInfo exchange_info = {};
@@ -233,20 +277,20 @@ ge::Status LinkMsgHandler::ProcessConnectRequest(int32_t fd, const std::vector<c
   exchange_info.req_size = kDefaultReqBufferSize;
   exchange_info.resp_addr = PtrToValue(mem_info_ptr->resp_);
   exchange_info.resp_size = kDefaultRespBufferSize;
-  LLM_CHK_STATUS_RET(SendMsg(fd, LinkMsgType::kConnect, exchange_info), "Failed to send connect msg");
+  LLM_CHK_STATUS_RET(SendMsg(connection, LinkMsgType::kConnect, exchange_info), "Failed to send connect msg");
 
   auto ret = ge::FAILED;
-  LLM_MAKE_GUARD(send_status, ([fd, &ret]() {
+  LLM_MAKE_GUARD(send_status, ([connection, &ret]() {
                    LLMLinkStatus status{};
                    status.error_code = ret;
-                   LinkMsgHandler::SendMsg(fd, LinkMsgType::kStatus, status);
+                   LinkMsgHandler::SendMsg(connection, LinkMsgType::kStatus, status);
                  }));
 
   LLMExchangeInfo peer_exchange_info{};
   LLM_CHK_STATUS_RET(LinkMsgHandler::Deserialize(msg, peer_exchange_info), "Failed to deserialize connect msg");
   std::string requester_ip;
-  ret = hixl::GetPeerIp(fd, requester_ip);
-  LLM_CHK_STATUS(ret, "Failed to get requester source ip, fd:%d.", fd);
+  ret = hixl::GetPeerIp(connection->Fd(), requester_ip);
+  LLM_CHK_STATUS(ret, "Failed to get requester source ip, connection:%s.", connection->Desc().c_str());
   if (ret != ge::SUCCESS) {
     return ret;
   }
@@ -276,12 +320,13 @@ ge::Status LinkMsgHandler::ProcessConnectRequest(int32_t fd, const std::vector<c
   return ret;
 }
 
-ge::Status LinkMsgHandler::ProcessDisconnectRequest(int32_t fd, const std::vector<char> &msg) const {
+ge::Status LinkMsgHandler::ProcessDisconnectRequest(const hixl::CtrlMsgPluginPtr &connection,
+                                                    const std::vector<char> &msg) const {
   auto ret = ge::FAILED;
-  LLM_MAKE_GUARD(send_status, ([fd, &ret]() {
+  LLM_MAKE_GUARD(send_status, ([connection, &ret]() {
                    LLMLinkStatus status{};
                    status.error_code = ret;
-                   LinkMsgHandler::SendMsg(fd, LinkMsgType::kStatus, status);
+                   LinkMsgHandler::SendMsg(connection, LinkMsgType::kStatus, status);
                  }));
 
   LLMDisconnectInfo peer_disconnect_info{};
@@ -289,8 +334,8 @@ ge::Status LinkMsgHandler::ProcessDisconnectRequest(int32_t fd, const std::vecto
   LLMLOGI("Start to process disconnect cluster, local cluster_id:%lu, remote cluster_id:%lu.", cluster_id_,
           peer_disconnect_info.cluster_id);
   std::string requester_ip;
-  ret = hixl::GetPeerIp(fd, requester_ip);
-  LLM_CHK_STATUS(ret, "Failed to get requester source ip, fd:%d.", fd);
+  ret = hixl::GetPeerIp(connection->Fd(), requester_ip);
+  LLM_CHK_STATUS(ret, "Failed to get requester source ip, connection:%s.", connection->Desc().c_str());
   if (ret != ge::SUCCESS) {
     return ret;
   }
@@ -312,19 +357,19 @@ ge::Status LinkMsgHandler::ProcessDisconnectRequest(int32_t fd, const std::vecto
   return ret;
 }
 
-ge::Status LinkMsgHandler::ConnectedProcess(int32_t fd, bool &keep_fd) {
-  keep_fd = false;
+ge::Status LinkMsgHandler::ConnectedProcess(const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection) {
+  keep_connection = false;
   int32_t msg_type = 0;
   std::vector<char> msg;
-  LLM_CHK_STATUS_RET(MsgHandlerPlugin::RecvMsg(fd, msg_type, msg), "Failed to recv msg");
+  LLM_CHK_STATUS_RET(MsgHandlerPlugin::RecvMsg(connection, msg_type, msg, kServerReadTimeoutMs), "Failed to recv msg");
   LLM_CHK_BOOL_RET_STATUS(static_cast<LinkMsgType>(msg_type) == LinkMsgType::kConnect ||
                               static_cast<LinkMsgType>(msg_type) == LinkMsgType::kDisconnect,
                           ge::LLM_PARAM_INVALID, "Failed to check msg type:%d", msg_type);
 
   if (static_cast<LinkMsgType>(msg_type) == LinkMsgType::kConnect) {
-    LLM_CHK_STATUS_RET(ProcessConnectRequest(fd, msg), "Failed to process connect request");
+    LLM_CHK_STATUS_RET(ProcessConnectRequest(connection, msg), "Failed to process connect request");
   } else {
-    LLM_CHK_STATUS_RET(ProcessDisconnectRequest(fd, msg), "Failed to process disconnect request");
+    LLM_CHK_STATUS_RET(ProcessDisconnectRequest(connection, msg), "Failed to process disconnect request");
   }
   return ge::SUCCESS;
 }
@@ -440,24 +485,8 @@ ge::Status LinkMsgHandler::CreateEntityMemInfo(EntityMemInfoPtr &mem_info_ptr) c
   return ge::SUCCESS;
 }
 
-ge::Status LinkMsgHandler::LinkCluster(const ClusterInfo &cluster, int32_t timeout) {
-  LLM_CHK_BOOL_RET_STATUS(cluster.remote_ip_infos.size() == 1U, ge::LLM_PARAM_INVALID,
-                          "remote_ip_infos size != 1 is unsupported.");
-  std::string remote_ip_str;
-  LLM_CHK_STATUS_RET(LLMUtils::IntToIp(cluster.remote_ip_infos[0].ip, remote_ip_str), "Failed to convert remote ip.");
-  LLM_CHK_STATUS_RET(GenerateLocalCommRes(cluster), "Failed to generate local comm res");
-  int32_t conn_fd = 0;
-  uint32_t remote_port = static_cast<uint32_t>(cluster.remote_ip_infos[0].port);
-  LLMLOGI("Start to link cluster, local cluster_id:%lu, remote info %s:%u, timeout:%d ms.", cluster_id_,
-          remote_ip_str.c_str(), remote_port, timeout);
-  LLM_CHK_STATUS_RET(MsgHandlerPlugin::Connect(remote_ip_str, remote_port, conn_fd, timeout, ge::LLM_LINK_FAILED),
-                     "Failed to connect remote addr %s:%u, timeout=%d ms.", remote_ip_str.c_str(), remote_port,
-                     timeout);
-  LLMLOGI("connect to remote addr %s:%u success", remote_ip_str.c_str(), remote_port);
-
-  LLM_MAKE_GUARD(close_fd, ([conn_fd]() { MsgHandlerPlugin::Disconnect(conn_fd); }));
-  EntityMemInfoPtr mem_info_ptr = nullptr;
-  LLM_CHK_STATUS_RET(CreateEntityMemInfo(mem_info_ptr), "Failed to create entity mem info");
+LLMExchangeInfo LinkMsgHandler::BuildExchangeInfo(const ClusterInfo &cluster, int32_t timeout,
+                                                  const EntityMemInfoPtr &mem_info_ptr) const {
   LLMExchangeInfo exchange_info = {};
   const auto &buffer_and_size = cache_manager_->GetCacheTableBufferAndSize();
   exchange_info.cache_table_addr = PtrToValue(buffer_and_size.first);
@@ -471,10 +500,42 @@ ge::Status LinkMsgHandler::LinkCluster(const ClusterInfo &cluster, int32_t timeo
   exchange_info.req_size = kDefaultReqBufferSize;
   exchange_info.resp_addr = PtrToValue(mem_info_ptr->resp_);
   exchange_info.resp_size = kDefaultRespBufferSize;
+  return exchange_info;
+}
 
-  LLM_CHK_STATUS_RET(SendMsg(conn_fd, LinkMsgType::kConnect, exchange_info), "Failed to send connect msg");
+ge::Status LinkMsgHandler::LinkCluster(const ClusterInfo &cluster, int32_t timeout) {
+  LLM_CHK_BOOL_RET_STATUS(cluster.remote_ip_infos.size() == 1U, ge::LLM_PARAM_INVALID,
+                          "remote_ip_infos size != 1 is unsupported.");
+  std::string remote_ip_str;
+  LLM_CHK_STATUS_RET(LLMUtils::IntToIp(cluster.remote_ip_infos[0].ip, remote_ip_str), "Failed to convert remote ip.");
+  LLM_CHK_STATUS_RET(GenerateLocalCommRes(cluster), "Failed to generate local comm res");
+  auto connection = MakeShared<hixl::CtrlMsgPlugin>();
+  LLM_CHECK_NOTNULL(connection);
+  uint32_t remote_port = static_cast<uint32_t>(cluster.remote_ip_infos[0].port);
+  LLMLOGI("Start to link cluster, local cluster_id:%lu, remote info %s:%u, timeout:%d ms.", cluster_id_,
+          remote_ip_str.c_str(), remote_port, timeout);
+  const auto init_ret = connection->Initialize();
+  LLM_CHK_BOOL_RET_STATUS(init_ret == hixl::SUCCESS, ge::LLM_LINK_FAILED,
+                          "Call api:CtrlMsgPlugin::Initialize failed, peer:%s:%u, ret:%u", remote_ip_str.c_str(),
+                          remote_port, init_ret);
+  const auto connect_ret = connection->Connect(remote_ip_str, remote_port, timeout);
+  LLM_CHK_BOOL_RET_STATUS(connect_ret == hixl::SUCCESS,
+                          (connect_ret == hixl::PARAM_INVALID || connect_ret == hixl::TIMEOUT)
+                              ? ConvertHixlError2Ge(connect_ret)
+                              : ge::LLM_LINK_FAILED,
+                          "Call api:CtrlMsgPlugin::Connect failed, peer:%s:%u, timeout:%d ms, ret:%u",
+                          remote_ip_str.c_str(), remote_port, timeout, connect_ret);
+  LLMLOGI("connect to remote addr %s:%u success", remote_ip_str.c_str(), remote_port);
+
+  LLM_MAKE_GUARD(close_connection, ([connection]() { (void)connection->Close(); }));
+  EntityMemInfoPtr mem_info_ptr = nullptr;
+  LLM_CHK_STATUS_RET(CreateEntityMemInfo(mem_info_ptr), "Failed to create entity mem info");
+  const auto exchange_info = BuildExchangeInfo(cluster, timeout, mem_info_ptr);
+
+  LLM_CHK_STATUS_RET(SendMsg(connection, LinkMsgType::kConnect, exchange_info), "Failed to send connect msg");
   LLMExchangeInfo peer_exchange_info = {};
-  LLM_CHK_STATUS_RET(RecvMsg(conn_fd, LinkMsgType::kConnect, peer_exchange_info), "Failed to recv connect msg");
+  LLM_CHK_STATUS_RET(RecvMsg(connection, LinkMsgType::kConnect, peer_exchange_info, timeout),
+                     "Failed to recv connect msg");
 
   peer_exchange_info.comm_name =
       "llm_datadist_" + std::to_string(cluster_id_) + "_" + std::to_string(peer_exchange_info.cluster_id);
@@ -484,7 +545,7 @@ ge::Status LinkMsgHandler::LinkCluster(const ClusterInfo &cluster, int32_t timeo
   // 返回 SUCCESS，行为不变。
   auto ret = ExchangeInfoProcess(peer_exchange_info, timeout, exchange_info.force_link, remote_ip_str, mem_info_ptr);
   LLMLinkStatus status{};
-  LLM_CHK_STATUS_RET(RecvMsg(conn_fd, LinkMsgType::kStatus, status), "Failed to recv status msg");
+  LLM_CHK_STATUS_RET(RecvMsg(connection, LinkMsgType::kStatus, status, timeout), "Failed to recv status msg");
   LLM_CHK_STATUS_RET(status.error_code, "Failed to check peer process ret status, error code[%u], err msg[%s]",
                      status.error_code, status.error_message.c_str());
   LLM_CHK_STATUS_RET(ret, "Failed to process peer exchange info, timeout:%d ms", timeout);
@@ -498,26 +559,34 @@ ge::Status LinkMsgHandler::UnlinkCluster(const ClusterInfo &cluster, int32_t tim
           cluster_id_, cluster.remote_cluster_id, timeout, static_cast<int32_t>(force_flag));
   LLM_CHK_BOOL_RET_STATUS(force_flag || cluster.remote_ip_infos.size() == 1U, ge::LLM_PARAM_INVALID,
                           "When force_flag=false, remote_ip_infos size != 1 is unsupported.");
-  int32_t conn_fd = -1;
-  LLM_MAKE_GUARD(close_fd, ([&conn_fd]() {
-                   if (conn_fd != -1) {
-                     MsgHandlerPlugin::Disconnect(conn_fd);
+  hixl::CtrlMsgPluginPtr connection;
+  LLM_MAKE_GUARD(close_connection, ([&connection]() {
+                   if (connection != nullptr) {
+                     (void)connection->Close();
                    }
                  }));
-
   if (!force_flag) {
     std::string remote_ip_str;
     LLM_CHK_STATUS_RET(LLMUtils::IntToIp(cluster.remote_ip_infos[0].ip, remote_ip_str), "Failed to convert remote ip.");
     uint32_t remote_port = static_cast<uint32_t>(cluster.remote_ip_infos[0].port);
-    LLM_CHK_STATUS_RET(MsgHandlerPlugin::Connect(remote_ip_str, remote_port, conn_fd, timeout, ge::LLM_UNLINK_FAILED),
-                       "Failed to connect remote addr %s:%u, timeout=%d ms.", remote_ip_str.c_str(), remote_port,
-                       timeout);
+    connection = MakeShared<hixl::CtrlMsgPlugin>();
+    LLM_CHECK_NOTNULL(connection);
+    const auto init_ret = connection->Initialize();
+    LLM_CHK_BOOL_RET_STATUS(init_ret == hixl::SUCCESS, ge::LLM_UNLINK_FAILED,
+                            "Call api:CtrlMsgPlugin::Initialize failed, peer:%s:%u, ret:%u", remote_ip_str.c_str(),
+                            remote_port, init_ret);
+    const auto connect_ret = connection->Connect(remote_ip_str, remote_port, timeout);
+    LLM_CHK_BOOL_RET_STATUS(connect_ret == hixl::SUCCESS,
+                            (connect_ret == hixl::PARAM_INVALID || connect_ret == hixl::TIMEOUT)
+                                ? ConvertHixlError2Ge(connect_ret)
+                                : ge::LLM_UNLINK_FAILED,
+                            "Call api:CtrlMsgPlugin::Connect failed, peer:%s:%u, timeout:%d ms, ret:%u",
+                            remote_ip_str.c_str(), remote_port, timeout, connect_ret);
     LLMLOGI("connect to remote addr %s:%u success", remote_ip_str.c_str(), remote_port);
-
     LLMDisconnectInfo disconnect_info = {};
     disconnect_info.cluster_id = cluster_id_;
     disconnect_info.timeout = timeout;
-    LLM_CHK_STATUS_RET(SendMsg(conn_fd, LinkMsgType::kDisconnect, disconnect_info), "Failed to send disconnect msg");
+    LLM_CHK_STATUS_RET(SendMsg(connection, LinkMsgType::kDisconnect, disconnect_info), "Failed to send disconnect msg");
   }
   LLMDisconnectInfo peer_disconnect_info = {};
   peer_disconnect_info.cluster_id = cluster.remote_cluster_id;
@@ -526,7 +595,7 @@ ge::Status LinkMsgHandler::UnlinkCluster(const ClusterInfo &cluster, int32_t tim
   auto ret = DisconnectInfoProcess(peer_disconnect_info);
   if (!force_flag) {
     LLMLinkStatus status{};
-    LLM_CHK_STATUS_RET(RecvMsg(conn_fd, LinkMsgType::kStatus, status), "Failed to recv status msg");
+    LLM_CHK_STATUS_RET(RecvMsg(connection, LinkMsgType::kStatus, status, timeout), "Failed to recv status msg");
     LLM_CHK_STATUS_RET(status.error_code, "Failed to check peer process ret status, error code[%u], err msg[%s]",
                        status.error_code, status.error_message.c_str());
   }

@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "depends/ctrl_msg_test_helper.h"
 
 #include <atomic>
 #include <chrono>
@@ -615,9 +616,10 @@ static EndpointDesc MakeIdEpEx(uint32_t id, CommProtocol protocol) {
   return ep;
 }
 
-class HixlCSClientUT : public ::testing::Test {
+class HixlCSClientUT : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     ResetHcommVersionStub();
     src_ = MakeIdEp(kSrcEpId);
     dst_ = MakeIdEp(kDstEpId);
@@ -1030,8 +1032,12 @@ TEST_F(HixlCSClientUT, ConnectFailNoServer) {
   port_ = kPort;
   CreateClient();
   EXPECT_NE(client_.Connect(kConnectTime1), SUCCESS);  // 50ms
-  EXPECT_EQ(client_.socket_, -1);
+  EXPECT_EQ(client_.connection_, nullptr);
   EXPECT_FALSE(client_.is_connected_);
+  CommMem *remote = nullptr;
+  char **tags = nullptr;
+  uint32_t num = kZero;
+  EXPECT_EQ(client_.GetRemoteMem(&remote, &tags, &num, kTimeOutOne), FAILED);
 }
 
 TEST_F(HixlCSClientUT, ConnectSuccessNormal) {
@@ -1052,9 +1058,13 @@ TEST_F(HixlCSClientUT, ConnectRetryAfterExchangeFailReconnects) {
   StartServer(MiniSrvMode::kConnectResp_FailResult, MiniSrvMode::kNormal);
   CreateClient();
   EXPECT_NE(client_.Connect(kDefaultConnectTimeoutMs), SUCCESS);
-  EXPECT_EQ(client_.socket_, -1);
+  EXPECT_EQ(client_.connection_, nullptr);
   EXPECT_FALSE(client_.is_connected_);
   EXPECT_TRUE(client_.local_endpoint_->channels_.empty());
+  CommMem *remote = nullptr;
+  char **tags = nullptr;
+  uint32_t num = kZero;
+  EXPECT_EQ(client_.GetRemoteMem(&remote, &tags, &num, kTimeOutOne), FAILED);
   StartServer(MiniSrvMode::kNormal, MiniSrvMode::kNormal);
   EXPECT_EQ(client_.Connect(kDefaultConnectTimeoutMs), SUCCESS);
   EXPECT_TRUE(client_.is_connected_);
@@ -1182,7 +1192,7 @@ TEST_F(HixlCSClientUT, GetRemoteMemFailWithoutConnect) {
   char **tags = nullptr;
   uint32_t num = kZero;
 
-  // 未 Connect，socket_ 还没连上 -> send/recv 会失败
+  // 未 Connect，connection_ 还没连上 -> send/recv 会失败
   EXPECT_NE(client_.GetRemoteMem(&remote, &tags, &num, kTimeOutOne), SUCCESS);
 }
 

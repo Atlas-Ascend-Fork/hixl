@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 #include <thread>
 #include "common/mem_utils.h"
 #include "common/llm_scope_guard.h"
+#include "common/ctrl_msg_plugin.h"
 #include "common/def_types.h"
 #include "base/err_msg.h"
 #include "control_msg_handler.h"
@@ -59,8 +60,8 @@ Status ValidateDisconnectRequest(const ChannelPtr &channel, const RequestDisconn
 // the response body, and the caller only needs to report that the request has been handled (see the call site),
 // so this always returns SUCCESS by design.
 Status SendRequestDisconnectResp(const ChannelPtr &channel, const RequestDisconnectResp &resp) {
-  const Status send_ret = channel->SendControlMsg([&resp](int32_t fd) {
-    return ControlMsgHandler::SendMsg(fd, ControlMsgType::kRequestDisconnectResp, resp, kSendMsgTimeout);
+  const Status send_ret = channel->SendControlMsg([&resp](const hixl::CtrlMsgPluginPtr &connection) {
+    return ControlMsgHandler::SendMsg(connection, ControlMsgType::kRequestDisconnectResp, resp, kSendMsgTimeout);
   });
   if (send_ret != SUCCESS) {
     LLMLOGW("Failed to send disconnect response for channel %s", resp.channel_id.c_str());
@@ -156,24 +157,52 @@ Status ChannelManager::Initialize(BufferTransferService *buffer_transfer_service
   return SUCCESS;
 }
 
-Status ChannelManager::AddSocketToEpoll(int32_t fd, ChannelPtr channel) {
+Status ChannelManager::AddSocketToEpoll(const hixl::CtrlMsgPluginPtr &connection, ChannelPtr channel) {
   epoll_event event{};
   event.events = EPOLLIN;
-  event.data.fd = fd;
-  const int32_t ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event);
+  event.data.fd = connection->Fd();
+  const int32_t ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, connection->Fd(), &event);
   const int32_t ctl_errno = errno;
-  ADXL_CHK_BOOL_RET_STATUS(ret != -1, FAILED, "Call api:epoll_ctl failed, ret:%d, fd:%d, errno:%d, error_msg:%s", ret,
-                           fd, ctl_errno, strerror(ctl_errno));
+  ADXL_CHK_BOOL_RET_STATUS(ret != -1, FAILED,
+                           "Call api:epoll_ctl failed, ret:%d, connection:%s, errno:%d, error_msg:%s", ret,
+                           connection->Desc().c_str(), ctl_errno, strerror(ctl_errno));
 
   std::lock_guard<std::mutex> lock(fd_mutex_);
-  fd_to_channel_map_[fd] = std::move(channel);
-  LLMLOGI("Successfully added fd %d to epoll", fd);
+  fd_to_channel_map_[connection->Fd()] = std::move(channel);
+  LLMLOGI("Successfully added connection %s to epoll", connection->Desc().c_str());
   return SUCCESS;
 }
 
+bool ChannelManager::ProcessPendingMsg() {
+  std::vector<ChannelPtr> failed_channels;
+  bool processed = false;
+  {
+    std::lock_guard<std::mutex> lock(fd_mutex_);
+    for (auto it = fd_to_channel_map_.begin(); it != fd_to_channel_map_.end();) {
+      const int32_t fd = it->first;
+      const auto channel = it->second;
+      const auto connection = channel->Connection();
+      ++it;
+      // HandleSocketEventLocked may erase the current connection on failure.
+      if (connection->HasPending()) {
+        processed = true;
+        if (HandleSocketEventLocked(fd) != SUCCESS) {
+          failed_channels.push_back(channel);
+        }
+      }
+    }
+  }
+  for (const auto &channel : failed_channels) {
+    CleanupUnusableChannel(channel);
+  }
+  return processed;
+}
+
 Status ChannelManager::HandleEpoolEvents() {
+  const bool processed_pending = ProcessPendingMsg();
   struct epoll_event events[kMaxEvents];
-  int nfds = epoll_wait(epoll_fd_, events, kMaxEvents, kEpollWaitTimeInMillis);
+  const int32_t timeout_ms = processed_pending ? 0 : kEpollWaitTimeInMillis;
+  int nfds = epoll_wait(epoll_fd_, events, kMaxEvents, timeout_ms);
   if (nfds == -1) {
     const int32_t wait_errno = errno;
     ADXL_CHK_BOOL_RET_SPECIAL_STATUS(wait_errno == EINTR, SUCCESS, "Get EINTR signal.");
@@ -190,15 +219,47 @@ Status ChannelManager::HandleEpoolEvents() {
 }
 
 Status ChannelManager::HandleSocketEvent(int32_t fd) {
-  std::lock_guard<std::mutex> lock(fd_mutex_);
+  ChannelPtr channel;
+  Status ret;
+  {
+    std::lock_guard<std::mutex> lock(fd_mutex_);
+    const auto it = fd_to_channel_map_.find(fd);
+    if (it != fd_to_channel_map_.end()) {
+      channel = it->second;
+    }
+    ret = HandleSocketEventLocked(fd);
+  }
+  if (ret != SUCCESS && channel != nullptr) {
+    CleanupUnusableChannel(channel);
+  }
+  return ret;
+}
+
+void ChannelManager::CleanupUnusableChannel(const ChannelPtr &channel) {
+  const auto connection = channel->Connection();
+  // DestroyChannel takes fd_mutex_; callers must release it before owner cleanup.
+  if (connection != nullptr && !connection->IsUsable()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = channels_.find({channel->GetChannelType(), channel->GetChannelId()});
+    if (it == channels_.end() || it->second != channel) {
+      return;
+    }
+    ADXL_CHK_STATUS(DestroyChannelLocked(channel->GetChannelType(), channel->GetChannelId()),
+                    "Failed to destroy channel with unusable control connection, channel:%s",
+                    channel->GetChannelId().c_str());
+  }
+}
+
+Status ChannelManager::HandleSocketEventLocked(int32_t fd) {
   auto it = fd_to_channel_map_.find(fd);
   auto ret = SUCCESS;
   if (it != fd_to_channel_map_.end()) {
     ret = HandleReadEvent(it->second);
     if (ret != SUCCESS) {
       auto channel_id = it->second->GetChannelId();
+      const int socket = it->second->GetFd();
       fd_to_channel_map_.erase(it);
-      auto epoll_ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+      auto epoll_ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, socket, nullptr);
       ADXL_CHK_BOOL_RET_STATUS(epoll_ret != -1, FAILED, "Failed to remove epoll fd of channel:%s.", channel_id.c_str());
     }
   }
@@ -210,8 +271,11 @@ Status ChannelManager::HandleReadEvent(const ChannelPtr &channel) const {
   if (channel->recv_buffer_.size() < channel->bytes_received_ + kRecvChunkSize) {
     channel->recv_buffer_.resize(channel->bytes_received_ + kRecvChunkSize);
   }
-  ssize_t n = recv(fd, channel->recv_buffer_.data() + channel->bytes_received_,
-                   channel->recv_buffer_.size() - channel->bytes_received_, 0);
+  ssize_t n = 0;
+  const auto recv_ret = channel->Connection()->Recv(channel->recv_buffer_.data() + channel->bytes_received_,
+                                                    channel->recv_buffer_.size() - channel->bytes_received_, n);
+  ADXL_CHK_BOOL_RET_STATUS(recv_ret == SUCCESS, FAILED, "recv once failed on channel:%s, hixl_status:%u",
+                           channel->GetChannelId().c_str(), static_cast<uint32_t>(recv_ret));
   if (n == 0) {
     LLMLOGI("Connection closed by peer, fd: %d, channel:%s.", fd, channel->GetChannelId().c_str());
     ResetRecvState(channel);
@@ -366,9 +430,9 @@ Status ChannelManager::HandleRequestDisconnectMessage(const ChannelPtr &channel,
   resp.can_disconnect = can_disconnect;
   if (can_disconnect && disconnect_callback_) {
     int32_t timeout_ms = static_cast<int32_t>(req_msg.timeout);
-    // Act on the receiving channel's own id instead of the peer-declared one, so a forged request can never
-    // disconnect another link even if the validation above is bypassed.
-    Status ret = disconnect_callback_(channel->GetChannelId(), timeout_ms);
+    // Act on the receiving channel itself instead of looking it up again while fd_mutex_ is held. This keeps the
+    // lock order one-way: owner map mutex_ may be followed by fd_mutex_, never the reverse.
+    Status ret = disconnect_callback_(channel, timeout_ms);
     if (ret == SUCCESS) {
       // The callback only enqueues the eviction, the actual disconnect happens asynchronously. Fall through to
       // reply error_code=0: the peer waits for a response on every request, silence would force it into a full
@@ -501,8 +565,8 @@ void ChannelManager::SendHeartbeats() {
     HeartbeatMsg msg{};
     msg.msg = 'H';
     LLMLOGI("Start to send heartbeat msg to:%s.", channel->GetChannelId().c_str());
-    auto ret = channel->SendHeartBeat([&msg](int32_t fd) {
-      return ControlMsgHandler::SendMsg(fd, ControlMsgType::kHeartBeat, msg, kSendMsgTimeout);
+    auto ret = channel->SendHeartBeat([&msg](const hixl::CtrlMsgPluginPtr &connection) {
+      return ControlMsgHandler::SendMsg(connection, ControlMsgType::kHeartBeat, msg, kSendMsgTimeout);
     });
     if (ret == kNoNeedRetry) {
       channel->StopHeartbeat();
@@ -569,7 +633,7 @@ void ChannelManager::DestroyChannels() {
   std::lock_guard<std::mutex> lock(mutex_);
   for (const auto &entry : channels_) {
     auto channel = entry.second;
-    (void)RemoveFd(channel->GetFd());
+    (void)RemoveFd(channel->Connection());
     (void)channel->Finalize();
     const bool is_client = (entry.first.first == ChannelType::kClient);
     StatisticManager::GetInstance().RemoveStatisticChannel(entry.first.second, is_client);
@@ -578,12 +642,16 @@ void ChannelManager::DestroyChannels() {
 }
 
 Status ChannelManager::DestroyChannel(ChannelType channel_type, const std::string &channel_id) {
-  auto ret = SUCCESS;
   std::lock_guard<std::mutex> lock(mutex_);
+  return DestroyChannelLocked(channel_type, channel_id);
+}
+
+Status ChannelManager::DestroyChannelLocked(ChannelType channel_type, const std::string &channel_id) {
+  auto ret = SUCCESS;
   const auto &it = channels_.find(std::make_pair(channel_type, channel_id));
   if (it != channels_.cend()) {
     auto channel = it->second;
-    (void)RemoveFd(channel->GetFd());
+    (void)RemoveFd(channel->Connection());
     auto channel_ret = channel->Finalize();
     ret = channel_ret != SUCCESS ? channel_ret : ret;
     channels_.erase(it);
@@ -595,16 +663,16 @@ Status ChannelManager::DestroyChannel(ChannelType channel_type, const std::strin
   return ret;
 }
 
-Status ChannelManager::RemoveFd(int32_t fd) {
+Status ChannelManager::RemoveFd(const hixl::CtrlMsgPluginPtr &connection) {
   auto ret = SUCCESS;
-  if (fd != -1) {
+  if (connection != nullptr) {
     std::lock_guard<std::mutex> fd_lock(fd_mutex_);
-    auto fd_it = fd_to_channel_map_.find(fd);
+    auto fd_it = fd_to_channel_map_.find(connection->Fd());
     if (fd_it != fd_to_channel_map_.end()) {
       fd_to_channel_map_.erase(fd_it);
-      auto epoll_ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+      auto epoll_ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, connection->Fd(), nullptr);
       if (epoll_ret == -1) {
-        LLMLOGW("Failed to remove fd %d from epoll: %s", fd, strerror(errno));
+        LLMLOGW("Failed to remove connection %s from epoll: %s", connection->Desc().c_str(), strerror(errno));
       }
     }
   }
@@ -627,8 +695,8 @@ void ChannelManager::ProcessAckMessages() {
     }
     NotifyAck notify_ack;
     notify_ack.req_id = ack_msg.req_id;
-    auto ret = ack_msg.channel->SendControlMsg([&notify_ack](int32_t fd) {
-      return ControlMsgHandler::SendMsg(fd, ControlMsgType::kNotifyAck, notify_ack, kSendMsgTimeout);
+    auto ret = ack_msg.channel->SendControlMsg([&notify_ack](const hixl::CtrlMsgPluginPtr &connection) {
+      return ControlMsgHandler::SendMsg(connection, ControlMsgType::kNotifyAck, notify_ack, kSendMsgTimeout);
     });
     if (ret != SUCCESS) {
       LLMLOGW("Failed to send notify ack, req_id: %lu", notify_ack.req_id);

@@ -20,6 +20,8 @@
 #include "cs/hixl_cs.h"
 #include "hixl/hixl_types.h"
 
+#include "common/ctrl_msg_plugin.h"
+
 namespace hixl {
 constexpr uint32_t kMagicNumber = 0xA4B3C2D1U;
 constexpr size_t kMaxNotifyNameLen = 1024;
@@ -114,7 +116,7 @@ struct NotifyMsg {
 };
 
 using CtrlMsgPtr = std::shared_ptr<CtrlMsg>;
-using MsgProcessor = std::function<Status(int32_t fd, const char *msg, uint64_t msg_len)>;
+using MsgProcessor = std::function<Status(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len)>;
 }  // namespace hixl
 
 namespace hixl {

@@ -35,6 +35,7 @@ file(GLOB LLM_V2_SRC_LIST
         "${HIXL_CODE_DIR}/src/hixl/engine/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/endpoint_generator/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/common/*.cc"
+        "${HIXL_CODE_DIR}/src/hixl/common/tls/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/cs/ubmem/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/cs/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/profiling/*.cc"
@@ -99,6 +100,8 @@ target_link_libraries(llm_datadist_test
         metadef_headers
         intf_pub
         json
+        ssl_static
+        crypto_static
         slog_stub
         mmpa_stub
         msprof_stub

@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include "common/hixl_inner_types.h"
+#include "common/ctrl_msg_plugin.h"
 #include "engine/client_handler.h"
 #include "hixl_options.h"
 
@@ -39,7 +40,7 @@ struct HandlerCreateArgs {
   GlobalResourceConfig global_config;
   bool is_lazy = false;
   uint32_t timeout_ms = 0;
-  int32_t ctrl_socket = -1;
+  CtrlMsgPluginPtr connection;
   std::string local_engine;
   std::string remote_engine;
 

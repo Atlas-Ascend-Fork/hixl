@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -21,34 +22,75 @@
 #include <netdb.h>
 #include <unistd.h>
 #include "hixl/hixl_types.h"
+#include "common/tls/tls_session.h"
+#include <mutex>
+#include <shared_mutex>
 
 namespace hixl {
 class CtrlMsgPlugin {
  public:
   CtrlMsgPlugin() = default;
-  ~CtrlMsgPlugin() = default;
-  static constexpr uint32_t kDefaultCtrlTimeoutMs = 1000U;
+  ~CtrlMsgPlugin();
+  CtrlMsgPlugin(const CtrlMsgPlugin &) = delete;
+  CtrlMsgPlugin &operator=(const CtrlMsgPlugin &) = delete;
+  CtrlMsgPlugin(CtrlMsgPlugin &&) = delete;
+  CtrlMsgPlugin &operator=(CtrlMsgPlugin &&) = delete;
 
-  static void Initialize();
-  static Status Connect(const std::string &ip, uint32_t port, int32_t &conn_fd, int32_t timeout);
-  // 第四参只表示超时。需要 errno 时放在 timeout_ms 之后。
-  // 删除第四参为 int32_t 左值的重载，避免超时被精确匹配成 err_no。
-  static Status Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms = kDefaultCtrlTimeoutMs);
-  static Status Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no);
-  static Status Send(int32_t fd, const void *buf, size_t len, int32_t &) = delete;
-  static Status Recv(int32_t fd, void *buf, size_t len, uint32_t timeout_ms);
-  static Status Listen(const std::string &ip, uint32_t listen_port, int32_t backlog, int32_t &listen_fd);
-  static Status AddFdToEpoll(int32_t &epoll_fd, int32_t fd, uint32_t events = EPOLLIN | EPOLLRDHUP);
-  static Status Accept(int32_t listen_fd, int32_t &conn_fd);
-  static Status SetTcpNoDelay(int32_t fd);
-  static Status SetTcpKeepAlive(int32_t fd);
-  static Status SetSendTimeout(int32_t fd, uint32_t timeout_ms);
+  Status Initialize();
+  Status Connect(const std::string &ip, uint32_t port, int32_t timeout);
+  Status Listen(const std::string &ip, uint32_t port, int32_t backlog);
+  Status Accept(std::shared_ptr<CtrlMsgPlugin> &connection);
+  Status HandshakeServer();
+  Status HandshakeServerStep(TlsHandshakeState &state);
+  static constexpr uint32_t kDefaultCtrlTimeoutMs = 1000U;
+  static constexpr int32_t kServerHandshakeTimeoutMs = 10000;
+  // The third argument is the timeout; errno follows timeout_ms when needed.
+  Status Send(const void *buf, size_t len, uint32_t timeout_ms = kDefaultCtrlTimeoutMs);
+  Status Send(const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no);
+  Status Send(const void *buf, size_t len, int32_t &) = delete;
+  // Receive exactly len bytes, or return an error/timeout. The third argument is an input timeout in milliseconds.
+  Status Recv(void *buf, size_t len, uint32_t timeout_ms);
+  // Attempt one receive. The third argument is an output byte count; inspect errno when n < 0.
+  Status Recv(void *buf, size_t len, ssize_t &n);
+  Status AddToEpoll(int32_t &epoll_fd, uint32_t events = EPOLLIN | EPOLLRDHUP);
+  Status SetTcpNoDelay();
+  Status SetTcpKeepAlive();
+  Status SetSendTimeout(uint32_t timeout_ms);
+  bool HasPending();
+  bool IsUsable() const;
+  // Abandon an incomplete TLS message and wake I/O; the connection owner still closes the descriptor.
+  Status InvalidateTlsSession();
+  // Wake in-flight I/O without closing or reusing the descriptor.
+  Status ShutdownSocket();
+  Status Close();
+  int32_t Fd() const;
+  // Return a snapshot; cached socket addresses remain available after Close().
+  std::string Desc() const;
 
  private:
-  static Status DoConnect(const struct ::addrinfo *addr, int32_t &conn_fd, int32_t &err_no, int32_t timeout);
-  static Status GetAiFamily(const std::string &ip, int32_t &ai_family);
-  static Status SockAddrInit(const std::string &ip, uint32_t listen_port, int32_t ai_family,
-                             struct sockaddr_storage &server_addr, socklen_t &addr_len);
+  Status Handshake(bool server, int32_t timeout_ms);
+  // Caller holds lifecycle_mutex_ throughout the check and subsequent I/O.
+  Status CheckReady(std::shared_ptr<TlsSession> &session) const;
+  Status ConnectSocket(const std::string &ip, uint32_t port, int32_t timeout);
+  Status ListenSocket(const std::string &ip, uint32_t port, int32_t backlog);
+  Status DoConnect(const struct ::addrinfo *addr, int32_t &conn_fd, int32_t &err_no, int32_t timeout);
+  Status GetAiFamily(const std::string &ip, int32_t &ai_family);
+  Status SockAddrInit(const std::string &ip, uint32_t port, int32_t family, struct sockaddr_storage &addr,
+                      socklen_t &len);
+  Status CloseLocked();
+  Status ShutdownSocketLocked() const;
+  // Caller holds lifecycle_mutex_, or owns an accepted connection that has not been published yet.
+  void UpdateSocketAddresses();
+
+  mutable std::shared_mutex lifecycle_mutex_;
+  std::mutex receive_mutex_;
+  int32_t fd_ = -1;
+  bool initialized_ = false;
+  bool tls_enabled_ = false;
+  std::shared_ptr<TlsSession> tls_session_;
+  std::string local_address_ = "unknown";
+  std::string peer_address_ = "unknown";
 };
+using CtrlMsgPluginPtr = std::shared_ptr<CtrlMsgPlugin>;
 }  // namespace hixl
 #endif  // CANN_HIXL_SRC_HIXL_COMMON_CTRL_MSG_PLUGIN_H_

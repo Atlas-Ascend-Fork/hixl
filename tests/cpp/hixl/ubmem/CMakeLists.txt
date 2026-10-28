@@ -83,6 +83,8 @@ target_link_libraries(ubmem_test
         metadef_headers
         intf_pub
         json
+        ssl_static
+        crypto_static
         slog_stub
         mmpa_stub
         msprof_stub

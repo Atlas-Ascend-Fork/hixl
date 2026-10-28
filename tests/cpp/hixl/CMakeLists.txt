@@ -14,6 +14,10 @@ set(HIXL_TEST_FILES
         common/thread_pool_ut.cc
         common/json_utils_ut.cc
         common/ctrl_msg_plugin_ut.cc
+        common/tls/tls_context_ut.cc
+        common/tls/tls_session_ut.cc
+        common/tls/tls_manager_ut.cc
+        common/tls/tls_cert_watcher_ut.cc
         proxy/hccp_proxy_ut.cc
         proxy/dcmi_proxy_ut.cc
         common/segment_ut.cc
@@ -24,6 +28,9 @@ set(HIXL_TEST_FILES
         cs/endpoint_store_ut.cc
         cs/endpoint_factory_ut.cc
         cs/test_hixl_cs_server.cc
+        cs/test_hixl_cs_server_tls.cc
+        cs/hixl_cs_server_handshake_ut.cc
+        cs/hixl_cs_cleanup_ut.cc
         cs/hixl_cs_client_ut.cc
         cs/hixl_mem_store_basic_ut.cc
         cs/hixl_mem_store_uboe_ut.cc
@@ -56,6 +63,7 @@ set(HIXL_TEST_FILES
 
 file(GLOB HIXL_SRC_LIST
         "${HIXL_CODE_DIR}/src/hixl/common/*.cc"
+        "${HIXL_CODE_DIR}/src/hixl/common/tls/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/cs/ubmem/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/endpoint_generator/*.cc"
@@ -198,6 +206,8 @@ target_link_libraries(hixl_test
         metadef_headers
         intf_pub
         json
+        ssl_static
+        crypto_static
         slog_stub
         mmpa_stub
         msprof_stub

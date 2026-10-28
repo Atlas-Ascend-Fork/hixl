@@ -56,12 +56,11 @@ void HixlTransferEngine::LLMDataDist2HixlOptions(
 }
 
 ge::Status HixlTransferEngine::InitMsgProcessor() {
-  hixl::CtrlMsgPlugin::Initialize();
-  hixl::CallbackProcessor callback = [this](int32_t fd, const char *msg, uint64_t msg_len,
-                                            bool &keep_fd) -> hixl::Status {
+  hixl::CallbackProcessor callback = [this](const hixl::CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len,
+                                            bool &keep_connection) -> hixl::Status {
     (void)msg;
     (void)msg_len;
-    keep_fd = false;
+    keep_connection = false;
     CacheTableInfo cache_table_info{};
     const auto &buffer_and_size = cache_manager_->GetCacheTableBufferAndSize();
     cache_table_info.cache_table_addr = PtrToValue(buffer_and_size.first);
@@ -70,11 +69,11 @@ ge::Status HixlTransferEngine::InitMsgProcessor() {
     header.magic = hixl::kMagicNumber;
     header.body_size = static_cast<uint64_t>(sizeof(hixl::CtrlMsgType) + sizeof(CacheTableInfo));
     hixl::CtrlMsgType msg_type = hixl::CtrlMsgType::kGetCacheTableResp;
-    HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))),
+    HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))),
                         "Failed to send cache table msg header");
-    HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))),
+    HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))),
                         "Failed to send cache table msg type");
-    HIXL_CHK_STATUS_RET(hixl::CtrlMsgPlugin::Send(fd, &cache_table_info, static_cast<uint64_t>(sizeof(CacheTableInfo))),
+    HIXL_CHK_STATUS_RET(connection->Send(&cache_table_info, static_cast<uint64_t>(sizeof(CacheTableInfo))),
                         "Failed to send cache table msg body");
     return hixl::SUCCESS;
   };

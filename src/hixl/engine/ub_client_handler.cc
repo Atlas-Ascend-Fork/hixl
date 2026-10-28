@@ -113,28 +113,30 @@ std::string BuildAvailableCommTypes(const std::map<CommType, std::vector<HixlCli
   return available_types.empty() ? "none" : available_types;
 }
 
-Status FetchRemoteMemInfo(int32_t sock, uint32_t timeout_ms, std::vector<MemInfo> &mem_info) {
+Status FetchRemoteMemInfo(const CtrlMsgPluginPtr &connection, uint32_t timeout_ms, std::vector<MemInfo> &mem_info) {
   CtrlMsgHeader header{};
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType));
   CtrlMsgType req_type = CtrlMsgType::kGetMemInfoReq;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(sock, &header, sizeof(header), timeout_ms),
-                      "[UbClientHandler] Failed to send mem info header, fd:%d", sock);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(sock, &req_type, sizeof(req_type), timeout_ms),
-                      "[UbClientHandler] Failed to send GetMemInfoReq, fd:%d", sock);
+  HIXL_CHK_STATUS_RET(connection->Send(&header, sizeof(header), timeout_ms),
+                      "[UbClientHandler] Failed to send mem info header, connection:%s", connection->Desc().c_str());
+  HIXL_CHK_STATUS_RET(connection->Send(&req_type, sizeof(req_type), timeout_ms),
+                      "[UbClientHandler] Failed to send GetMemInfoReq, connection:%s", connection->Desc().c_str());
 
   CtrlMsgHeader resp_header{};
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Recv(sock, &resp_header, sizeof(resp_header), timeout_ms),
-                      "[UbClientHandler] Failed to recv mem info header, fd:%d", sock);
+  HIXL_CHK_STATUS_RET(connection->Recv(&resp_header, sizeof(resp_header), timeout_ms),
+                      "[UbClientHandler] Failed to recv mem info header, connection:%s", connection->Desc().c_str());
   HIXL_CHK_BOOL_RET_STATUS(resp_header.magic == kMagicNumber, PARAM_INVALID,
-                           "[UbClientHandler] Invalid magic in mem info resp, fd:%d: 0x%X", sock, resp_header.magic);
+                           "[UbClientHandler] Invalid magic in mem info resp, connection:%s: 0x%X",
+                           connection->Desc().c_str(), resp_header.magic);
   HIXL_CHK_BOOL_RET_STATUS(
       resp_header.body_size > sizeof(CtrlMsgType) && resp_header.body_size <= kMaxRecvMemInfoBodySize, PARAM_INVALID,
-      "[UbClientHandler] Invalid body_size=%" PRIu64 " in mem info resp, fd:%d", resp_header.body_size, sock);
+      "[UbClientHandler] Invalid body_size=%" PRIu64 " in mem info resp, connection:%s", resp_header.body_size,
+      connection->Desc().c_str());
 
   std::vector<uint8_t> body(resp_header.body_size);
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Recv(sock, body.data(), resp_header.body_size, timeout_ms),
-                      "[UbClientHandler] Failed to recv mem info body, fd:%d", sock);
+  HIXL_CHK_STATUS_RET(connection->Recv(body.data(), resp_header.body_size, timeout_ms),
+                      "[UbClientHandler] Failed to recv mem info body, connection:%s", connection->Desc().c_str());
 
   CtrlMsgType resp_type{};
   errno_t rc = memcpy_s(&resp_type, sizeof(resp_type), body.data(), sizeof(resp_type));
@@ -166,7 +168,7 @@ Status UbClientHandler::InitRemoteState(const HandlerCreateArgs &args) {
     connect_timeout_ms_ = args.timeout_ms;
   }
   std::vector<MemInfo> remote_mem_info;
-  HIXL_CHK_STATUS_RET(FetchRemoteMemInfo(args.ctrl_socket, args.timeout_ms, remote_mem_info),
+  HIXL_CHK_STATUS_RET(FetchRemoteMemInfo(args.connection, args.timeout_ms, remote_mem_info),
                       "Failed to fetch remote mem info");
   // BuildRemoteSegmentsFromMemInfo 内部自持 remote_seg_mutex_，外层勿重复加锁
   return BuildRemoteSegmentsFromMemInfo(remote_mem_info);

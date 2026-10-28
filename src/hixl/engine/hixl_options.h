@@ -21,6 +21,7 @@
 #include "hixl/hixl_types.h"
 #include "adxl/adxl_types.h"
 #include "common/hixl_inner_types.h"
+#include "common/tls/tls_config.h"
 #include "common/transfer_config.h"
 #include "cs/ubmem/ubmem_types.h"
 
@@ -73,6 +74,7 @@ struct GlobalResourceConfig {
   ConnectPoolConfig connect_pool;
   CommResourceConfigDesc comm_resource_config;
   TransferConfig transfer_config;
+  TlsConfig tls_config;
   std::optional<std::string> local_comm_res_path;  // local_comm_res JSON file path
   std::optional<std::string> topo_file_path;       // hardware topo JSON path for auto-gen
 };

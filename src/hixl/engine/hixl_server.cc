@@ -109,7 +109,7 @@ void RollbackNotify(std::vector<NotifyDesc> &queue, std::mutex &mutex, uint64_t 
   queue.pop_back();
 }
 
-Status SendNotifyAck(int32_t fd, Status result) {
+Status SendNotifyAck(const CtrlMsgPluginPtr &connection, Status result) {
   std::string ack_str;
   try {
     ack_str = SerializeNotifyAck(result);
@@ -121,9 +121,9 @@ Status SendNotifyAck(int32_t fd, Status result) {
   header.magic = kMagicNumber;
   header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + ack_str.size());
   CtrlMsgType msg_type = CtrlMsgType::kNotifyAck;
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-  HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, ack_str.c_str(), static_cast<uint64_t>(ack_str.size())));
+  HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+  HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+  HIXL_CHK_STATUS_RET(connection->Send(ack_str.c_str(), static_cast<uint64_t>(ack_str.size())));
   return SUCCESS;
 }
 }  // namespace
@@ -258,9 +258,11 @@ Status HixlServer::Finalize() {
 }
 
 Status HixlServer::RegisterCallbackProcessor(int32_t msg_type, CallbackProcessor processor) const {
-  MsgProcessor callback = [this, processor, msg_type](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-    bool keep_fd = false;
-    HIXL_CHK_STATUS_RET(processor(fd, msg, msg_len, keep_fd), "Failed to process msg, type:%d", msg_type);
+  MsgProcessor callback = [this, processor, msg_type](const CtrlMsgPluginPtr &connection, const char *msg,
+                                                      uint64_t msg_len) -> Status {
+    bool keep_connection = false;
+    HIXL_CHK_STATUS_RET(processor(connection, msg, msg_len, keep_connection), "Failed to process msg, type:%d",
+                        msg_type);
     return SUCCESS;
   };
   HIXL_CHK_STATUS_RET(HixlCSServerRegProc(server_handle_, static_cast<CtrlMsgType>(msg_type), callback),
@@ -276,15 +278,16 @@ Status HixlServer::GetNotifies(std::vector<NotifyDesc> &notifies) {
 }
 
 Status HixlServer::RegisterNotifyHandlers() {
-  MsgProcessor notify_processor = [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-    return ProcessNotifyMsg(fd, msg, msg_len);
+  MsgProcessor notify_processor = [this](const CtrlMsgPluginPtr &connection, const char *msg,
+                                         uint64_t msg_len) -> Status {
+    return ProcessNotifyMsg(connection, msg, msg_len);
   };
   HIXL_CHK_STATUS_RET(HixlCSServerRegProc(server_handle_, CtrlMsgType::kNotify, notify_processor),
                       "Failed to register kNotify processor.");
   return SUCCESS;
 }
 
-Status HixlServer::ProcessNotifyMsg(int32_t fd, const char *msg, uint64_t msg_len) {
+Status HixlServer::ProcessNotifyMsg(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) {
   NotifyMsg notify_msg{};
   try {
     notify_msg = ParseNotifyMsg(msg, msg_len);
@@ -294,7 +297,7 @@ Status HixlServer::ProcessNotifyMsg(int32_t fd, const char *msg, uint64_t msg_le
   }
   NotifyEnqueueRecord record;
   const Status result = EnqueueNotify(notify_messages_, notify_mutex_, notify_enqueue_seq_, notify_msg, record);
-  const Status send_ret = SendNotifyAck(fd, result);
+  const Status send_ret = SendNotifyAck(connection, result);
   if (send_ret != SUCCESS) {
     RollbackNotify(notify_messages_, notify_mutex_, notify_enqueue_seq_, record);
     return send_ret;
@@ -325,7 +328,8 @@ std::vector<MemInfo> HixlServer::GetRegisteredMemInfo() const {
 }
 
 Status HixlServer::RegisterProcessors() {
-  MsgProcessor send_endpoint_cb = [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
+  MsgProcessor send_endpoint_cb = [this](const CtrlMsgPluginPtr &connection, const char *msg,
+                                         uint64_t msg_len) -> Status {
     (void)msg;
     (void)msg_len;
     std::string msg_str;
@@ -335,15 +339,16 @@ Status HixlServer::RegisterProcessors() {
     header.magic = kMagicNumber;
     header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + msg_str.size());
     CtrlMsgType msg_type = CtrlMsgType::kGetEndpointInfoResp;
-    HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))));
-    HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-    HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, msg_str.c_str(), static_cast<uint64_t>(msg_str.size())));
+    HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+    HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+    HIXL_CHK_STATUS_RET(connection->Send(msg_str.c_str(), static_cast<uint64_t>(msg_str.size())));
     return SUCCESS;
   };
   HIXL_CHK_STATUS_RET(HixlCSServerRegProc(server_handle_, CtrlMsgType::kGetEndpointInfoReq, send_endpoint_cb),
                       "Failed to register send endpoint info processor.");
 
-  MsgProcessor send_mem_info_cb = [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
+  MsgProcessor send_mem_info_cb = [this](const CtrlMsgPluginPtr &connection, const char *msg,
+                                         uint64_t msg_len) -> Status {
     (void)msg;
     (void)msg_len;
     std::vector<MemInfo> mem_info = GetRegisteredMemInfo();
@@ -353,15 +358,15 @@ Status HixlServer::RegisterProcessors() {
     header.magic = kMagicNumber;
     header.body_size = static_cast<uint64_t>(sizeof(CtrlMsgType) + msg_str.size());
     CtrlMsgType msg_type = CtrlMsgType::kGetMemInfoResp;
-    HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &header, static_cast<uint64_t>(sizeof(header))));
-    HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, &msg_type, static_cast<uint64_t>(sizeof(msg_type))));
-    HIXL_CHK_STATUS_RET(CtrlMsgPlugin::Send(fd, msg_str.c_str(), static_cast<uint64_t>(msg_str.size())));
+    HIXL_CHK_STATUS_RET(connection->Send(&header, static_cast<uint64_t>(sizeof(header))));
+    HIXL_CHK_STATUS_RET(connection->Send(&msg_type, static_cast<uint64_t>(sizeof(msg_type))));
+    HIXL_CHK_STATUS_RET(connection->Send(msg_str.c_str(), static_cast<uint64_t>(msg_str.size())));
     return SUCCESS;
   };
   HIXL_CHK_STATUS_RET(HixlCSServerRegProc(server_handle_, CtrlMsgType::kGetMemInfoReq, send_mem_info_cb),
                       "Failed to register send mem info processor.");
-  MsgProcessor heartbeat_cb = [](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
-    (void)fd;
+  MsgProcessor heartbeat_cb = [](const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len) -> Status {
+    (void)connection;
     (void)msg;
     (void)msg_len;
     return SUCCESS;

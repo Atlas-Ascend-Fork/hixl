@@ -23,6 +23,9 @@
 #include <unistd.h>
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+
+#include "depends/ctrl_msg_test_helper.h"
+
 #include "cs/hixl_cs.h"
 #include "cs/hixl_cs_client.h"
 #include "engine/endpoint_test_utils.h"
@@ -145,10 +148,11 @@ class MockHixlServer {
   }
 
   void ListenServer() {
-    MsgProcessor send_endpoint_cb = [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
+    MsgProcessor send_endpoint_cb = [this](const CtrlMsgPluginPtr &connection, const char *msg,
+                                           uint64_t msg_len) -> Status {
       (void)msg;
       (void)msg_len;
-      conn_fd_ = fd;
+      connection_ = connection;
       SendResponse();
       return SUCCESS;
     };
@@ -158,10 +162,11 @@ class MockHixlServer {
       return;
     }
 
-    MsgProcessor send_mem_info_cb = [this](int32_t fd, const char *msg, uint64_t msg_len) -> Status {
+    MsgProcessor send_mem_info_cb = [this](const CtrlMsgPluginPtr &connection, const char *msg,
+                                           uint64_t msg_len) -> Status {
       (void)msg;
       (void)msg_len;
-      conn_fd_ = fd;
+      connection_ = connection;
       SendMemInfoResponse();
       return SUCCESS;
     };
@@ -207,7 +212,7 @@ class MockHixlServer {
   HixlServerHandle server_handle_ = nullptr;
   std::vector<MemHandle> mem_handles_{};
   std::vector<MemInfo> registered_mem_{};
-  int32_t conn_fd_ = -1;
+  CtrlMsgPluginPtr connection_;
   MockHixlServerMode mode_;
 
   // JSON字符串常量
@@ -228,12 +233,12 @@ class MockHixlServer {
     CtrlMsgHeader header{};
     header.magic = magic;
     header.body_size = body_size;
-    CtrlMsgPlugin::Send(conn_fd_, &header, sizeof(header));
+    test::Connection(connection_)->Send(&header, sizeof(header));
 
     // 发送消息体
-    CtrlMsgPlugin::Send(conn_fd_, &msg_type, sizeof(msg_type));
+    test::Connection(connection_)->Send(&msg_type, sizeof(msg_type));
     if (!json_content.empty()) {
-      CtrlMsgPlugin::Send(conn_fd_, json_content.data(), json_content.size());
+      test::Connection(connection_)->Send(json_content.data(), json_content.size());
     }
   }
 
@@ -377,9 +382,10 @@ const std::string MockHixlServer::kMissingFieldJson = R"([
 // Use common KernelJsonMmpaStub from test_mmpa_utils.h
 using ClientMmpaStub = hixl::test::KernelJsonMmpaStub;
 
-class HixlClientUTest : public ::testing::Test {
+class HixlClientUTest : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     // TransferPool initialization loads device kernels, so MmpaStub must be ready before Create.
     hixl_test::InstallSysApiHooks(std::make_shared<ClientMmpaStub>());
     ClientConfig config{};
@@ -806,7 +812,7 @@ TEST_F(HixlClientUTest, Initialize4UBTest) {
   local_endpoint_list.push_back(MakeUbDeviceLocalEp4());
   Status st = client_->Initialize(local_endpoint_list, kDefaultTimeoutMs);
   EXPECT_EQ(st, SUCCESS);
-  EXPECT_GE(client_->ctrl_socket_, 0);
+  EXPECT_NE(client_->connection_, nullptr);
   EXPECT_EQ(client_->Finalize(), SUCCESS);
 }
 
@@ -826,16 +832,16 @@ TEST_F(HixlClientUTest, InitializeKeepsControlSocket) {
   Status st = client.Initialize(local_endpoint_list, kDefaultTimeoutMs);
 
   EXPECT_EQ(st, SUCCESS);
-  EXPECT_GE(client.ctrl_socket_, 0);
+  EXPECT_NE(client.connection_, nullptr);
   EXPECT_EQ(client.Finalize(), SUCCESS);
 }
 
-// Initialize 失败（对端无监听）时 ctrl_socket_ 必须被置为 -1，Finalize 不得误关复用该 fd 号的无关资源
+// Initialize 失败（对端无监听）时 connection_ 必须被置为 nullptr，Finalize 不得误关复用该 fd 号的无关资源
 TEST_F(HixlClientUTest, InitializeConnectFailClearsCtrlSocket) {
   std::vector<EndpointConfig> local_endpoint_list(1);
   const Status ret = client_->Initialize(local_endpoint_list, kDefaultTimeoutMs);
   EXPECT_NE(ret, SUCCESS);
-  EXPECT_EQ(client_->ctrl_socket_, -1);
+  EXPECT_EQ(client_->connection_, nullptr);
 
   const int reused_fd = ::socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(reused_fd, 0);
@@ -847,7 +853,7 @@ TEST_F(HixlClientUTest, InitializeConnectFailClearsCtrlSocket) {
 // CtrlMsgPlugin::Connect 失败时输出 fd 必须被清理为 -1
 TEST_F(HixlClientUTest, CtrlMsgPluginConnectClearsFdOnFailure) {
   int32_t client_fd = -1;
-  const Status ret = CtrlMsgPlugin::Connect("127.0.0.1", kServerPort, client_fd, kDefaultTimeoutMs);
+  const Status ret = test::Connect("127.0.0.1", kServerPort, client_fd, kDefaultTimeoutMs);
   EXPECT_NE(ret, SUCCESS);
   EXPECT_EQ(client_fd, -1);
 }
@@ -2303,7 +2309,7 @@ TEST_F(HixlClientUTest, CheckAliveWritesControlSocket) {
   HixlClient client("127.0.0.1", kServerPort, config);
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-  client.ctrl_socket_ = fds[0];
+  client.connection_ = CtrlMsgPluginTestAccess::Own(fds[0]);
 
   Status ret = client.CheckAlive();
   EXPECT_EQ(ret, SUCCESS);
@@ -2321,18 +2327,17 @@ TEST_F(HixlClientUTest, CheckAliveWritesControlSocket) {
 }
 
 TEST_F(HixlClientUTest, CheckAliveBrokenPipeReturnsFailed) {
-  CtrlMsgPlugin::Initialize();
   ClientConfig config{};
   config.remote_engine = "127.0.0.1:16001";
   HixlClient client("127.0.0.1", kServerPort, config);
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-  client.ctrl_socket_ = fds[0];
+  client.connection_ = CtrlMsgPluginTestAccess::Own(fds[0]);
   close(fds[1]);
 
   Status ret = client.CheckAlive();
   EXPECT_EQ(ret, FAILED);
-  EXPECT_EQ(client.ctrl_socket_, -1);
+  EXPECT_EQ(client.connection_, nullptr);
 }
 
 TEST_F(HixlClientUTest, CheckAliveNonDisconnectedSendFailureKeepsClient) {
@@ -2341,11 +2346,11 @@ TEST_F(HixlClientUTest, CheckAliveNonDisconnectedSendFailureKeepsClient) {
   HixlClient client("127.0.0.1", kServerPort, config);
   int32_t timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
   ASSERT_GE(timer_fd, 0);
-  client.ctrl_socket_ = timer_fd;
+  client.connection_ = CtrlMsgPluginTestAccess::Own(timer_fd);
 
   Status ret = client.CheckAlive();
   EXPECT_EQ(ret, SUCCESS);
-  EXPECT_EQ(client.ctrl_socket_, timer_fd);
+  EXPECT_EQ(client.connection_->Fd(), timer_fd);
 
   EXPECT_EQ(client.Finalize(), SUCCESS);
 }
@@ -2381,11 +2386,12 @@ TEST_F(HixlClientUTest, RecvNotifyAckValidatesResultField) {
     header.magic = kMagicNumber;
     header.body_size = sizeof(CtrlMsgType) + json.size();
     CtrlMsgType msg_type = CtrlMsgType::kNotifyAck;
-    ASSERT_EQ(CtrlMsgPlugin::Send(fds[1], &header, sizeof(header)), SUCCESS) << test_case.name;
-    ASSERT_EQ(CtrlMsgPlugin::Send(fds[1], &msg_type, sizeof(msg_type)), SUCCESS) << test_case.name;
-    ASSERT_EQ(CtrlMsgPlugin::Send(fds[1], json.data(), json.size()), SUCCESS) << test_case.name;
+    ASSERT_EQ(test::Connection(fds[1])->Send(&header, sizeof(header)), SUCCESS) << test_case.name;
+    ASSERT_EQ(test::Connection(fds[1])->Send(&msg_type, sizeof(msg_type)), SUCCESS) << test_case.name;
+    ASSERT_EQ(test::Connection(fds[1])->Send(json.data(), json.size()), SUCCESS) << test_case.name;
 
-    EXPECT_EQ(client_->RecvNotifyAck(fds[0], kDefaultTimeoutMs), test_case.expected) << test_case.name;
+    EXPECT_EQ(client_->RecvNotifyAck(test::Connection(fds[0]), kDefaultTimeoutMs), test_case.expected)
+        << test_case.name;
     close(fds[0]);
     close(fds[1]);
   }
@@ -2451,11 +2457,10 @@ static bool ReadHeartbeatFromPeer(int32_t fd) {
 static void ConfigureFailClient(HixlClient &client, int32_t ctrl_fd) {
   client.client_handler_ = MakeUnique<FailClientHandler>();
   client.is_connected_ = true;
-  client.ctrl_socket_ = ctrl_fd;
+  client.connection_ = CtrlMsgPluginTestAccess::Own(ctrl_fd);
 }
 
 TEST_F(HixlClientUTest, ConnectFailureChecksLinkAlive) {
-  CtrlMsgPlugin::Initialize();
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ClientConfig config{};
@@ -2465,14 +2470,13 @@ TEST_F(HixlClientUTest, ConnectFailureChecksLinkAlive) {
 
   EXPECT_NE(client.Connect(kDefaultTimeoutMs), SUCCESS);
   EXPECT_TRUE(ReadHeartbeatFromPeer(fds[1]));
-  EXPECT_GE(client.ctrl_socket_, 0);
+  EXPECT_NE(client.connection_, nullptr);
 
   EXPECT_EQ(client.Finalize(), SUCCESS);
   close(fds[1]);
 }
 
 TEST_F(HixlClientUTest, TransferSyncFailureChecksLinkAlive) {
-  CtrlMsgPlugin::Initialize();
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ClientConfig config{};
@@ -2486,7 +2490,7 @@ TEST_F(HixlClientUTest, TransferSyncFailureChecksLinkAlive) {
 
   EXPECT_NE(client.TransferSync({desc}, READ, kDefaultTimeoutMs), SUCCESS);
   EXPECT_TRUE(ReadHeartbeatFromPeer(fds[1]));
-  EXPECT_GE(client.ctrl_socket_, 0);
+  EXPECT_NE(client.connection_, nullptr);
 
   EXPECT_EQ(client.Finalize(), SUCCESS);
   close(fds[1]);
@@ -2494,7 +2498,6 @@ TEST_F(HixlClientUTest, TransferSyncFailureChecksLinkAlive) {
 
 TEST_F(HixlClientUTest, TransferAsyncFailureChecksLinkAlive) {
   llm::AclProfStampEnabled acl_prof_stamp;
-  CtrlMsgPlugin::Initialize();
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ClientConfig config{};
@@ -2513,7 +2516,7 @@ TEST_F(HixlClientUTest, TransferAsyncFailureChecksLinkAlive) {
   EXPECT_EQ(llm::GetAclProfStampCreateCount(), create_count + 1U);
   EXPECT_EQ(llm::GetAclProfStampDestroyCount(), destroy_count + 1U);
   EXPECT_TRUE(ReadHeartbeatFromPeer(fds[1]));
-  EXPECT_GE(client.ctrl_socket_, 0);
+  EXPECT_NE(client.connection_, nullptr);
 
   EXPECT_EQ(client.Finalize(), SUCCESS);
   close(fds[1]);
@@ -2526,7 +2529,6 @@ TEST_F(HixlClientUTest, ConnectFailureDeadLinkLogsErrorAndClosesCtrlSocket) {
   log_capture->SetLevelInfo();
   llm::SlogStub::SetInstance(log_capture);
 
-  CtrlMsgPlugin::Initialize();
   int32_t fds[2] = {-1, -1};
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ClientConfig config{};
@@ -2536,7 +2538,7 @@ TEST_F(HixlClientUTest, ConnectFailureDeadLinkLogsErrorAndClosesCtrlSocket) {
   close(fds[1]);
 
   EXPECT_NE(client.Connect(kDefaultTimeoutMs), SUCCESS);
-  EXPECT_EQ(client.ctrl_socket_, -1);
+  EXPECT_EQ(client.connection_, nullptr);
   EXPECT_TRUE(log_capture->WaitForAllPatternsCaptured(kCaptureLogTimeoutMs));
   EXPECT_TRUE(log_capture->IsPatternCaptured(pattern));
   llm::SlogStub::SetInstance(nullptr);

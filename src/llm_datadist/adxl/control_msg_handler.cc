@@ -10,36 +10,15 @@
 
 #include "control_msg_handler.h"
 
-#include <poll.h>
+#include <cerrno>
+#include <algorithm>
+#include <limits>
+#include "common/ctrl_msg_plugin.h"
+#include "common/scope_guard.h"
 
 namespace adxl {
 namespace {
-constexpr int64_t kMicrosPerMillis = 1000;
-
-Status PollForWriteReady(int32_t fd, int64_t remaining_us) {
-  if (remaining_us <= 0) {
-    return TIMEOUT;
-  }
-  struct pollfd pfd = {};
-  pfd.fd = fd;
-  pfd.events = POLLOUT;
-  const int poll_timeout_ms = static_cast<int>(remaining_us / kMicrosPerMillis);
-  const int poll_ret = poll(&pfd, 1, poll_timeout_ms);
-  if (poll_ret == 0) {
-    return TIMEOUT;
-  }
-  if (poll_ret < 0) {
-    const int32_t poll_errno = errno;
-    if (poll_errno == EINTR) {
-      return SUCCESS;
-    }
-    ADXL_CHK_BOOL_RET_STATUS(poll_ret >= 0, FAILED, "Call api:poll failed, ret:%d, fd:%d, errno:%d, error_msg:%s",
-                             poll_ret, fd, poll_errno, strerror(poll_errno));
-  }
-  return SUCCESS;
-}
-}  // namespace
-namespace {
+constexpr uint64_t kMicrosPerMillis = 1000U;
 Status kNoNeedRetry = 1U;
 }  // namespace
 
@@ -68,50 +47,46 @@ std::string TransferTypeToString(TransferType type) {
   }
 }
 
-Status ControlMsgHandler::SendMsgByProtocol(int32_t fd, ControlMsgType msg_type, const std::string &msg_str,
-                                            uint64_t timeout) {
+Status ControlMsgHandler::SendMsgByProtocol(const hixl::CtrlMsgPluginPtr &connection, ControlMsgType msg_type,
+                                            const std::string &msg_str, uint64_t timeout) {
   auto start = std::chrono::steady_clock::now();
   auto body_size = msg_str.size() + sizeof(msg_type);
   ProtocolHeader protocol_header{kMagicNumber, body_size};
-  ADXL_CHK_STATUS_RET(Write(fd, &protocol_header, sizeof(protocol_header), timeout, start), "Failed to write msg");
-  ADXL_CHK_STATUS_RET(Write(fd, &msg_type, sizeof(ControlMsgType), timeout, start), "Failed to write msg");
-  ADXL_CHK_STATUS_RET(Write(fd, msg_str.c_str(), msg_str.size(), timeout, start), "Failed to write msg");
+  ADXL_CHK_STATUS_RET(Write(connection, &protocol_header, sizeof(protocol_header), timeout, start),
+                      "Failed to write msg");
+  HIXL_DISMISSABLE_GUARD(incomplete_message, ([&]() {
+                           ADXL_CHK_STATUS(connection->InvalidateTlsSession(), "Failed to invalidate TLS message");
+                         }));
+  ADXL_CHK_STATUS_RET(Write(connection, &msg_type, sizeof(ControlMsgType), timeout, start), "Failed to write msg");
+  ADXL_CHK_STATUS_RET(Write(connection, msg_str.c_str(), msg_str.size(), timeout, start), "Failed to write msg");
+  HIXL_DISMISS_GUARD(incomplete_message);
   return SUCCESS;
 }
 
-Status ControlMsgHandler::Write(int32_t fd, const void *buf, size_t len, uint64_t timeout,
+Status ControlMsgHandler::Write(const hixl::CtrlMsgPluginPtr &connection, const void *buf, size_t len, uint64_t timeout,
                                 std::chrono::steady_clock::time_point &start) {
-  const char *pos = static_cast<const char *>(buf);
-  size_t nbytes = len;
-  while (nbytes > 0U) {
-    const int64_t time_cost =
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
-    ADXL_CHK_BOOL_RET_STATUS(time_cost < static_cast<int64_t>(timeout), TIMEOUT, "Transfer timeout.");
-
-    auto rc = write(fd, pos, nbytes);
-    if (rc < 0 && errno == EINTR) {
-      continue;
-    }
-    if (rc < 0 && errno == EAGAIN) {
-      const int64_t remaining_us = static_cast<int64_t>(timeout) - time_cost;
-      ADXL_CHK_STATUS_RET(PollForWriteReady(fd, remaining_us), "Socket poll failed");
-      continue;
-    }
-    if (rc < 0) {
-      Status ret = FAILED;
-      if (errno == EPIPE || errno == EBADF) {
-        ret = kNoNeedRetry;
-      }
-      LLMLOGE(FAILED, "Socket write failed, error msg:%s, errno:%d", strerror(errno), errno);
-      return ret;
-    }
-    if (rc == 0) {
-      LLMLOGW("Socket write incomplete: expected %zu bytes, actual %zu bytes", len, len - nbytes);
-      return FAILED;
-    }
-    pos += rc;
-    nbytes -= rc;
+  if (len == 0U) {
+    return SUCCESS;
   }
-  return SUCCESS;
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+  ADXL_CHK_BOOL_RET_STATUS(static_cast<uint64_t>(elapsed) < timeout, TIMEOUT,
+                           "Control message send timed out, elapsed:%ld us, timeout:%lu us", elapsed, timeout);
+  // Round up to the Send API's millisecond resolution while the shared message budget is still positive.
+  const uint64_t remaining_us = timeout - static_cast<uint64_t>(elapsed);
+  const uint64_t remaining_ms = (remaining_us - 1U) / kMicrosPerMillis + 1U;
+  const auto timeout_ms = static_cast<uint32_t>(std::min<uint64_t>(remaining_ms, std::numeric_limits<uint32_t>::max()));
+  int32_t err_no = 0;
+  const auto status = connection->Send(buf, len, timeout_ms, err_no);
+  if (status == hixl::SUCCESS) {
+    return SUCCESS;
+  }
+  LLMLOGE(FAILED,
+          "Call api:CtrlMsgPlugin::Send failed, connection:%s, hixl_status:%u, size:%zu bytes, timeout:%u ms, errno:%d",
+          connection->Desc().c_str(), static_cast<uint32_t>(status), len, timeout_ms, err_no);
+  if (err_no == EPIPE || err_no == EBADF) {
+    return kNoNeedRetry;
+  }
+  return status == hixl::TIMEOUT ? TIMEOUT : FAILED;
 }
 }  // namespace adxl

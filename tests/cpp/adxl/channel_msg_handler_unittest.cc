@@ -9,22 +9,28 @@
  */
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <array>
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "nlohmann/json.hpp"
+
+#include "depends/ctrl_msg_test_helper.h"
 
 #define private public
 #include "adxl/channel_msg_handler.h"
 #undef private
 
 #include "common/msg_handler_plugin.h"
+#include "common/scope_guard.h"
+#include "adxl/statistic_manager.h"
 
 namespace adxl {
 namespace {
@@ -48,9 +54,10 @@ std::string BuildDisconnectJson() {
 }
 }  // namespace
 
-class ChannelMsgHandlerUnitTest : public ::testing::Test {
+class ChannelMsgHandlerUnitTest : public hixl::test::PlainTlsTest {
  protected:
   void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets_.data()), 0);
     handler_ = std::make_unique<ChannelMsgHandler>(kListenInfo, &channel_manager_);
   }
@@ -78,12 +85,25 @@ class ChannelMsgHandlerUnitTest : public ::testing::Test {
     return std::thread([this, response_json]() {
       int32_t msg_type = 0;
       std::vector<char> msg;
-      EXPECT_EQ(llm::MsgHandlerPlugin::RecvMsg(sockets_[1], msg_type, msg), SUCCESS);
+      EXPECT_EQ(llm::MsgHandlerPlugin::RecvMsg(hixl::test::Connection(sockets_[1]), msg_type, msg, kTimeoutMs),
+                SUCCESS);
       EXPECT_EQ(msg_type, static_cast<int32_t>(ChannelMsgType::kConnect));
-      EXPECT_EQ(llm::MsgHandlerPlugin::SendMsg(sockets_[1], static_cast<int32_t>(ChannelMsgType::kConnect),
-                                               response_json.dump()),
+      EXPECT_EQ(llm::MsgHandlerPlugin::SendMsg(hixl::test::Connection(sockets_[1]),
+                                               static_cast<int32_t>(ChannelMsgType::kConnect), response_json.dump()),
                 SUCCESS);
     });
+  }
+
+  void BindUnavailablePeer(int &fd, std::string &remote_engine) const {
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)), 0);
+    socklen_t size = sizeof(address);
+    ASSERT_EQ(getsockname(fd, reinterpret_cast<sockaddr *>(&address), &size), 0);
+    remote_engine = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
   }
 
   std::array<int32_t, 2> sockets_{{-1, -1}};
@@ -91,11 +111,178 @@ class ChannelMsgHandlerUnitTest : public ::testing::Test {
   std::unique_ptr<ChannelMsgHandler> handler_;
 };
 
+TEST_F(ChannelMsgHandlerUnitTest, DisconnectCallbackUsesReceivingChannelWithoutLookup) {
+  ASSERT_EQ(handler_->SetupChannelManagerCallbacks(), SUCCESS);
+
+  ChannelInfo channel_info{};
+  channel_info.channel_type = ChannelType::kClient;
+  channel_info.channel_id = kRemoteEngine;
+  auto channel = std::make_shared<CommChannel>(channel_info);
+
+  RequestDisconnectMsg req_msg{};
+  req_msg.channel_id = kRemoteEngine;
+  req_msg.req_id = 1U;
+  req_msg.timeout = kTimeoutMs;
+  std::string msg_str;
+  ASSERT_EQ(ControlMsgHandler::Serialize(req_msg, msg_str), SUCCESS);
+
+  EXPECT_EQ(channel_manager_.HandleRequestDisconnectMessage(channel, msg_str), SUCCESS);
+  EXPECT_TRUE(channel->IsDisconnecting());
+  EXPECT_EQ(handler_->evict_queue_.size(), 1U);
+
+  channel_info.channel_type = ChannelType::kServer;
+  auto server_channel = std::make_shared<CommChannel>(channel_info);
+  EXPECT_EQ(channel_manager_.HandleRequestDisconnectMessage(server_channel, msg_str), SUCCESS);
+  EXPECT_FALSE(server_channel->IsDisconnecting());
+  EXPECT_EQ(handler_->evict_queue_.size(), 1U);
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, EvictionLoopProcessesPendingBatch) {
+  ChannelInfo channel_info{};
+  channel_info.channel_type = ChannelType::kClient;
+  channel_info.channel_id = kRemoteEngine;
+  auto channel = std::make_shared<CommChannel>(channel_info);
+  channel->IncrementTransferCount();
+  channel->SetDisconnecting(true);
+  channel_manager_.channels_[{ChannelType::kClient, kRemoteEngine}] = channel;
+
+  handler_->stop_eviction_.store(false);
+  handler_->evict_queue_.push(EvictItem{kRemoteEngine, ChannelType::kClient, kTimeoutMs});
+  std::thread eviction_thread([this]() { handler_->EvictionLoop(); });
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (channel->IsDisconnecting() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_FALSE(channel->IsDisconnecting());
+
+  handler_->stop_eviction_.store(true);
+  handler_->evict_cv_.notify_all();
+  eviction_thread.join();
+  channel_manager_.channels_.clear();
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, ConnectToPeerFailureClearsPreviousConnection) {
+  int fd = -1;
+  HIXL_MAKE_GUARD(close_fd, ([&fd]() { (void)close(fd); }));
+  std::string remote_engine;
+  ASSERT_NO_FATAL_FAILURE(BindUnavailablePeer(fd, remote_engine));
+  auto connection = hixl::test::Connection(sockets_[0]);
+  ASSERT_NE(connection, nullptr);
+  EXPECT_EQ(handler_->ConnectToPeer(remote_engine, kTimeoutMs, connection), FAILED);
+  EXPECT_EQ(connection, nullptr);
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, ConnectToPeerPublishesInitializedConnection) {
+  int fd = -1;
+  HIXL_MAKE_GUARD(close_fd, ([&fd]() { (void)close(fd); }));
+  std::string remote_engine;
+  ASSERT_NO_FATAL_FAILURE(BindUnavailablePeer(fd, remote_engine));
+  ASSERT_EQ(listen(fd, 1), 0);
+  HIXL_MAKE_GUARD(remove_statistics, ([&remote_engine]() {
+                    StatisticManager::GetInstance().RemoveStatisticChannel(remote_engine, true);
+                  }));
+  hixl::CtrlMsgPluginPtr connection;
+  ASSERT_EQ(handler_->ConnectToPeer(remote_engine, kTimeoutMs, connection), SUCCESS);
+  ASSERT_NE(connection, nullptr);
+  EXPECT_TRUE(connection->IsUsable());
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, PrepareDisconnectAllowsUnavailablePeerForLocalCleanup) {
+  int fd = -1;
+  HIXL_MAKE_GUARD(close_fd, ([&fd]() { (void)close(fd); }));
+  std::string remote_engine;
+  ASSERT_NO_FATAL_FAILURE(BindUnavailablePeer(fd, remote_engine));
+  ChannelInfo info{};
+  info.channel_type = ChannelType::kClient;
+  info.channel_id = remote_engine;
+  channel_manager_.channels_[{ChannelType::kClient, remote_engine}] = std::make_shared<CommChannel>(info);
+  HIXL_MAKE_GUARD(clear_channels, ([this]() { channel_manager_.channels_.clear(); }));
+  auto connection = hixl::test::Connection(sockets_[0]);
+  EXPECT_EQ(handler_->PrepareDisconnect(remote_engine, kTimeoutMs, connection), SUCCESS);
+  EXPECT_EQ(connection, nullptr);
+  Status send_status = FAILED;
+  handler_->SendDisconnectRequest(connection, send_status);
+  EXPECT_EQ(handler_->ValidateDisconnectResponse(connection, send_status, kTimeoutMs), SUCCESS);
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, PrepareDisconnectPublishesConnectionWhenPeerIsAvailable) {
+  int fd = -1;
+  HIXL_MAKE_GUARD(close_fd, ([&fd]() { (void)close(fd); }));
+  std::string remote_engine;
+  ASSERT_NO_FATAL_FAILURE(BindUnavailablePeer(fd, remote_engine));
+  ASSERT_EQ(listen(fd, 1), 0);
+  ChannelInfo info{};
+  info.channel_type = ChannelType::kClient;
+  info.channel_id = remote_engine;
+  channel_manager_.channels_[{ChannelType::kClient, remote_engine}] = std::make_shared<CommChannel>(info);
+  HIXL_MAKE_GUARD(clear_channels, ([this]() { channel_manager_.channels_.clear(); }));
+  hixl::CtrlMsgPluginPtr connection;
+  ASSERT_EQ(handler_->PrepareDisconnect(remote_engine, kTimeoutMs, connection), SUCCESS);
+  ASSERT_NE(connection, nullptr);
+  EXPECT_TRUE(connection->IsUsable());
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, DisconnectCleansLocalResourcesAfterConnectionTimeout) {
+  int fd = -1;
+  HIXL_MAKE_GUARD(close_fd, ([&fd]() { (void)close(fd); }));
+  std::string remote_engine;
+  ASSERT_NO_FATAL_FAILURE(BindUnavailablePeer(fd, remote_engine));
+  hixl::CtrlMsgPluginPtr connection;
+  ASSERT_EQ(handler_->ConnectToPeer(remote_engine, 0, connection), TIMEOUT);
+  ASSERT_EQ(connection, nullptr);
+
+  ChannelInfo info{};
+  info.channel_type = ChannelType::kClient;
+  info.channel_id = remote_engine;
+  auto channel = std::make_shared<CommChannel>(info);
+  channel_manager_.channels_[{ChannelType::kClient, remote_engine}] = channel;
+  SegmentTable segments;
+  segments.AddRange(remote_engine, kRemoteAddrStart, kRemoteAddrEnd, MEM_HOST);
+  handler_->segment_table_ = &segments;
+
+  EXPECT_EQ(handler_->Disconnect(remote_engine, 0), SUCCESS);
+  EXPECT_EQ(channel_manager_.GetChannel(ChannelType::kClient, remote_engine), nullptr);
+  EXPECT_EQ(segments.FindSegment(remote_engine, kRemoteAddrStart, kRemoteAddrEnd), nullptr);
+  EXPECT_TRUE(channel->IsFinalized());
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, DisconnectPreservesLocalResourcesForInvalidAddress) {
+  const std::string remote_engine = "invalid-engine";
+  ChannelInfo info{};
+  info.channel_type = ChannelType::kClient;
+  info.channel_id = remote_engine;
+  auto channel = std::make_shared<CommChannel>(info);
+  channel_manager_.channels_[{ChannelType::kClient, remote_engine}] = channel;
+
+  EXPECT_EQ(handler_->Disconnect(remote_engine, kTimeoutMs), PARAM_INVALID);
+  EXPECT_EQ(channel_manager_.GetChannel(ChannelType::kClient, remote_engine), channel);
+  EXPECT_FALSE(channel->IsFinalized());
+  EXPECT_FALSE(channel->IsDisconnecting());
+}
+
+TEST(ChannelMsgHandlerLifecycleTest, InitializationFailureKeepsDisconnectCleanup) {
+  ASSERT_FALSE(hixl::TlsManager::GetInstance().IsInitialized());
+  ChannelManager channel_manager;
+  ChannelMsgHandler handler(kListenInfo, &channel_manager);
+  hixl::CtrlMsgPluginPtr connection;
+  EXPECT_EQ(handler.ConnectToPeer(kRemoteEngine, kTimeoutMs, connection), FAILED);
+  EXPECT_EQ(connection, nullptr);
+  ChannelInfo info{};
+  info.channel_type = ChannelType::kClient;
+  info.channel_id = kRemoteEngine;
+  channel_manager.channels_[{ChannelType::kClient, kRemoteEngine}] = std::make_shared<CommChannel>(info);
+  HIXL_MAKE_GUARD(clear_channels, ([&channel_manager]() { channel_manager.channels_.clear(); }));
+  EXPECT_EQ(handler.PrepareDisconnect(kRemoteEngine, kTimeoutMs, connection), SUCCESS);
+  EXPECT_EQ(connection, nullptr);
+  EXPECT_FALSE(hixl::TlsManager::GetInstance().IsInitialized());
+}
+
 TEST_F(ChannelMsgHandlerUnitTest, ExchangeConnectInfoAcceptsAdxlConnectInfo) {
   auto peer_thread = StartPeerExchangeThread(BuildConnectInfoJson());
 
   ChannelConnectInfo peer_connect_info{};
-  EXPECT_EQ(handler_->ExchangeConnectInfo(sockets_[0], kTimeoutMs, peer_connect_info), SUCCESS);
+  EXPECT_EQ(handler_->ExchangeConnectInfo(hixl::test::Connection(sockets_[0]), kTimeoutMs, peer_connect_info), SUCCESS);
   EXPECT_EQ(peer_connect_info.channel_id, kRemoteEngine);
   EXPECT_EQ(peer_connect_info.comm_res, kRemoteCommRes);
   EXPECT_EQ(peer_connect_info.timeout, kTimeoutMs);
@@ -105,6 +292,51 @@ TEST_F(ChannelMsgHandlerUnitTest, ExchangeConnectInfoAcceptsAdxlConnectInfo) {
   EXPECT_EQ(peer_connect_info.addrs[0].end_addr, kRemoteAddrEnd);
 
   peer_thread.join();
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, ExchangeConnectInfoUsesCallerTimeout) {
+  ChannelConnectInfo peer_connect_info{};
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(handler_->ExchangeConnectInfo(hixl::test::Connection(sockets_[0]), 50, peer_connect_info), FAILED);
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+  EXPECT_GE(elapsed, 40);
+  EXPECT_LT(elapsed, 2000);
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, DisconnectResponseUsesCallerTimeout) {
+  const auto connection = hixl::test::Connection(sockets_[0]);
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(handler_->ValidateDisconnectResponse(connection, SUCCESS, 50), FAILED);
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+  EXPECT_GE(elapsed, 40);
+  EXPECT_LT(elapsed, 2000);
+  EXPECT_EQ(handler_->ValidateDisconnectResponse(connection, FAILED, 50), SUCCESS);
+}
+
+TEST_F(ChannelMsgHandlerUnitTest, ServerReceivesDelayedRequest) {
+  bool called = false;
+  ASSERT_EQ(handler_->RegisterCallbackProcessor(
+                static_cast<int32_t>(ChannelMsgType::kEnd),
+                [&called](const hixl::CtrlMsgPluginPtr &, const char *, uint64_t, bool &keep_connection) {
+                  called = true;
+                  keep_connection = false;
+                  return SUCCESS;
+                }),
+            SUCCESS);
+  std::thread sender([&]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(llm::MsgHandlerPlugin::SendMsg(hixl::test::Connection(sockets_[1]),
+                                             static_cast<int32_t>(ChannelMsgType::kEnd), "{}"),
+              ge::SUCCESS);
+  });
+  bool keep_connection = true;
+  const auto result = handler_->ConnectedProcess(hixl::test::Connection(sockets_[0]), keep_connection);
+  sender.join();
+  EXPECT_EQ(result, SUCCESS);
+  EXPECT_TRUE(called);
+  EXPECT_FALSE(keep_connection);
 }
 
 TEST_F(ChannelMsgHandlerUnitTest, SerializeConnectInfoWritesAdxlConnectInfo) {
@@ -169,17 +401,21 @@ TEST_F(ChannelMsgHandlerUnitTest, DeserializeRejectsNullptrAndEmptyMsgLen) {
 }
 
 TEST_F(ChannelMsgHandlerUnitTest, ProcessDisconnectRequestRejectsInvalidMsg) {
-  bool keep_fd = true;
-  EXPECT_EQ(handler_->ProcessDisconnectRequest(sockets_[0], nullptr, 0, keep_fd), PARAM_INVALID);
-  EXPECT_FALSE(keep_fd);
+  bool keep_connection = true;
+  EXPECT_EQ(handler_->ProcessDisconnectRequest(hixl::test::Connection(sockets_[0]), nullptr, 0, keep_connection),
+            PARAM_INVALID);
+  EXPECT_FALSE(keep_connection);
 
   const std::string disconnect_json = BuildDisconnectJson();
-  EXPECT_EQ(handler_->ProcessDisconnectRequest(sockets_[0], disconnect_json.c_str(), 0, keep_fd), PARAM_INVALID);
+  EXPECT_EQ(handler_->ProcessDisconnectRequest(hixl::test::Connection(sockets_[0]), disconnect_json.c_str(), 0,
+                                               keep_connection),
+            PARAM_INVALID);
 }
 
 TEST_F(ChannelMsgHandlerUnitTest, ProcessConnectRequestRejectsInvalidMsg) {
-  bool keep_fd = true;
-  EXPECT_EQ(handler_->ProcessConnectRequest(sockets_[0], nullptr, 0, keep_fd), PARAM_INVALID);
+  bool keep_connection = true;
+  EXPECT_EQ(handler_->ProcessConnectRequest(hixl::test::Connection(sockets_[0]), nullptr, 0, keep_connection),
+            PARAM_INVALID);
 }
 
 TEST_F(ChannelMsgHandlerUnitTest, ParseTcSlRejectsOutOfRangeValues) {
@@ -224,8 +460,8 @@ TEST_F(ChannelMsgHandlerUnitTest, ProcessServerEviction_WhenClientReturnsError_L
   int fd = socket_pair[0];
   int peer_fd = socket_pair[1];
 
-  // Set the fd on the channel (accessing private member)
-  channel->fd_ = fd;
+  // Set the connection on the channel (accessing private member)
+  channel->connection_ = hixl::test::Connection(fd);
 
   // Pre-set the next_req_id to a known value
   uint64_t req_id = 100;
@@ -278,7 +514,7 @@ TEST_F(ChannelMsgHandlerUnitTest, ProcessServerEviction_WhenClientAccepts_LogsIn
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair), 0);
 
   // Set the fd on the channel (accessing private member)
-  channel->fd_ = socket_pair[0];
+  channel->connection_ = hixl::test::Connection(socket_pair[0]);
 
   // Pre-set the next_req_id to a known value
   uint64_t req_id = 200;
@@ -337,7 +573,7 @@ TEST_F(ChannelMsgHandlerUnitTest, ProcessServerEviction_WhenClientSilent_TimesOu
 
   int socket_pair[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair), 0);
-  channel->fd_ = socket_pair[0];
+  channel->connection_ = hixl::test::Connection(socket_pair[0]);
 
   channel->SetDisconnecting(true);
 

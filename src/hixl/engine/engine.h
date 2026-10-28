@@ -17,9 +17,11 @@
 #include <vector>
 #include "hixl/hixl_types.h"
 #include "hixl_options.h"
+#include "common/ctrl_msg_plugin.h"
 
 namespace hixl {
-using CallbackProcessor = std::function<Status(int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd)>;
+using CallbackProcessor =
+    std::function<Status(const CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len, bool &keep_connection)>;
 
 class Engine {
  public:

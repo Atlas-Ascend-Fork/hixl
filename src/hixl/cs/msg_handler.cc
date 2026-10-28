@@ -13,10 +13,10 @@
 #include "common/ctrl_msg.h"
 
 namespace hixl {
-void MsgHandler::SubmitMsg(int32_t fd, const CtrlMsgPtr &msg) {
+void MsgHandler::SubmitMsg(const CtrlMsgPluginPtr &connection, const CtrlMsgPtr &msg) {
   {
     std::lock_guard<std::mutex> lock(req_mutex_);
-    req_queue_.emplace(fd, msg);
+    req_queue_.emplace(connection, msg);
   }
   req_cv_.notify_one();
 }
@@ -34,9 +34,11 @@ Status MsgHandler::Initialize() {
 }
 
 void MsgHandler::Finalize() {
-  bool expected = true;
-  if (!running_.compare_exchange_strong(expected, false)) {
-    return;
+  {
+    std::lock_guard<std::mutex> lock(req_mutex_);
+    if (!running_.exchange(false)) {
+      return;
+    }
   }
   req_cv_.notify_one();
   if (listener_.joinable()) {
@@ -44,7 +46,11 @@ void MsgHandler::Finalize() {
   }
   if (thread_pool_ != nullptr) {
     thread_pool_->Destroy();
+    thread_pool_.reset();
   }
+  std::lock_guard<std::mutex> lock(req_mutex_);
+  decltype(req_queue_) empty;
+  req_queue_.swap(empty);
 }
 
 MsgHandler::~MsgHandler() {
@@ -53,10 +59,10 @@ MsgHandler::~MsgHandler() {
   }
 }
 
-Status MsgHandler::HandleMsg(int32_t fd, CtrlMsgPtr msg, MsgProcessor proc) {
+Status MsgHandler::HandleMsg(const CtrlMsgPluginPtr &connection, CtrlMsgPtr msg, MsgProcessor proc) {
   HIXL_EVENT("[HixlServer] handle msg begin, msg type:%d, msg size:%zu", static_cast<int32_t>(msg->msg_type),
              msg->msg.size());
-  HIXL_CHK_STATUS_RET(proc(fd, msg->msg.c_str(), msg->msg.size()), "Failed to handle msg");
+  HIXL_CHK_STATUS_RET(proc(connection, msg->msg.c_str(), msg->msg.size()), "Failed to handle msg");
   HIXL_EVENT("[HixlServer] handle msg success, msg type:%d, msg size:%zu", static_cast<int32_t>(msg->msg_type),
              msg->msg.size());
   return SUCCESS;
@@ -72,8 +78,8 @@ Status MsgHandler::RegisterMsgProcessor(CtrlMsgType msg_type, MsgProcessor msg_p
 }
 
 void MsgHandler::HandleMsg() {
-  while (running_.load()) {
-    std::pair<int32_t, CtrlMsgPtr> req;
+  while (true) {
+    std::pair<CtrlMsgPluginPtr, CtrlMsgPtr> req;
     {
       std::unique_lock<std::mutex> lock(req_mutex_);
       req_cv_.wait(lock, [this] { return !req_queue_.empty() || !running_.load(); });
@@ -93,10 +99,14 @@ void MsgHandler::HandleMsg() {
       }
       proc = it->second;
     }
-    (void)thread_pool_->commit([this, req, proc]() -> void {
+    const auto future = thread_pool_->commit([this, req, proc]() {
       HIXL_CHK_STATUS(ctx_.SetCurrentContext(), "SetCurrentContext failed");
       (void)HandleMsg(req.first, req.second, proc);
     });
+    if (!future.valid()) {
+      HIXL_LOGE(FAILED, "[HixlServer] ThreadPool::commit failed, msg type:%d",
+                static_cast<int32_t>(req.second->msg_type));
+    }
   }
 }
 }  // namespace hixl

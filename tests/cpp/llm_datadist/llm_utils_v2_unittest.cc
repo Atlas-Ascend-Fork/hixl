@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 #include <fcntl.h>
 #include <future>
+#include <memory>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -22,8 +23,11 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+
+#include "depends/ctrl_msg_test_helper.h"
+
 #include "common/llm_utils.h"
-#include "common/msg_handler_plugin.h"
+#include "common/ctrl_msg_plugin.h"
 #include "common/llm_checker.h"
 #include "common/hixl_utils.h"
 #include "llm_datadist/llm_engine_types.h"
@@ -33,6 +37,7 @@ using namespace ::testing;
 
 namespace llm {
 namespace {
+constexpr int32_t kReadTimeoutMs = 1000;
 bool WaitForChildSuccess(const pid_t child) {
   int status = 0;
   for (int32_t i = 0; i < 1000; ++i) {
@@ -98,9 +103,11 @@ class ScopedSignalHandler {
 };
 }  // namespace
 
-class LLMUtilsTest : public ::testing::Test {
+class LLMUtilsTest : public hixl::test::PlainTlsTest {
  protected:
-  void SetUp() override {}
+  void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(hixl::test::PlainTlsTest::SetUp());
+  }
   // 在测试类中进行清理工作，如果需要的话
   void TearDown() override {}
 };
@@ -183,16 +190,15 @@ TEST_F(LLMUtilsTest, TestParserOptions) {
   EXPECT_EQ(ret, ge::SUCCESS);
 }
 
-TEST_F(LLMUtilsTest, TestMsgHandlerPlugin) {
-  int32_t fd = -1;
-  char data[1];
+TEST_F(LLMUtilsTest, ControlConnectionRejectsClosedFd) {
+  int32_t fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(close(fd), 0);
+  char data[1] = {};
   size_t len = 1;
-  ssize_t s = 0;
-  s = MsgHandlerPlugin::Read(fd, data, len);
-  EXPECT_TRUE(s < 0);
-
-  s = MsgHandlerPlugin::Write(fd, data, len);
-  EXPECT_TRUE(s < 0);
+  const auto connection = hixl::test::Connection(fd);
+  EXPECT_EQ(connection->Recv(data, len, kReadTimeoutMs), hixl::FAILED);
+  EXPECT_EQ(connection->Send(data, len), hixl::FAILED);
 }
 
 TEST_F(LLMUtilsTest, ConnectFailureLeavesInvalidFd) {
@@ -206,13 +212,14 @@ TEST_F(LLMUtilsTest, ConnectFailureLeavesInvalidFd) {
   socklen_t addr_len = sizeof(addr);
   ASSERT_EQ(getsockname(bound_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len), 0);
 
-  int32_t conn_fd = bound_fd;
-  EXPECT_EQ(MsgHandlerPlugin::Connect("127.0.0.1", ntohs(addr.sin_port), conn_fd, 1000, ge::SUCCESS), ge::SUCCESS);
-  EXPECT_EQ(conn_fd, -1);
+  auto connection = std::make_shared<hixl::CtrlMsgPlugin>();
+  ASSERT_EQ(connection->Initialize(), hixl::SUCCESS);
+  EXPECT_EQ(connection->Connect("127.0.0.1", ntohs(addr.sin_port), 1000), hixl::FAILED);
+  EXPECT_EQ(connection->Fd(), -1);
   close(bound_fd);
 }
 
-TEST_F(LLMUtilsTest, TestMsgHandlerPluginReadEOF) {
+TEST_F(LLMUtilsTest, ControlConnectionReadRejectsEarlyEof) {
   int fds[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
@@ -221,13 +228,15 @@ TEST_F(LLMUtilsTest, TestMsgHandlerPluginReadEOF) {
   close(fds[0]);
 
   char read_buf[10];
-  ssize_t ret = MsgHandlerPlugin::Read(fds[1], read_buf, sizeof(read_buf));
-  EXPECT_EQ(ret, static_cast<ssize_t>(sizeof(write_data)));
+  const auto ret = hixl::test::Connection(fds[1])->Recv(read_buf, sizeof(read_buf), kReadTimeoutMs);
+  EXPECT_EQ(ret, hixl::FAILED);
+  EXPECT_EQ(read_buf[0], write_data[0]);
+  EXPECT_EQ(read_buf[1], write_data[1]);
 
   close(fds[1]);
 }
 
-TEST_F(LLMUtilsTest, MsgHandlerReadReturnsOnEagain) {
+TEST_F(LLMUtilsTest, ControlConnectionReadWaitsForDataOnNonBlockingSocket) {
   int fds[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ASSERT_TRUE(SetNonBlocking(fds[1]));
@@ -236,15 +245,19 @@ TEST_F(LLMUtilsTest, MsgHandlerReadReturnsOnEagain) {
   ASSERT_GE(child, 0);
   if (child == 0) {
     char data = 0;
-    _exit(MsgHandlerPlugin::Read(fds[1], &data, sizeof(data)) < 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    const auto ret = hixl::test::Connection(fds[1])->Recv(&data, sizeof(data), kReadTimeoutMs);
+    _exit(ret == hixl::SUCCESS && data == 'a' ? EXIT_SUCCESS : EXIT_FAILURE);
   }
 
+  usleep(10000);
+  const char data = 'a';
+  EXPECT_EQ(write(fds[0], &data, sizeof(data)), static_cast<ssize_t>(sizeof(data)));
   EXPECT_TRUE(WaitForChildSuccess(child));
   close(fds[0]);
   close(fds[1]);
 }
 
-TEST_F(LLMUtilsTest, MsgHandlerWriteReturnsOnEagain) {
+TEST_F(LLMUtilsTest, ControlConnectionWriteRetriesOnEagain) {
   int fds[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ASSERT_TRUE(SetNonBlocking(fds[0]));
@@ -254,15 +267,19 @@ TEST_F(LLMUtilsTest, MsgHandlerWriteReturnsOnEagain) {
   ASSERT_GE(child, 0);
   if (child == 0) {
     const char data = 0;
-    _exit(MsgHandlerPlugin::Write(fds[0], &data, sizeof(data)) < 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    const auto ret = hixl::test::Connection(fds[0])->Send(&data, sizeof(data));
+    _exit(ret == hixl::SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE);
   }
 
+  usleep(10000);
+  char data[65536] = {};
+  EXPECT_GT(read(fds[1], data, sizeof(data)), 0);
   EXPECT_TRUE(WaitForChildSuccess(child));
   close(fds[0]);
   close(fds[1]);
 }
 
-TEST_F(LLMUtilsTest, MsgHandlerReadRetriesOnEintr) {
+TEST_F(LLMUtilsTest, ControlConnectionReadRetriesOnEintr) {
   int fds[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   ScopedSignalHandler signal_handler(SIGUSR1);
@@ -283,17 +300,17 @@ TEST_F(LLMUtilsTest, MsgHandlerReadRetriesOnEintr) {
 
   ready.set_value();
   char data = 0;
-  const ssize_t read_ret = MsgHandlerPlugin::Read(fds[1], &data, sizeof(data));
+  const auto read_ret = hixl::test::Connection(fds[1])->Recv(&data, sizeof(data), kReadTimeoutMs);
   signaler.join();
 
   EXPECT_EQ(signal_ret.load(std::memory_order_acquire), 0);
-  EXPECT_EQ(read_ret, static_cast<ssize_t>(sizeof(data)));
+  EXPECT_EQ(read_ret, hixl::SUCCESS);
   EXPECT_EQ(data, 'a');
   close(fds[0]);
   close(fds[1]);
 }
 
-TEST_F(LLMUtilsTest, MsgHandlerWriteRetriesOnEintr) {
+TEST_F(LLMUtilsTest, ControlConnectionWriteRetriesOnEintr) {
   int fds[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   constexpr int kSmallSendBuffer = 4096;
@@ -321,11 +338,11 @@ TEST_F(LLMUtilsTest, MsgHandlerWriteRetriesOnEintr) {
 
   ready.set_value();
   const char data = 0;
-  const ssize_t write_ret = MsgHandlerPlugin::Write(fds[0], &data, sizeof(data));
+  const auto write_ret = hixl::test::Connection(fds[0])->Send(&data, sizeof(data));
   signaler.join();
 
   EXPECT_EQ(signal_ret.load(std::memory_order_acquire), 0);
-  EXPECT_EQ(write_ret, static_cast<ssize_t>(sizeof(data)));
+  EXPECT_EQ(write_ret, hixl::SUCCESS);
   close(fds[0]);
   close(fds[1]);
 }

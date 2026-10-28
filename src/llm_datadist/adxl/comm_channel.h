@@ -74,18 +74,26 @@ class CommChannel {
   Status Initialize();
   Status Finalize();
   std::string GetChannelId() const;
+  ChannelType GetChannelType() const {
+    return channel_info_.channel_type;
+  }
   Status TransferSync(TransferOp operation, const std::vector<TransferOpDesc> &op_descs, int32_t timeout_in_millis);
   Status TransferAsync(TransferOp operation, const std::vector<TransferOpDesc> &op_descs,
                        const TransferArgs &optional_args, TransferReq &req);
   Status GetTransferStatus(const TransferReq &req, TransferStatus &status);
-  Status SetSocketNonBlocking(int32_t fd);
+  Status SetSocketNonBlocking(const hixl::CtrlMsgPluginPtr &connection);
   void StopHeartbeat();
-  Status SendControlMsg(const std::function<Status(int32_t fd)> &func) const;
-  Status CommWithFd(const std::function<Status(int32_t)> &func) const;
-  Status SendHeartBeat(const std::function<Status(int32_t)> &func) const;
+  Status SendControlMsg(const std::function<Status(const hixl::CtrlMsgPluginPtr &connection)> &func) const;
+  Status CommWithFd(const std::function<Status(const hixl::CtrlMsgPluginPtr &)> &func) const;
+  Status SendHeartBeat(const std::function<Status(const hixl::CtrlMsgPluginPtr &)> &func) const;
   static void SetHeartbeatTimeout(int64_t timeout_in_millis);
   int32_t GetFd() const {
-    return fd_;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connection_ == nullptr ? -1 : connection_->Fd();
+  }
+  hixl::CtrlMsgPluginPtr Connection() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connection_;
   }
   void UpdateHeartbeatTime();
   bool IsHeartbeatTimeout() const;
@@ -181,7 +189,7 @@ class CommChannel {
   // Fail-fast gate: only rejects when fail_fast_ is on and the link was marked unavailable by a prior fatal error.
   Status CheckAvailableLocked() const;
   ChannelInfo channel_info_;
-  // mutex for fd
+  // Mutex for connection_
   mutable std::mutex mutex_;
   std::atomic<bool> with_heartbeat_{false};
   std::chrono::steady_clock::time_point last_heartbeat_time_;
@@ -194,7 +202,7 @@ class CommChannel {
   std::atomic<bool> unavailable_{false};
   bool fail_fast_enabled_{true};
 
-  int32_t fd_ = -1;
+  hixl::CtrlMsgPluginPtr connection_;
   RecvState recv_state_ = RecvState::WAITING_FOR_HEADER;
   std::vector<char> recv_buffer_;
   size_t expected_body_size_ = 0;

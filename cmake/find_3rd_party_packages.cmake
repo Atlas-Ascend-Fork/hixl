@@ -25,3 +25,5 @@ endif()
 if (ENABLE_TEST)
     add_cann_third_party(gtest)
 endif()
+
+add_cann_third_party(openssl)

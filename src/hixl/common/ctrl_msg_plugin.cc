@@ -15,21 +15,208 @@
 #include <csignal>
 #include <chrono>
 #include <limits>
+#include <algorithm>
+#include <fcntl.h>
 #include <sys/poll.h>
 #include "securec.h"
 #include "hixl_checker.h"
 #include "scope_guard.h"
+#include "common/tls/tls_manager.h"
 
 namespace hixl {
 namespace {
+std::once_flag g_signal_initialized;
 constexpr int32_t kKeepAlive = 1;      // 启用 keepalive 机制
 constexpr int32_t kTcpKeepIdle = 60;   // 连接空闲 60 秒后开始发送 keepalive 探测包
 constexpr int32_t kTcpKeepIntvl = 10;  // keepalive 探测包发送间隔
 constexpr int32_t kTcpKeepCnt = 6;     // 连续 6 次探测失败后认为连接断开
 constexpr size_t kMaxTransferSize = static_cast<size_t>(std::numeric_limits<ssize_t>::max());
+
+std::string SocketAddress(int32_t fd, bool peer) {
+  sockaddr_storage address{};
+  socklen_t size = sizeof(address);
+  auto *socket_address = reinterpret_cast<sockaddr *>(&address);
+  const int ret = peer ? getpeername(fd, socket_address, &size) : getsockname(fd, socket_address, &size);
+  if (ret != 0 || (address.ss_family != AF_INET && address.ss_family != AF_INET6)) {
+    return "unknown";
+  }
+  char host[NI_MAXHOST] = {};
+  char service[NI_MAXSERV] = {};
+  if (getnameinfo(socket_address, size, host, sizeof(host), service, sizeof(service),
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    return "unknown";
+  }
+  if (address.ss_family == AF_INET6) {
+    return "[" + std::string(host) + "]:" + service;
+  }
+  return std::string(host) + ":" + service;
+}
+
+Status WaitSocketReady(int32_t fd, short events, int32_t timeout_ms, bool &ready) {
+  ready = false;
+  pollfd event{fd, events, 0};
+  const int ret = poll(&event, 1, timeout_ms);
+  if (ret < 0 && errno == EINTR) {
+    return SUCCESS;
+  }
+  HIXL_CHK_BOOL_RET_STATUS(ret >= 0, FAILED, "Call api:poll failed, fd:%d, ret:%d, errno:%d, error_msg:%s", fd, ret,
+                           errno, strerror(errno));
+  ready = ret > 0;
+  return SUCCESS;
+}
+
+Status SendPlain(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no) {
+  HIXL_LOGD("Socket write begin: %zu bytes, fd:%d, timeout:%u ms", len, fd, timeout_ms);
+  const char *pos = static_cast<const char *>(buf);
+  auto nbytes = static_cast<ssize_t>(len);
+  const auto start = std::chrono::steady_clock::now();
+  while (nbytes > 0) {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    HIXL_CHK_BOOL_RET_STATUS(elapsed < static_cast<int64_t>(timeout_ms), TIMEOUT,
+                             "Call api:send timed out, fd:%d, size:%zu bytes, remaining_size:%ld bytes, "
+                             "elapsed:%ld ms, timeout:%u ms",
+                             fd, len, nbytes, elapsed, timeout_ms);
+    const auto rc = send(fd, pos, static_cast<size_t>(nbytes), MSG_DONTWAIT | MSG_NOSIGNAL);
+    const int saved_errno = errno;
+    if (rc < 0 && saved_errno == EINTR) {
+      continue;
+    }
+    if (rc < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
+      bool ready = false;
+      // POLLOUT may require more free buffer space than this small control message needs.
+      const auto wait_ms = static_cast<int32_t>(std::min<int64_t>(100, static_cast<int64_t>(timeout_ms) - elapsed));
+      HIXL_CHK_STATUS_RET(WaitSocketReady(fd, POLLOUT, wait_ms, ready), "Failed to wait for socket send, fd:%d", fd);
+      continue;
+    } else if (rc <= 0) {
+      err_no = saved_errno;
+      HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
+                               "Call api:send failed, ret:%ld, fd:%d, remaining_size:%ld bytes, errno:%d, "
+                               "error_msg:%s",
+                               rc, fd, nbytes, err_no, strerror(err_no));
+    }
+    pos += rc;
+    nbytes -= rc;
+  }
+  HIXL_LOGD("Socket write completed: %zu bytes, fd:%d", len, fd);
+  return SUCCESS;
+}
+
+Status RecvPlain(int32_t fd, void *buf, size_t len, uint32_t timeout_ms) {
+  HIXL_LOGI("Socket read begin: %zu bytes, fd:%d", len, fd);
+  auto pos = static_cast<uint8_t *>(buf);
+  auto nbytes = static_cast<ssize_t>(len);
+  auto start_time = std::chrono::steady_clock::now();
+  while (nbytes > 0) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+    int64_t remaining_ms = static_cast<int64_t>(timeout_ms) - elapsed_ms;
+    if (remaining_ms <= 0) {
+      HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT,
+                               "Call api:read timed out, fd:%d, size:%zu bytes, remaining_size:%ld bytes, "
+                               "elapsed:%ld ms, timeout:%u ms",
+                               fd, len, nbytes, elapsed_ms, timeout_ms);
+    }
+    struct pollfd pfd = {};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int ret = poll(&pfd, 1, static_cast<int>(remaining_ms));
+    if (ret == 0) {
+      HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT, "Call api:poll timed out, ret:%d, fd:%d, remaining_timeout:%ld ms", ret,
+                               fd, remaining_ms);
+    } else if (ret < 0) {
+      const int32_t saved_errno = errno;
+      if (saved_errno == EINTR) {
+        continue;
+      }
+      HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
+                               "Call api:poll failed, ret:%d, fd:%d, remaining_timeout:%ld ms, errno:%d, "
+                               "error_msg:%s",
+                               ret, fd, remaining_ms, saved_errno, strerror(saved_errno));
+    }
+
+    auto rc = read(fd, pos, static_cast<size_t>(nbytes));
+    const int32_t saved_errno = errno;
+    if (rc < 0 && (saved_errno == EAGAIN || saved_errno == EINTR)) {
+      HIXL_LOGI("Socket read returned EAGAIN/EINTR, need to retry");
+      continue;
+    } else if (rc <= 0) {
+      HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
+                               "Call api:read failed, ret:%ld, fd:%d, remaining_size:%ld bytes, errno:%d, "
+                               "error_msg:%s",
+                               rc, fd, nbytes, saved_errno, strerror(saved_errno));
+    }
+    pos += rc;
+    nbytes -= rc;
+  }
+  HIXL_LOGI("Socket read completed: %zu bytes, fd:%d", len, fd);
+  return SUCCESS;
+}
+
 }  // namespace
-void CtrlMsgPlugin::Initialize() {
-  (void)std::signal(SIGPIPE, SIG_IGN);
+CtrlMsgPlugin::~CtrlMsgPlugin() {
+  (void)Close();
+}
+
+Status CtrlMsgPlugin::Initialize() {
+  std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  std::call_once(g_signal_initialized, []() { (void)std::signal(SIGPIPE, SIG_IGN); });
+  HIXL_CHK_BOOL_RET_STATUS(!initialized_, FAILED, "[CtrlMsgPlugin] Already initialized, fd:%d", fd_);
+  HIXL_CHK_STATUS_RET(TlsManager::GetInstance().GetTlsEnabled(tls_enabled_), "Failed to get process TLS mode");
+  local_address_ = "unknown";
+  peer_address_ = "unknown";
+  initialized_ = true;
+  return SUCCESS;
+}
+
+int32_t CtrlMsgPlugin::Fd() const {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  return fd_;
+}
+
+std::string CtrlMsgPlugin::Desc() const {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  return "fd:" + std::to_string(fd_) + ", local:" + local_address_ + ", peer:" + peer_address_;
+}
+
+void CtrlMsgPlugin::UpdateSocketAddresses() {
+  // Address discovery is best effort and must not change I/O error handling or emit extra failure logs.
+  const int saved_errno = errno;
+  local_address_ = SocketAddress(fd_, false);
+  peer_address_ = SocketAddress(fd_, true);
+  errno = saved_errno;
+}
+
+Status CtrlMsgPlugin::CheckReady(std::shared_ptr<TlsSession> &session) const {
+  HIXL_CHK_BOOL_RET_STATUS(initialized_ && fd_ >= 0, FAILED, "[CtrlMsgPlugin] Invalid socket, fd:%d", fd_);
+  session = tls_session_;
+  HIXL_CHK_BOOL_RET_STATUS(!tls_enabled_ || (session != nullptr && session->IsUsable()), FAILED,
+                           "[CtrlMsgPlugin] TLS session is not usable, fd:%d", fd_);
+  return SUCCESS;
+}
+
+Status CtrlMsgPlugin::Connect(const std::string &ip, uint32_t port, int32_t timeout) {
+  std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  HIXL_CHK_BOOL_RET_STATUS(initialized_, FAILED,
+                           "[CtrlMsgPlugin] Cannot connect before initialization or after close, fd:%d", fd_);
+  HIXL_CHK_BOOL_RET_STATUS(fd_ < 0, FAILED, "[CtrlMsgPlugin] Socket already exists for connect, fd:%d", fd_);
+  const Status ret = ConnectSocket(ip, port, timeout);
+  if (ret != SUCCESS) {
+    (void)CloseLocked();
+  }
+  return ret;
+}
+
+Status CtrlMsgPlugin::Listen(const std::string &ip, uint32_t port, int32_t backlog) {
+  std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  HIXL_CHK_BOOL_RET_STATUS(initialized_, FAILED,
+                           "[CtrlMsgPlugin] Cannot listen before initialization or after close, fd:%d", fd_);
+  HIXL_CHK_BOOL_RET_STATUS(fd_ < 0, FAILED, "[CtrlMsgPlugin] Socket already exists for listen, fd:%d", fd_);
+  const Status ret = ListenSocket(ip, port, backlog);
+  if (ret != SUCCESS) {
+    (void)CloseLocked();
+  }
+  return ret;
 }
 
 Status CtrlMsgPlugin::GetAiFamily(const std::string &ip, int32_t &ai_family) {
@@ -51,7 +238,8 @@ Status CtrlMsgPlugin::GetAiFamily(const std::string &ip, int32_t &ai_family) {
   return PARAM_INVALID;
 }
 
-Status CtrlMsgPlugin::Connect(const std::string &ip, uint32_t port, int32_t &conn_fd, int32_t timeout) {
+Status CtrlMsgPlugin::ConnectSocket(const std::string &ip, uint32_t port, int32_t timeout) {
+  auto &conn_fd = fd_;
   HIXL_EVENT("connect to server %s:%u begin", ip.c_str(), port);
   auto start = std::chrono::high_resolution_clock::now();
   struct ::addrinfo hints;
@@ -83,8 +271,11 @@ Status CtrlMsgPlugin::Connect(const std::string &ip, uint32_t port, int32_t &con
   }
   if (ret != SUCCESS) {
     HIXL_LOGE(ret, "Failed to connect peer %s:%u, error msg:%s, errno:%d", ip.c_str(), port, strerror(err_no), err_no);
+    return ret;
   }
-  return ret;
+  UpdateSocketAddresses();
+  HIXL_CHK_STATUS_RET(Handshake(false, timeout), "[CtrlMsgPlugin] Client handshake failed, fd:%d", fd_);
+  return SUCCESS;
 }
 
 Status CtrlMsgPlugin::DoConnect(const struct ::addrinfo *addr, int32_t &conn_fd, int32_t &err_no, int32_t timeout) {
@@ -150,7 +341,8 @@ Status CtrlMsgPlugin::SockAddrInit(const std::string &ip, uint32_t listen_port, 
   return SUCCESS;
 }
 
-Status CtrlMsgPlugin::Listen(const std::string &ip, uint32_t listen_port, int32_t backlog, int32_t &listen_fd) {
+Status CtrlMsgPlugin::ListenSocket(const std::string &ip, uint32_t listen_port, int32_t backlog) {
+  auto &listen_fd = fd_;
   int32_t ai_family = 0;
   HIXL_CHK_STATUS_RET(GetAiFamily(ip, ai_family), "Failed to get ai_family, ip:%s", ip.c_str());
   const int32_t fd = socket(ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -185,11 +377,14 @@ Status CtrlMsgPlugin::Listen(const std::string &ip, uint32_t listen_port, int32_
                            socket_ret, strerror(errno), errno);
   HIXL_DISMISS_GUARD(fail_guard);
   listen_fd = fd;
+  UpdateSocketAddresses();
   HIXL_EVENT("listen on %s:%d success, listen_fd:%d", ip.c_str(), listen_port, fd);
   return SUCCESS;
 }
 
-Status CtrlMsgPlugin::AddFdToEpoll(int32_t &epoll_fd, int32_t fd, uint32_t events) {
+Status CtrlMsgPlugin::AddToEpoll(int32_t &epoll_fd, uint32_t events) {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  const auto fd = fd_;
   HIXL_CHK_BOOL_RET_STATUS(fd >= 0, FAILED, "Invalid fd:%d", fd);
   if (epoll_fd < 0) {
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -210,184 +405,75 @@ Status CtrlMsgPlugin::AddFdToEpoll(int32_t &epoll_fd, int32_t fd, uint32_t event
   return SUCCESS;
 }
 
-Status CtrlMsgPlugin::Accept(int32_t listen_fd, int32_t &conn_fd) {
-  HIXL_LOGI("Socket accept begin, listen_fd:%d", listen_fd);
+Status CtrlMsgPlugin::Accept(CtrlMsgPluginPtr &connection) {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  connection.reset();
+  HIXL_CHK_BOOL_RET_STATUS(fd_ >= 0, FAILED, "[CtrlMsgPlugin] Invalid listener socket, fd:%d", fd_);
   struct sockaddr_storage addr;
   socklen_t addr_len = sizeof(addr);
-  conn_fd = accept(listen_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len);
-  if (conn_fd < 0) {
-    HIXL_CHK_BOOL_RET_STATUS(errno == EWOULDBLOCK || errno == EINTR || errno == ECONNABORTED, FAILED,
-                             "Failed to accept, error msg=%s, errno=%d", strerror(errno), errno);
+  const int32_t fd = accept(fd_, reinterpret_cast<sockaddr *>(&addr), &addr_len);
+  if (fd < 0) {
+    const int saved_errno = errno;
+    HIXL_CHK_BOOL_RET_STATUS(saved_errno == EWOULDBLOCK || saved_errno == EINTR || saved_errno == ECONNABORTED, FAILED,
+                             "Call api:accept failed, fd:%d, errno:%d, error_msg:%s", fd_, saved_errno,
+                             strerror(saved_errno));
     return SUCCESS;
   }
-  HIXL_EVENT("accept success, listen_fd:%d, conn_fd:%d", listen_fd, conn_fd);
+  HIXL_DISMISSABLE_GUARD(close_fd, ([fd]() { (void)close(fd); }));
+  CtrlMsgPluginPtr accepted_connection(new (std::nothrow) CtrlMsgPlugin());
+  HIXL_CHECK_NOTNULL(accepted_connection);
+  HIXL_CHK_STATUS_RET(accepted_connection->Initialize(), "Failed to initialize accepted connection");
+  accepted_connection->fd_ = fd;
+  accepted_connection->UpdateSocketAddresses();
+  HIXL_DISMISS_GUARD(close_fd);
+  connection = std::move(accepted_connection);
   return SUCCESS;
 }
 
-namespace {
-int64_t ElapsedMs(std::chrono::steady_clock::time_point start) {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-}
-
-int PollWaitMs(int64_t remaining_ms) {
-  constexpr int64_t kMaxPollWaitMs = std::numeric_limits<int>::max();
-  if (remaining_ms > kMaxPollWaitMs) {
-    return static_cast<int>(kMaxPollWaitMs);
-  }
-  return static_cast<int>(remaining_ms);
-}
-
-Status WaitUntilWritable(int32_t fd, int64_t remaining_ms, bool &retry) {
-  retry = false;
-  struct pollfd pfd = {};
-  pfd.fd = fd;
-  pfd.events = POLLOUT;
-  const int ret = poll(&pfd, 1, PollWaitMs(remaining_ms));
-  if (ret == 0) {
-    HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT, "Call api:poll timed out, ret:%d, fd:%d, remaining_timeout:%ld ms", ret,
-                             fd, remaining_ms);
-  }
-  if (ret < 0) {
-    const int32_t saved_errno = errno;
-    if (saved_errno == EINTR) {
-      retry = true;
-      return SUCCESS;
-    }
-    HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
-                             "Call api:poll failed, ret:%d, fd:%d, remaining_timeout:%ld ms, errno:%d, "
-                             "error_msg:%s",
-                             ret, fd, remaining_ms, saved_errno, strerror(saved_errno));
-  }
-  return SUCCESS;
-}
-
-Status WriteSome(int32_t fd, const char *&pos, ssize_t &nbytes, int32_t &err_no, bool &retry) {
-  retry = false;
-  // 不等待内核阻塞：poll 负责等待，SO_SNDTIMEO 只约束阻塞 send。
-  const auto rc = send(fd, pos, static_cast<size_t>(nbytes), MSG_DONTWAIT);
-  const int32_t saved_errno = errno;
-  if (rc < 0 && (saved_errno == EAGAIN || saved_errno == EINTR)) {
-    HIXL_LOGD("Socket write needs retry, fd:%d, errno:%d", fd, saved_errno);
-    retry = true;
-    return SUCCESS;
-  }
-  if (rc <= 0) {
-    err_no = saved_errno;
-    HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
-                             "Call api:send failed, ret:%ld, fd:%d, remaining_size:%ld bytes, errno:%d, "
-                             "error_msg:%s",
-                             rc, fd, nbytes, err_no, strerror(err_no));
-  }
-  pos += rc;
-  nbytes -= rc;
-  return SUCCESS;
-}
-}  // namespace
-
-Status CtrlMsgPlugin::Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms) {
+Status CtrlMsgPlugin::Send(const void *buf, size_t len, uint32_t timeout_ms) {
   int32_t err_no = 0;
-  return Send(fd, buf, len, timeout_ms, err_no);
+  return Send(buf, len, timeout_ms, err_no);
 }
 
-Status CtrlMsgPlugin::Send(int32_t fd, const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no) {
+Status CtrlMsgPlugin::Send(const void *buf, size_t len, uint32_t timeout_ms, int32_t &err_no) {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  const auto fd = fd_;
   err_no = 0;
   HIXL_CHK_BOOL_RET_STATUS(len <= kMaxTransferSize, PARAM_INVALID,
                            "Socket write length exceeds ssize_t max, len:%zu bytes, max:%zu bytes", len,
                            kMaxTransferSize);
-  HIXL_LOGI("Socket write begin: %zu bytes, fd:%d, timeout:%u ms", len, fd, timeout_ms);
-  if (len > 0U && fd < 0) {
-    err_no = EBADF;
-    HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
-                             "Call api:send failed, ret:-1, fd:%d, remaining_size:%zu bytes, errno:%d, error_msg:%s",
-                             fd, len, err_no, strerror(err_no));
+  std::shared_ptr<TlsSession> session;
+  HIXL_CHK_STATUS_RET(CheckReady(session), "[CtrlMsgPlugin] Connection is not ready for I/O");
+  HIXL_CHK_BOOL_RET_STATUS(buf != nullptr || len == 0U, PARAM_INVALID, "Invalid I/O buffer, size:%zu bytes", len);
+  if (session != nullptr) {
+    const Status ret = session->Send(buf, len, timeout_ms, err_no);
+    if (!session->IsUsable()) {
+      HIXL_CHK_STATUS(ShutdownSocketLocked(), "Failed to interrupt unusable TLS connection, fd:%d", fd_);
+    }
+    return ret;
   }
-  const char *pos = static_cast<const char *>(buf);
-  auto nbytes = static_cast<ssize_t>(len);
-  const auto start_time = std::chrono::steady_clock::now();
-  while (nbytes > 0) {
-    const int64_t elapsed_ms = ElapsedMs(start_time);
-    const int64_t remaining_ms = static_cast<int64_t>(timeout_ms) - elapsed_ms;
-    if (remaining_ms <= 0) {
-      HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT,
-                               "Call api:send timed out, fd:%d, size:%zu bytes, remaining_size:%ld bytes, "
-                               "elapsed:%ld ms, timeout:%u ms",
-                               fd, len, nbytes, elapsed_ms, timeout_ms);
-    }
-    bool retry = false;
-    const Status wait_ret = WaitUntilWritable(fd, remaining_ms, retry);
-    if (wait_ret != SUCCESS) {
-      return wait_ret;
-    }
-    if (retry) {
-      continue;
-    }
-    const Status write_ret = WriteSome(fd, pos, nbytes, err_no, retry);
-    if (write_ret != SUCCESS) {
-      return write_ret;
-    }
-    if (retry) {
-      continue;
-    }
-  }
-  HIXL_LOGI("Socket write completed: %zu bytes, fd:%d", len, fd);
-  return SUCCESS;
+  return SendPlain(fd, buf, len, timeout_ms, err_no);
 }
 
-Status CtrlMsgPlugin::Recv(int32_t fd, void *buf, size_t len, uint32_t timeout_ms) {
+Status CtrlMsgPlugin::Recv(void *buf, size_t len, uint32_t timeout_ms) {
+  std::lock_guard<std::mutex> receive_lock(receive_mutex_);
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  const auto fd = fd_;
   HIXL_CHK_BOOL_RET_STATUS(len <= kMaxTransferSize, PARAM_INVALID,
                            "Socket read length exceeds ssize_t max, len:%zu bytes, max:%zu bytes", len,
                            kMaxTransferSize);
-  HIXL_LOGI("Socket read begin: %zu bytes, fd:%d", len, fd);
-  auto pos = static_cast<uint8_t *>(buf);
-  auto nbytes = static_cast<ssize_t>(len);
-  auto start_time = std::chrono::steady_clock::now();
-  while (nbytes > 0) {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-    int64_t remaining_ms = static_cast<int64_t>(timeout_ms) - elapsed_ms;
-    if (remaining_ms <= 0) {
-      HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT,
-                               "Call api:read timed out, fd:%d, size:%zu bytes, remaining_size:%ld bytes, "
-                               "elapsed:%ld ms, timeout:%u ms",
-                               fd, len, nbytes, elapsed_ms, timeout_ms);
-    }
-    struct pollfd pfd = {};
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-    int ret = poll(&pfd, 1, static_cast<int>(remaining_ms));
-    if (ret == 0) {
-      HIXL_CHK_BOOL_RET_STATUS(false, TIMEOUT, "Call api:poll timed out, ret:%d, fd:%d, remaining_timeout:%ld ms", ret,
-                               fd, remaining_ms);
-    } else if (ret < 0) {
-      const int32_t saved_errno = errno;
-      if (saved_errno == EINTR) {
-        continue;
-      }
-      HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
-                               "Call api:poll failed, ret:%d, fd:%d, remaining_timeout:%ld ms, errno:%d, "
-                               "error_msg:%s",
-                               ret, fd, remaining_ms, saved_errno, strerror(saved_errno));
-    }
-
-    auto rc = read(fd, pos, static_cast<size_t>(nbytes));
-    const int32_t saved_errno = errno;
-    if (rc < 0 && (saved_errno == EAGAIN || saved_errno == EINTR)) {
-      HIXL_LOGI("Socket read returned EAGAIN, need to retry");
-      continue;
-    } else if (rc <= 0) {
-      HIXL_CHK_BOOL_RET_STATUS(false, FAILED,
-                               "Call api:read failed, ret:%ld, fd:%d, remaining_size:%ld bytes, errno:%d, "
-                               "error_msg:%s",
-                               rc, fd, nbytes, saved_errno, strerror(saved_errno));
-    }
-    pos += rc;
-    nbytes -= rc;
+  std::shared_ptr<TlsSession> session;
+  HIXL_CHK_STATUS_RET(CheckReady(session), "[CtrlMsgPlugin] Connection is not ready for I/O");
+  HIXL_CHK_BOOL_RET_STATUS(buf != nullptr || len == 0U, PARAM_INVALID, "Invalid I/O buffer, size:%zu bytes", len);
+  if (session != nullptr) {
+    return session->Recv(buf, len, timeout_ms);
   }
-  HIXL_LOGI("Socket read completed: %zu bytes, fd:%d", len, fd);
-  return SUCCESS;
+  return RecvPlain(fd, buf, len, timeout_ms);
 }
 
-Status CtrlMsgPlugin::SetTcpNoDelay(int32_t fd) {
+Status CtrlMsgPlugin::SetTcpNoDelay() {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  const auto fd = fd_;
   HIXL_CHK_BOOL_RET_STATUS(fd >= 0, FAILED, "Invalid fd:%d", fd);
   int32_t flag = 1;
   HIXL_CHK_BOOL_RET_STATUS(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) == 0, FAILED,
@@ -396,7 +482,9 @@ Status CtrlMsgPlugin::SetTcpNoDelay(int32_t fd) {
   return SUCCESS;
 }
 
-Status CtrlMsgPlugin::SetTcpKeepAlive(int32_t fd) {
+Status CtrlMsgPlugin::SetTcpKeepAlive() {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  const auto fd = fd_;
   HIXL_CHK_BOOL_RET_STATUS(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &kKeepAlive, sizeof(kKeepAlive)) == 0, FAILED,
                            "Failed to set SO_KEEPALIVE, fd:%d, errno:%d", fd, errno);
   HIXL_CHK_BOOL_RET_STATUS(setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &kTcpKeepIdle, sizeof(kTcpKeepIdle)) == 0, FAILED,
@@ -412,16 +500,140 @@ Status CtrlMsgPlugin::SetTcpKeepAlive(int32_t fd) {
   return SUCCESS;
 }
 
-Status CtrlMsgPlugin::SetSendTimeout(int32_t fd, uint32_t timeout_ms) {
-  HIXL_CHK_BOOL_RET_STATUS(fd >= 0, FAILED, "Invalid fd:%d", fd);
-  constexpr int64_t kTimeInSec = 1000;
-  struct timeval socket_timeout;
-  socket_timeout.tv_sec = static_cast<int64_t>(timeout_ms) / kTimeInSec;
-  socket_timeout.tv_usec = (static_cast<int64_t>(timeout_ms) % kTimeInSec) * kTimeInSec;
-  const auto socket_ret = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &socket_timeout, sizeof(socket_timeout));
-  HIXL_CHK_BOOL_RET_STATUS(socket_ret == 0, FAILED,
-                           "Failed to set SO_SNDTIMEO, fd:%d, timeout:%u ms, socket_ret:%d, error msg:%s, errno:%d", fd,
-                           timeout_ms, socket_ret, strerror(errno), errno);
+Status CtrlMsgPlugin::SetSendTimeout(uint32_t timeout_ms) {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  HIXL_CHK_BOOL_RET_STATUS(fd_ >= 0, FAILED, "Invalid fd:%d", fd_);
+  constexpr int64_t kMillisPerSecond = 1000;
+  timeval socket_timeout{};
+  socket_timeout.tv_sec = static_cast<int64_t>(timeout_ms) / kMillisPerSecond;
+  socket_timeout.tv_usec = (static_cast<int64_t>(timeout_ms) % kMillisPerSecond) * kMillisPerSecond;
+  const auto ret = setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &socket_timeout, sizeof(socket_timeout));
+  const int saved_errno = errno;
+  HIXL_CHK_BOOL_RET_STATUS(ret == 0, FAILED,
+                           "Call api:setsockopt failed, option:SO_SNDTIMEO, ret:%d, fd:%d, timeout:%u ms, "
+                           "errno:%d, error_msg:%s",
+                           ret, fd_, timeout_ms, saved_errno, strerror(saved_errno));
   return SUCCESS;
+}
+
+Status CtrlMsgPlugin::Handshake(bool server, int32_t timeout_ms) {
+  if (!tls_enabled_) {
+    return SUCCESS;
+  }
+  auto ctx = TlsManager::GetInstance().GetContext();
+  HIXL_CHK_BOOL_RET_STATUS(ctx != nullptr, FAILED, "[CtrlMsgPlugin] TLS context is missing, fd:%d", fd_);
+  std::shared_ptr<TlsSession> session;
+  HIXL_CHK_STATUS_RET(TlsContext::CreateSession(ctx, fd_, server, session), "Failed to create TLS session, fd:%d", fd_);
+  const Status ret = server ? session->HandshakeAsServer(timeout_ms) : session->HandshakeAsClient(timeout_ms);
+  HIXL_CHK_STATUS_RET(ret, "TLS handshake failed, fd:%d", fd_);
+  tls_session_ = std::move(session);
+  return SUCCESS;
+}
+
+Status CtrlMsgPlugin::HandshakeServer() {
+  std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  HIXL_CHK_BOOL_RET_STATUS(fd_ >= 0, FAILED, "[CtrlMsgPlugin] Invalid socket for server handshake, fd:%d", fd_);
+  HIXL_CHK_BOOL_RET_STATUS(tls_session_ == nullptr, FAILED,
+                           "[CtrlMsgPlugin] TLS session already exists for server handshake, fd:%d", fd_);
+  const Status ret = Handshake(true, kServerHandshakeTimeoutMs);
+  if (ret != SUCCESS) {
+    (void)CloseLocked();
+  }
+  return ret;
+}
+
+Status CtrlMsgPlugin::HandshakeServerStep(TlsHandshakeState &state) {
+  std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  HIXL_CHK_BOOL_RET_STATUS(initialized_ && fd_ >= 0, FAILED,
+                           "[CtrlMsgPlugin] Invalid socket for server handshake, fd:%d", fd_);
+  state = TlsHandshakeState::kComplete;
+  if (!tls_enabled_) {
+    return SUCCESS;
+  }
+  if (tls_session_ == nullptr) {
+    HIXL_CHK_STATUS_RET(TlsContext::CreateSession(TlsManager::GetInstance().GetContext(), fd_, true, tls_session_),
+                        "Failed to create server TLS session, fd:%d", fd_);
+  }
+  const Status ret = tls_session_->HandshakeAsServerStep(state);
+  if (ret != SUCCESS) {
+    (void)CloseLocked();
+  }
+  return ret;
+}
+
+Status CtrlMsgPlugin::Recv(void *buf, size_t len, ssize_t &n) {
+  std::lock_guard<std::mutex> receive_lock(receive_mutex_);
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  n = -1;
+  std::shared_ptr<TlsSession> session;
+  HIXL_CHK_STATUS_RET(CheckReady(session), "[CtrlMsgPlugin] Connection is not ready for receive");
+  if (session != nullptr) {
+    return session->RecvOnce(buf, len, n);
+  }
+  n = recv(fd_, buf, len, 0);
+  return SUCCESS;
+}
+
+bool CtrlMsgPlugin::HasPending() {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  if (fd_ < 0) {
+    return false;
+  }
+  auto session = tls_session_;
+  return session != nullptr && session->HasPending();
+}
+
+bool CtrlMsgPlugin::IsUsable() const {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  return initialized_ && fd_ >= 0 && (!tls_enabled_ || (tls_session_ != nullptr && tls_session_->IsUsable()));
+}
+
+Status CtrlMsgPlugin::InvalidateTlsSession() {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  if (tls_session_ == nullptr) {
+    return SUCCESS;
+  }
+  tls_session_->Invalidate();
+  return ShutdownSocketLocked();
+}
+
+Status CtrlMsgPlugin::ShutdownSocket() {
+  std::shared_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  return ShutdownSocketLocked();
+}
+
+Status CtrlMsgPlugin::ShutdownSocketLocked() const {
+  if (fd_ < 0) {
+    return SUCCESS;
+  }
+  const int ret = shutdown(fd_, SHUT_RDWR);
+  const int saved_errno = errno;
+  HIXL_CHK_BOOL_RET_STATUS(ret == 0 || saved_errno == ENOTCONN, FAILED,
+                           "Call api:shutdown failed, ret:%d, fd:%d, errno:%d, error_msg:%s", ret, fd_, saved_errno,
+                           strerror(saved_errno));
+  return SUCCESS;
+}
+
+Status CtrlMsgPlugin::CloseLocked() {
+  if (tls_session_ != nullptr) {
+    tls_session_->Shutdown();
+    tls_session_.reset();
+  }
+  initialized_ = false;
+  tls_enabled_ = false;
+  const int32_t fd = fd_;
+  fd_ = -1;
+  if (fd < 0) {
+    return SUCCESS;
+  }
+  const int ret = close(fd);
+  HIXL_CHK_BOOL_RET_STATUS(ret == 0, FAILED, "Call api:close failed, ret:%d, fd:%d, errno:%d, error_msg:%s", ret, fd,
+                           errno, strerror(errno));
+  return SUCCESS;
+}
+
+Status CtrlMsgPlugin::Close() {
+  std::unique_lock<std::shared_mutex> lock(lifecycle_mutex_);
+  return CloseLocked();
 }
 }  // namespace hixl

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -62,7 +62,8 @@ struct PendingDisconnectRequest {
   RequestDisconnectResp resp;
 };
 
-using CallbackProcessor = std::function<Status(int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd)>;
+using CallbackProcessor = std::function<Status(const hixl::CtrlMsgPluginPtr &connection, const char *msg,
+                                               uint64_t msg_len, bool &keep_connection)>;
 
 class ChannelMsgHandler {
  public:
@@ -112,14 +113,16 @@ class ChannelMsgHandler {
   Status ParseRankTable(const ChannelConnectInfo &peer_channel_info, std::string &rank_table, int32_t &local_rank_id,
                         int32_t &peer_rank_id) const;
   Status ConnectInfoProcess(const ChannelConnectInfo &peer_channel_info, int32_t timeout, bool is_client);
-  Status ProcessConnectRequest(int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd);
+  Status ProcessConnectRequest(const hixl::CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len,
+                               bool &keep_connection);
   Status DisconnectInfoProcess(ChannelType channel_type, const ChannelDisconnectInfo &peer_disconnect_info);
-  Status ProcessDisconnectRequest(int32_t fd, const char *msg, uint64_t msg_len, bool &keep_fd);
-  Status ConnectedProcess(int32_t fd, bool &keep_fd);
+  Status ProcessDisconnectRequest(const hixl::CtrlMsgPluginPtr &connection, const char *msg, uint64_t msg_len,
+                                  bool &keep_connection);
+  Status ConnectedProcess(const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection);
   template <typename T>
-  static Status SendMsg(int32_t fd, ChannelMsgType msg_type, const T &msg);
+  static Status SendMsg(const hixl::CtrlMsgPluginPtr &connection, ChannelMsgType msg_type, const T &msg);
   template <typename T>
-  static Status RecvMsg(int32_t fd, ChannelMsgType msg_type, T &msg);
+  static Status RecvMsg(const hixl::CtrlMsgPluginPtr &connection, ChannelMsgType msg_type, T &msg, int32_t timeout_ms);
   template <typename T>
   static Status Serialize(const T &msg, std::string &msg_str);
   template <typename T>
@@ -128,15 +131,20 @@ class ChannelMsgHandler {
   Status ParseServiceLevel(const std::map<AscendString, AscendString> &options);
   Status DoConnect(const std::string &remote_engine, int32_t timeout_in_millis);
   Status FillLocalConnectInfo(ChannelConnectInfo &channel_connect_info) const;
-  Status StartChannelHeartbeat(const std::string &channel_id, ChannelType channel_type, int32_t fd, bool &keep_fd);
-  Status ConnectToPeer(const std::string &remote_engine, int32_t timeout_in_millis, int32_t &conn_fd) const;
-  Status ExchangeConnectInfo(int32_t conn_fd, int32_t timeout_in_millis, ChannelConnectInfo &peer_connect_info) const;
-  Status PrepareDisconnect(const std::string &remote_engine, int32_t timeout_in_millis, int32_t &conn_fd) const;
+  Status StartChannelHeartbeat(const std::string &channel_id, ChannelType channel_type,
+                               const hixl::CtrlMsgPluginPtr &connection, bool &keep_connection);
+  Status ConnectToPeer(const std::string &remote_engine, int32_t timeout_in_millis,
+                       hixl::CtrlMsgPluginPtr &connection) const;
+  Status ExchangeConnectInfo(const hixl::CtrlMsgPluginPtr &connection, int32_t timeout_in_millis,
+                             ChannelConnectInfo &peer_connect_info) const;
+  Status PrepareDisconnect(const std::string &remote_engine, int32_t timeout_in_millis,
+                           hixl::CtrlMsgPluginPtr &connection) const;
   Status CheckPrepareDisconnectResult(Status prepare_ret, const std::string &remote_engine,
                                       int32_t timeout_in_millis) const;
-  void SendDisconnectRequest(int32_t conn_fd, Status &send_status) const;
+  void SendDisconnectRequest(const hixl::CtrlMsgPluginPtr &connection, Status &send_status) const;
   Status CleanupDisconnectResources(const std::string &remote_engine) const;
-  Status ValidateDisconnectResponse(int32_t conn_fd, Status send_status) const;
+  Status ValidateDisconnectResponse(const hixl::CtrlMsgPluginPtr &connection, Status send_status,
+                                    int32_t timeout_ms) const;
   Status InitChannelPool();
 
   int32_t GetTotalChannelCount() const;
@@ -156,6 +164,7 @@ class ChannelMsgHandler {
   int32_t high_waterline_{0};
   int32_t low_waterline_{0};
 
+  // Queue-only lock. Do not run ProcessEviction or channel cleanup while holding it.
   std::mutex evict_mutex_;
   std::condition_variable evict_cv_;
   std::queue<EvictItem> evict_queue_;

@@ -20,6 +20,7 @@
 #include "common/hixl_log.h"
 #include "common/llm_utils.h"
 #include "common/scope_guard.h"
+#include "common/tls/tls_manager.h"
 #include "profiling/prof_reporter.h"
 #include "acl/acl.h"
 #include "cs/ubmem/ubmem_allocator.h"
@@ -62,10 +63,14 @@ Status HixlEngine::Initialize(const HixlOptions &options) {
                              "Invalid option fields, OPTION_BUFFER_POOL for hixl engine only supports %s",
                              BUFFER_POOL_DISABLED);
   }
+  HIXL_CHK_BOOL_RET_STATUS(!IsInitialized(), FAILED, "[HixlEngine] Engine is already initialized");
   global_config_ = options.GlobalResourceCfg().value_or(GlobalResourceConfig{});
   std::string local_comm_res;
   HIXL_CHK_STATUS_RET(EndpointGenerator::BuildEndpointList(options, local_engine_, local_comm_res, endpoint_list_),
                       "[HixlEngine] Failed to build endpoint list from options");
+  HIXL_CHK_STATUS_RET(TlsManager::GetInstance().Initialize(global_config_.tls_config),
+                      "[HixlEngine] Failed to initialize TLS");
+  HIXL_DISMISSABLE_GUARD(tls_guard, ([]() { TlsManager::GetInstance().Finalize(); }));
   HIXL_CHK_STATUS_RET(aclrt_context_.CreateContext(), "[HixlEngine] Failed to create optional aclrt context");
   auto with_context = aclrt_context_.GetContextGuard();
   HIXL_DISMISSABLE_GUARD(ctx_fail_guard, ([this]() {
@@ -79,6 +84,7 @@ Status HixlEngine::Initialize(const HixlOptions &options) {
   auto_connect_ = options.AutoConnect().value_or(false);
   HIXL_CHK_STATUS_RET(client_manager_.Initialize(auto_connect_), "[HixlEngine] Failed to initialize client manager");
   HIXL_DISMISS_GUARD(ctx_fail_guard);
+  HIXL_DISMISS_GUARD(tls_guard);
   is_initialized_ = true;
   HIXL_EVENT("[HixlEngine] initialize success, local_engine:%s, endpoint_count:%zu, auto_connect:%d",
              local_engine_.c_str(), endpoint_list_.size(), static_cast<int32_t>(auto_connect_.load()));
@@ -311,7 +317,7 @@ Status HixlEngine::GetTransferStatus(const GetTransferStatusArgs &args, std::vec
 void HixlEngine::Finalize() {
   HIXL_EVENT("[HixlEngine] finalize start, local_engine:%s", local_engine_.c_str());
   std::lock_guard<std::shared_mutex> lock(mutex_);
-  is_initialized_ = false;
+  const bool was_initialized = is_initialized_.exchange(false);
   {
     auto with_context = aclrt_context_.GetContextGuard();
     (void)client_manager_.Finalize();
@@ -319,6 +325,9 @@ void HixlEngine::Finalize() {
     mem_map_.clear();
   }
   aclrt_context_.DestroyContext();
+  if (was_initialized) {
+    TlsManager::GetInstance().Finalize();
+  }
   HIXL_EVENT("[HixlEngine] finalize success, local_engine:%s", local_engine_.c_str());
 }
 

@@ -55,6 +55,7 @@ file(GLOB ADXL_SRC_LIST
 
 file(GLOB HIXL_SRC_LIST
         "${HIXL_CODE_DIR}/src/hixl/common/*.cc"
+        "${HIXL_CODE_DIR}/src/hixl/common/tls/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/cs/ubmem/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/*.cc"
         "${HIXL_CODE_DIR}/src/hixl/engine/endpoint_generator/*.cc"
@@ -115,6 +116,8 @@ function(add_adxl_family_test target_name test_files)
           metadef_headers
           intf_pub
           json
+          ssl_static
+          crypto_static
           slog_stub
           mmpa_stub
           ascendcl_stub

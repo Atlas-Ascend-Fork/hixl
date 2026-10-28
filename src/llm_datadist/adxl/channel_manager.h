@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -44,12 +44,12 @@ class ChannelManager {
   void SetSlotPool(TransferSlotPool *slot_pool);
   void SetFailFastEnabled(bool enabled);
 
-  Status AddSocketToEpoll(int32_t fd, ChannelPtr channel);
+  Status AddSocketToEpoll(const hixl::CtrlMsgPluginPtr &connection, ChannelPtr channel);
 
   std::vector<ChannelPtr> GetAllClientChannel() const;
   std::vector<ChannelPtr> GetAllServerChannel() const;
 
-  void SetDisconnectCallback(std::function<Status(const std::string &, int32_t)> callback) {
+  void SetDisconnectCallback(std::function<Status(const ChannelPtr &, int32_t)> callback) {
     disconnect_callback_ = callback;
   }
 
@@ -78,7 +78,11 @@ class ChannelManager {
   void StartWorkerThreads();
   void CloseEpollFd() noexcept;
   Status HandleEpoolEvents();
+  bool ProcessPendingMsg();
   Status HandleSocketEvent(int32_t fd);
+  Status HandleSocketEventLocked(int32_t fd);
+  void CleanupUnusableChannel(const ChannelPtr &channel);
+  Status DestroyChannelLocked(ChannelType channel_type, const std::string &channel_id);
   Status HandleReadEvent(const ChannelPtr &channel) const;
   Status ProcessReceivedData(const ChannelPtr &channel) const;
   Status HandleControlMessage(const ChannelPtr &channel) const;
@@ -87,7 +91,7 @@ class ChannelManager {
   Status HandleBufferRespMessage(const ChannelPtr &channel, const std::string &msg_str) const;
   Status HandleNotifyMessage(const ChannelPtr &channel, const std::string &msg_str) const;
   Status HandleNotifyAckMessage(const ChannelPtr &channel, const std::string &msg_str) const;
-  Status RemoveFd(int32_t fd);
+  Status RemoveFd(const hixl::CtrlMsgPluginPtr &connection);
 
   NotifyAckCallback notify_ack_callback_;
 
@@ -102,7 +106,7 @@ class ChannelManager {
   std::mutex cv_mutex_;
   std::condition_variable cv_;
 
-  // mutex for map channels_
+  // Lock order: mutex_ before fd_mutex_. Never acquire mutex_ while holding fd_mutex_.
   mutable std::mutex mutex_;
   std::map<std::pair<ChannelType, std::string>, ChannelPtr> channels_;
 
@@ -117,7 +121,7 @@ class ChannelManager {
   std::thread msg_receiver_;
   aclrtContext aclrt_context_{nullptr};
 
-  std::function<Status(const std::string &, int32_t)> disconnect_callback_;
+  std::function<Status(const ChannelPtr &, int32_t)> disconnect_callback_;
   std::function<void(const RequestDisconnectResp &)> disconnect_response_callback_;
   bool auto_connect_{false};
 };
