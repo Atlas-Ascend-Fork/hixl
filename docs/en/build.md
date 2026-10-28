@@ -209,6 +209,7 @@ During compilation, HIXL depends on the following third-party open-source softwa
 Run the following commands to download the source code of this repository:
 ```bash
 git clone https://gitcode.com/cann/hixl.git
+cd hixl
 ```
 
 > [!NOTE] Note
@@ -220,6 +221,8 @@ If your build environment cannot access the Internet, you cannot download code v
 - Connect to the offline environment and upload the source code to the specified directory. If you download a compressed package, decompress it.
 
 ### Compile Source Code
+
+Run the build commands below from the HIXL source root. For an offline archive, enter its extracted source directory first.
 
 - If your build environment can access the Internet, the compilation process will automatically download the required third-party open-source software listed above. Run the following command to perform the compilation:
 
