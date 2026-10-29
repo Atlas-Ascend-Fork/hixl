@@ -290,7 +290,7 @@ Status LinkLlmClusters(const std::vector<ClusterInfo> &clusters, std::vector<Sta
   <!-- end id15 -->
 
   ```sh
-  export PATH=$PATH:{hccn_tool_install_path}
+  export PATH=$PATH:${hccn_tool_install_path}
   ```
   <!-- end id13 -->
 

@@ -430,7 +430,7 @@ local_comm_res = '''{
 <!-- npu="910b" id8 -->
 Atlas A2系列产品场景下，配置version为"1.0"时，仅需配置ranktable中当前llm datadist所使用Device信息，无需配置ranktable中的server_count和rank_id字段。ranktable具体信息请参见《[HCCL集合通信库](https://gitcode.com/cann/hccl/blob/9.2.0/docs/zh/user_guide/README.md)》。配置示例如下。
 
-```sh
+```json
 {
     "server_list": [
         {
@@ -438,7 +438,7 @@ Atlas A2系列产品场景下，配置version为"1.0"时，仅需配置ranktable
                 {
                     "device_id": "0",
                     "device_ip": "x.x.x.x"
-                },
+                }
             ],
             "server_id": "xxxx"
         }
@@ -458,7 +458,7 @@ local_comm_res = ""
 <!-- npu="A3" id9 -->
 Atlas A3系列产品场景下，配置version为"1.2"时，仅需配置ranktable中当前llm datadist所使用Device信息，无需配置ranktable中的server_count和rank_id字段。ranktable具体信息请参见《[HCCL集合通信库](https://gitcode.com/cann/hccl/blob/9.2.0/docs/zh/user_guide/README.md)》。配置示例如下。
 
-```sh
+```json
 {
     "server_list": [
         {
@@ -466,23 +466,27 @@ Atlas A3系列产品场景下，配置version为"1.2"时，仅需配置ranktable
                 {
                     "device_id": "0",
                     "device_ip": "x.x.x.x"
-                },
+                }
             ],
             "server_id": "xxxx"
         }
     ],
      "super_pod_list": [
         {
-            "super_pod_id": "0",          // 超节点唯一标识
-            "server_list": [              // 超节点内的AI Server列表
-                {"server_id": "xxxx"}  // server_id为Server标识，与"server_list"中的server_id对应
+            "super_pod_id": "0",
+            "server_list": [
+                {"server_id": "xxxx"}
             ]
-        },
-    ]
+        }
+    ],
     "status": "completed",
     "version": "1.2"
 }
 ```
+
+- super_pod_id：超节点唯一标识
+- server_list：超节点内的AI Server列表
+- server_id：server_id为Server标识，与"server_list"中的server_id对应
 <!-- end id9 -->
 
 该字段可以配置为空，示例如下。

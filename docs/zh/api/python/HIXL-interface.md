@@ -524,7 +524,7 @@ ret = engine.connect("127.0.0.1:16001", timeout_in_millis=5000)
   <!-- end id20 -->
 
   ```sh
-  export PATH=$PATH:{hccn_tool_install_path}
+  export PATH=$PATH:${hccn_tool_install_path}
   ```
   <!-- end id18 -->
 

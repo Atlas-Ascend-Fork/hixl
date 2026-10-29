@@ -552,7 +552,7 @@ Status Connect(const AscendString &remote_engine, int32_t timeout_in_millis = 10
   <!-- end id20 -->
 
   ```sh
-  export PATH=$PATH:{hccn_tool_install_path}
+  export PATH=$PATH:${hccn_tool_install_path}
   ```
   <!-- end id18 -->
 

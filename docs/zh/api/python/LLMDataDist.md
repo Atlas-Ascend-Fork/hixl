@@ -184,7 +184,7 @@ link_clusters(clusters: Union[List[LLMClusterInfo], Tuple[LLMClusterInfo]], time
 - 容器场景若未配置local\_comm\_res或配置为空，需在容器内映射“/etc/hccn.conf”文件或者确保默认路径“/usr/local/Ascend/driver/tools”下存在hccn_tool，如果两者都不能满足，则需要用户将hccn_tool所在路径配置到PATH中。配置实例如下，hccn_tool_install_path表示hccn_tool所在路径。
 
     ```sh
-    export PATH=$PATH:{hccn_tool_install_path}
+    export PATH=$PATH:${hccn_tool_install_path}
     ```
 
 <!-- npu="A3,910b" id9 -->
@@ -288,7 +288,7 @@ link(comm_name: str, cluster_rank_info: Dict[int, int], rank_table: str) -> int
 
 如上表格中ranktable具体信息请参见《[HCCL集合通信库](https://gitcode.com/cann/hccl/blob/9.2.0/docs/zh/user_guide/README.md)》。<br>如上表格中rank_table的配置示例如下:
 
-```sh
+```json
 {
     "server_count": "2",
     "server_list": [
@@ -298,7 +298,7 @@ link(comm_name: str, cluster_rank_info: Dict[int, int], rank_table: str) -> int
                     "device_id": "0",
                     "device_ip": "x.x.x.x",
                     "rank_id": "0"
-                },
+                }
             ],
             "server_id": "xxxx"
         },{
@@ -307,7 +307,7 @@ link(comm_name: str, cluster_rank_info: Dict[int, int], rank_table: str) -> int
                     "device_id": "0",
                     "device_ip": "x.x.x.x",
                     "rank_id": "1"
-                },
+                }
             ],
             "server_id": "xxxx"
         }
