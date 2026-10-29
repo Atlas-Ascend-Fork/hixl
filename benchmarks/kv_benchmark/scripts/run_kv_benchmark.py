@@ -287,6 +287,9 @@ def _run_kv_processes(args, bench_bin, devices, model_config, run_id, key_counts
 
 def main():
     args = parse_args()
+    if args.num_processes is not None and args.num_processes <= 0:
+        log.error("[ERROR] --num_processes must be positive, got %s", args.num_processes)
+        return 1
     key_counts = args.key_counts or "16,32,48,64"
     run_id = f"kv_{int(time.time())}_{os.getpid()}"
     platform_id = detect_platform_for_kv(args.platform)
