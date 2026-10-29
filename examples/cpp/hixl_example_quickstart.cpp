@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -24,13 +25,36 @@ using namespace hixl;
 
 namespace {
 constexpr int32_t kDeviceClient = 0;
-constexpr int32_t kDeviceServer = 2;
+constexpr int32_t kDeviceServer = 1;
 constexpr const char *kClientEngine = "127.0.0.1:16000";
 constexpr const char *kServerEngine = "127.0.0.1:16001";
 constexpr int32_t kSocketPort = 17001;
 constexpr int32_t kTimeoutMs = 5000;
 constexpr size_t kBufSize = 1024 * 1024;
 constexpr uint8_t kFillValue = 0x5A;
+
+void PrintUsage(const char *program) {
+  printf("Usage: %s --role=client|server [--device=<id>]\n", program);
+}
+
+bool ParseDeviceId(const std::string &value, int32_t &device) {
+  if (value.empty()) {
+    return false;
+  }
+  int32_t parsed = 0;
+  for (const char ch : value) {
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    const int32_t digit = ch - '0';
+    if (parsed > (std::numeric_limits<int32_t>::max() - digit) / 10) {
+      return false;
+    }
+    parsed = parsed * 10 + digit;
+  }
+  device = parsed;
+  return true;
+}
 
 const char *GetRecentErrMsg() {
   const char *errmsg = aclGetRecentErrMsg();
@@ -150,9 +174,9 @@ void PrepareClientMemAndOp(EngineCtx &ctx) {
   ctx.op.len = kBufSize;
 }
 
-void RunClient() {
+void RunClient(int32_t device) {
   EngineCtx ctx;
-  ctx.device = kDeviceClient;
+  ctx.device = device;
 
   InitEngine(ctx, kClientEngine);
   PrepareClientMemAndOp(ctx);
@@ -171,9 +195,9 @@ void RunClient() {
   Finalize(ctx);
 }
 
-void RunServer() {
+void RunServer(int32_t device) {
   EngineCtx ctx;
-  ctx.device = kDeviceServer;
+  ctx.device = device;
 
   InitEngine(ctx, kServerEngine);
 
@@ -201,6 +225,7 @@ void RunServer() {
 int main(int32_t argc, char **argv) {
   bool is_client = false;
   bool has_role = false;
+  int32_t device = -1;
   for (int32_t i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--role=client") {
@@ -209,20 +234,30 @@ int main(int32_t argc, char **argv) {
     } else if (arg == "--role=server") {
       is_client = false;
       has_role = true;
+    } else if (arg.find("--device=") == 0) {
+      const std::string value = arg.substr(9);
+      if (!ParseDeviceId(value, device)) {
+        printf("[ERROR] Invalid --device value: %s, expected a non-negative integer\n", value.c_str());
+        PrintUsage(argv[0]);
+        return -1;
+      }
     } else {
-      printf("Usage: %s --role=client|server\n", argv[0]);
+      PrintUsage(argv[0]);
       return -1;
     }
   }
   if (!has_role) {
-    printf("Usage: %s --role=client|server\n", argv[0]);
+    PrintUsage(argv[0]);
     return -1;
+  }
+  if (device < 0) {
+    device = is_client ? kDeviceClient : kDeviceServer;
   }
   printf("[INFO] Running as %s\n", is_client ? "client" : "server");
   if (is_client) {
-    RunClient();
+    RunClient(device);
   } else {
-    RunServer();
+    RunServer(device);
   }
   return 0;
 }

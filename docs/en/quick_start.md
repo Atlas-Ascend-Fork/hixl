@@ -33,11 +33,13 @@ Run the following commands in two terminals. Start the server first, and then st
 
 ```bash
 # Terminal 1: server
-./hixl_example_quickstart --role=server
+./hixl_example_quickstart --role=server --device=1
 
 # Terminal 2: client
-./hixl_example_quickstart --role=client
+./hixl_example_quickstart --role=client --device=0
 ```
+
+`--device=<id>` specifies the device ID bound to the current process.
 
 When the following logs appear in the client terminal, the READ transfer and data verification are successful:
 
@@ -59,9 +61,9 @@ The source code of this sample is [examples/cpp/hixl_example_quickstart.cpp](../
 
 ## Default Parameters
 
-The preceding commands do not explicitly specify the device and engine addresses. The sample default values are used:
+If `--device` is omitted, the sample uses the following default devices. The engine addresses always use the following default values:
 
 - The client uses `device 0` by default, and the local engine address is `127.0.0.1:16000`.
-- The server uses `device 2` by default, and the local engine address is `127.0.0.1:16001`.
+- The server uses `device 1` by default, and the local engine address is `127.0.0.1:16001`.
 
 For more parameter descriptions and HIXL sample details, see [HIXL Samples](../../examples/cpp/README_en.md#2-hixl-samples).

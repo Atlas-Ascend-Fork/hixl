@@ -33,11 +33,13 @@ cd build/examples/cpp
 
 ```bash
 # 终端1：server
-./hixl_example_quickstart --role=server
+./hixl_example_quickstart --role=server --device=1
 
 # 终端2：client
-./hixl_example_quickstart --role=client
+./hixl_example_quickstart --role=client --device=0
 ```
+
+`--device=<id>`用于指定当前进程绑定的device id。
 
 client终端出现如下日志时，表示READ传输和数据校验成功：
 
@@ -59,9 +61,9 @@ client终端出现如下日志时，表示READ传输和数据校验成功：
 
 ## 默认参数
 
-上述命令未显式指定device和engine地址，将使用样例默认值：
+如果省略`--device`，device将使用样例默认值；engine地址始终使用以下默认值：
 
 - client默认使用`device 0`，本端engine地址为`127.0.0.1:16000`。
-- server默认使用`device 2`，本端engine地址为`127.0.0.1:16001`。
+- server默认使用`device 1`，本端engine地址为`127.0.0.1:16001`。
 
 更多参数含义和HIXL样例说明，可参考[examples/cpp HIXL样例](../../examples/cpp/README.md#2-hixl样例)。
