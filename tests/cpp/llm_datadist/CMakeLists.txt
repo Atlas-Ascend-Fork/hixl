@@ -24,6 +24,7 @@ set(LLM_DATADIST_TEST_FILES
         transfer_request_validation_unittest.cc
         send_state_unittest.cc
         msg_handler_plugin_unittest.cc
+        llm_datadist_v2_wrapper_unittest.cc
 )
 set(LLM_DATADIST_STUB_SRC_FILES
         "${HIXL_CODE_DIR}/tests/depends/llm_datadist/src/data_cache_engine_test_helper.cc"
@@ -62,6 +63,7 @@ add_executable(llm_datadist_test
         ${LLM_DATADIST_TEST_FILES}
         ${LLM_DATADIST_STUB_SRC_FILES}
         ${LLM_V2_SRC_LIST}
+        "${HIXL_CODE_DIR}/src/python/llm_wrapper/llm_datadist_v2_wrapper.cc"
         )
 
 target_compile_definitions(llm_datadist_test PRIVATE
@@ -78,6 +80,7 @@ target_include_directories(llm_datadist_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${HIXL_CODE_DIR}/include
         ${HIXL_CODE_DIR}/src/llm_datadist
+        ${HIXL_CODE_DIR}/src/python/llm_wrapper
         ${HIXL_CODE_DIR}/src/hixl
         ${HIXL_CODE_DIR}/src/hixl/common
         ${HIXL_CODE_DIR}/src/hixl/proxy

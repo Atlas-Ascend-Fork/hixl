@@ -97,8 +97,11 @@ std::pair<ge::Status, uint32_t> LLMDataDistV2Wrapper::QueryRegisterMemStatus(uin
   if (llm_data_dist == nullptr) {
     return {ge::FAILED, 0};
   }
-  RegisterMemoryStatus status;
+  RegisterMemoryStatus status{};
   auto ret = llm_data_dist->QueryRegisterMemStatus(comm_id, status);
+  if (ret != ge::SUCCESS) {
+    return {ret, 0U};
+  }
   return {ret, static_cast<uint32_t>(status)};
 }
 
