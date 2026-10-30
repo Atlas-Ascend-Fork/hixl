@@ -18,10 +18,15 @@ from unittest.mock import MagicMock, patch
 from llm_datadist.utils.utils import (check_uint64, check_int64,check_int32,
                                       check_uint32, check_list_int32, check_uint16, check_uint8,
                                       check_dict, check_isinstance)
-from llm_datadist.v2.llm_types import (CacheDesc, DataType, Placement, Cache, CacheKeyByIdAndIndex,
-                                      TransferConfig, TransferWithCacheKeyConfig, LayerSynchronizer, CacheTask)
-from llm_datadist.v2.llm_utils import (pack_cache_desc, TransferCacheParameters, TransferCacheJob,
-                                     TransferAsyncThread, transfer_cache_async)
+from llm_datadist.v2.cache_manager import CacheManager
+from llm_datadist.v2.llm_types import (
+    Cache, CacheDesc, DataType, Placement, CacheKeyByIdAndIndex,
+    TransferConfig, TransferWithCacheKeyConfig, LayerSynchronizer, CacheTask,
+)
+from llm_datadist.v2.llm_utils import (
+    pack_cache_desc, TransferCacheParameters, TransferCacheJob,
+    TransferAsyncThread, transfer_cache_async,
+)
 from llm_datadist.status import LLMException, LLMStatusCode
 
 
@@ -79,6 +84,90 @@ class TensorUt(unittest.TestCase):
         cache_desc = CacheDesc(1, [2, 3], DataType.DT_INT8, Placement.DEVICE, batch_dim_index=1)
         self.assertEqual(pack_cache_desc(cache_desc), (1, DataType.DT_INT8.value, -1, 1, [2, 3],
                                                         Placement.DEVICE.value, False))
+
+    def test_cache_desc_shape_is_defensive_copy(self):
+        input_shape = [2, 4]
+        cache_desc = CacheDesc(1, input_shape, DataType.DT_INT8, Placement.DEVICE)
+
+        input_shape[0] = 3
+        exposed_shape = cache_desc.shape
+        exposed_shape[1] = 8
+
+        self.assertEqual(cache_desc.shape, [2, 4])
+        self.assertEqual(cache_desc.batch_size, 2)
+
+    def test_cache_desc_update_dim_refreshes_cached_values(self):
+        cache_desc = CacheDesc(1, [2, 4], DataType.DT_INT8, Placement.DEVICE)
+        self.assertEqual(cache_desc.size, 8)
+
+        cache_desc.update_dim(0, 3)
+        self.assertEqual(cache_desc.batch_size, 3)
+        self.assertEqual(cache_desc.size, 12)
+
+        cache_desc.update_dim(1, 8)
+        self.assertEqual(cache_desc.batch_size, 3)
+        self.assertEqual(cache_desc.size, 24)
+
+    def test_cache_desc_update_dim_rejects_nonpositive_batch_size(self):
+        cache_desc = CacheDesc(1, [2, 4], DataType.DT_INT8, Placement.DEVICE)
+
+        with self.assertRaises(LLMException):
+            cache_desc.update_dim(0, 0)
+        with self.assertRaises(ValueError):
+            cache_desc.update_dim(0, -1)
+
+        self.assertEqual(cache_desc.shape, [2, 4])
+        self.assertEqual(cache_desc.batch_size, 2)
+
+    def test_cache_desc_update_dim_rejects_invalid_index(self):
+        cache_desc = CacheDesc(1, [2, 4], DataType.DT_INT8, Placement.DEVICE)
+
+        for invalid_index in (-1, 2):
+            with self.subTest(dim_index=invalid_index):
+                with self.assertRaises(LLMException):
+                    cache_desc.update_dim(invalid_index, 3)
+
+        with self.assertRaises(TypeError):
+            cache_desc.update_dim(True, 3)
+
+        self.assertEqual(cache_desc.shape, [2, 4])
+        self.assertEqual(cache_desc.batch_size, 2)
+
+    def test_cache_manager_uses_updated_descriptor_shape(self):
+        class NativeStub:
+            def __init__(self):
+                self.block_size = None
+
+            @staticmethod
+            def dict_to_vector(mapping):
+                return list(mapping.items())
+
+            def swap_blocks_v2(self, src, dst, block_size, swap_type, mapping):
+                del src, dst, swap_type, mapping
+                self.block_size = block_size
+                return 0
+
+        native = NativeStub()
+        manager = CacheManager(native, {})
+        src_desc = CacheDesc(1, [2, 4], DataType.DT_INT8, Placement.DEVICE)
+        dst_desc = CacheDesc(1, [2, 4], DataType.DT_INT8, Placement.HOST)
+        src_desc.update_dim(0, 3)
+        dst_desc.update_dim(0, 3)
+        manager.swap_blocks(
+            Cache(1, src_desc, [101], None, False, True),
+            Cache(2, dst_desc, [202], None, False, True),
+            {2: 2},
+        )
+        self.assertEqual(native.block_size, 4)
+
+        src_desc.update_dim(1, 8)
+        dst_desc.update_dim(1, 8)
+        manager.swap_blocks(
+            Cache(3, src_desc, [303], None, False, True),
+            Cache(4, dst_desc, [404], None, False, True),
+            {0: 0},
+        )
+        self.assertEqual(native.block_size, 8)
 
 
 class AsyncCacheBatchBoundsUt(unittest.TestCase):

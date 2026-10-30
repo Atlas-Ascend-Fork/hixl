@@ -45,6 +45,8 @@ __init__(self,
 | seq_len_dim_index | int | 表示shape中seq_len所在维度。默认值-1，表示未配置。 |
 | kv_tensor_format | str | 表示cache的format。默认不配置。 |
 
+`shape` 属性返回当前 shape 的副本。修改该列表不会改变 CacheDesc；请使用 `update_dim(dim_index, dim_value)` 更新维度。更新 batch 维时，`dim_value` 必须大于 0。
+
 ## 调用示例
 
 ```python
