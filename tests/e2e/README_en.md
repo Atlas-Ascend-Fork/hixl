@@ -4,7 +4,7 @@ End-to-end smoke test suite for validating HIXL (Huawei Xfer Library) transport 
 
 ## Prerequisites
 
-- **Hardware**: At least 2 NPU cards (Atlas A2/A3)
+- **Hardware**: At least 2 visible NPU cards. Product support depends on the selected protocol and test scenario; Atlas A2/A3 scenarios and the VMM scenario on Ascend 950PR/Ascend 950DT must meet their respective runtime requirements
 - **Driver**: Ascend NPU Driver >= 25.5.0
 - **CANN**: CANN >= 9.1.0
 - **Python**: Python 3.10+
@@ -90,7 +90,36 @@ Remote Real (devices [1,2,3,0])     Remote Dummy (devices [1,2,3,0])
 3. D2RH WRITE: Local device (0xAA) → Remote host
 4. D2RH READ: Remote host → Local device (expects 0xAA)
 
-### 4. Scale Reconnect (`test_scale_reconnect.py`)
+### 4. Dummy-Real VMM Shared Memory Mode (`test_dummy_real_shared_mem_vmm.py`)
+
+The original IPC test is retained. This separate scenario uses VMM interfaces to share memory between processes on the same card and then perform transfers across cards.
+It requires an importable pyACL module (`import acl`) and CANN/driver support for VMM allocation, shared handle export/import, mapping, and access permissions.
+The devices must also support the selected communication protocol; the general version requirements do not imply support for this scenario on every product.
+
+**Test Case**:
+
+- `test_normal_full_flow_d2rd_d2rh_read`: Runs D2RD WRITE, D2RD READ, D2RH WRITE, and D2RH READ in one test function, so pytest reports `1 passed` when the entire flow succeeds.
+
+**Roles of the Four Processes**:
+
+- Local Dummy: Allocates VMM device memory, fills it with `0xAA`, exports shared handles, and verifies both READ results.
+- Local Real: Imports and maps Local Dummy's allocations in another process on the same card, registers memory, connects, and initiates transfers.
+- Remote Dummy: Allocates VMM device memory, fills it with `0xBB`, exports shared handles, and verifies the D2RD WRITE result.
+- Remote Real: Imports and maps Remote Dummy's allocations in another process on the same card, registers device and host memory, and verifies the D2RH WRITE result.
+
+All processes use the same visible card set. With `ASCEND_RT_VISIBLE_DEVICES=6,7`, logical devices `0,1` map to physical cards `6,7`; the two connections are Local Real card 6 → Remote Real card 7 and card 7 → card 6.
+Shared handles are imported between processes on the same physical card; HIXL transfers data across cards.
+
+**Data Flow and Verification**:
+
+1. D2RD WRITE: Writes `0xAA` from Local device memory to Remote device memory; Remote Dummy verifies the result.
+2. Local Real synchronously zeroes its local mapping and verifies the zero values, then performs D2RD READ; Local Dummy verifies that `0xAA` was read back.
+3. D2RH WRITE: Writes `0xAA` from Local device memory to Remote host memory; Remote Real verifies the result.
+4. Local Real synchronously zeroes the mapping and verifies the zero values again, then performs D2RH READ; Local Dummy verifies that `0xAA` was read back.
+
+The parent receives each stage's verification result and acknowledges success before allowing the next stage to proceed. It also checks the exit status and cleanup results of all four processes; verification failures, VMM release failures, or missing results fail the test.
+
+### 5. Scale Reconnect (`test_scale_reconnect.py`)
 
 Tests large-scale multi-link transport and device flapping reconnection.
 
@@ -135,10 +164,15 @@ python3 -m pytest tests/e2e/test_real_real.py -v -s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ASCEND_RT_VISIBLE_DEVICES` | `0,1,2,3` | Visible NPU device list |
+| `ASCEND_GLOBAL_RESOURCE_CONFIG` | Unconfigured; use underlying defaults | Complete JSON configuration string. For a nonempty value, the shared `create_engine` helper adds the global resource configuration option and passes the value unchanged without merging protocols. Example: `'{"comm_resource_config.protocol_desc":["ub_ctp:device"]}'` |
 | `HIXL_E2E_MIN_NPU` | `2` | Minimum required NPU count |
 | `HIXL_E2E_LINKS_PER_DEV` | `250` | Logical links per device (scale-reconnect) |
 | `HIXL_E2E_TRANSFER_SIZE` | `4096` | Transfer size per link (scale-reconnect) |
 | `HIXL_E2E_REGISTER_SIZE` | `268435456` (256MB) | Registered memory size (scale-reconnect) |
+
+When the variable is unset or an empty string, the shared E2E helper `create_engine` omits the global resource configuration option. The underlying library handles default communication resources according to the device platform, topology, and capabilities; the test helper does not specify a default protocol list. Leaving the protocol unspecified therefore does not guarantee a particular communication path. To validate VMM + Device UB, explicitly configure `ub_ctp:device` as shown below.
+
+Tests that explicitly pass `options` use those supplied options; the environment variable does not override them.
 
 ### Examples
 
@@ -146,6 +180,11 @@ python3 -m pytest tests/e2e/test_real_real.py -v -s
 # Run tests with 4 cards
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 python3 -m pytest tests/e2e/ -v
+
+# Run the complete VMM test on two cards with VMM and Device UB support
+ASCEND_RT_VISIBLE_DEVICES=6,7 \
+ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["ub_ctp:device"]}' \
+python3 -m pytest tests/e2e/test_dummy_real_shared_mem_vmm.py -v -s -rs
 
 # Custom link parameters
 export HIXL_E2E_LINKS_PER_DEV=500
@@ -186,11 +225,15 @@ port = BASE_PORT + scenario_idx * 100 + role_offset + dev_id + engine_offset
 - **Device Memory**: Allocated via `torch.zeros(..., device="npu")`
 - **Host Memory**: Allocated via `torch.empty(...).pin_memory()` for page-aligned memory
 - **IPC Sharing**: Cross-process sharing via `acl.rt.ipc_mem_get_export_key` / `ipc_mem_import_by_key`
+- **VMM Sharing**: The VMM test aligns physical allocation sizes to the allocation granularity, reserves VA, maps memory, and sets access permissions. Other processes import shared handles on the same card; the valid data size used for registration and transfer remains 64 KiB per buffer
 
 ### Resource Cleanup Order
 
 1. **Client side**: `disconnect` → `deregister` → `finalize`
 2. **Server side**: `deregister` → `finalize`
+
+The VMM test stops Local Real first, then Remote Real, and finally signals both Dummies to release their resources.
+Each Real releases its imported VMM mappings after deregistering memory and finalizing engines, then the Dummies release the original allocations. Each VMM allocation is cleaned up in this order: unmap → release VA → free the physical memory handle.
 
 ## Debugging Tips
 
@@ -253,6 +296,7 @@ tests/e2e/
 ├── test_real_real.py                # Real-Real mode tests
 ├── test_standalone_same_host.py     # Standalone same-host mode tests
 ├── test_dummy_real_shared_mem.py    # Dummy-Real shared memory mode tests
+├── test_dummy_real_shared_mem_vmm.py # Dummy-Real VMM shared memory mode tests
 ├── test_scale_reconnect.py          # Scale reconnect tests
 ├── README.md                        # Chinese documentation
 └── README_en.md                     # This document

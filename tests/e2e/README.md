@@ -4,7 +4,7 @@
 
 ## 前置条件
 
-- **硬件**: 至少 2 张 NPU 卡（Atlas A2/A3）
+- **硬件**: 至少 2 张可见 NPU 卡，具体产品支持取决于所选协议和测试场景；Atlas A2/A3 场景与 Ascend 950PR/Ascend 950DT 的 VMM 场景需满足各自的运行要求
 - **驱动**: Ascend NPU Driver >= 25.5.0
 - **CANN**: CANN >= 9.1.0
 - **Python**: Python 3.10+
@@ -90,7 +90,36 @@ Remote Real (devices [1,2,3,0])     Remote Dummy (devices [1,2,3,0])
 3. D2RH WRITE: Local device (0xAA) → Remote host
 4. D2RH READ: Remote host → Local device（期望 0xAA）
 
-### 4. 大规模连接与重连 (`test_scale_reconnect.py`)
+### 4. Dummy-Real VMM 共享内存模式 (`test_dummy_real_shared_mem_vmm.py`)
+
+保留原 IPC 用例，另外通过 VMM 接口验证同卡跨进程共享内存后的跨卡通信。
+该场景需要可导入的 pyACL（`import acl`），以及支持 VMM 分配、共享句柄导出/导入、映射和访问权限设置的 CANN 与驱动。
+还需确认设备支持所选通信协议；通用前置条件中的版本要求不代表所有产品都支持该场景。
+
+**测试用例**:
+
+- `test_normal_full_flow_d2rd_d2rh_read`: 在一个测试函数中完成 D2RD WRITE、D2RD READ、D2RH WRITE 和 D2RH READ，因此全部通过时 pytest 显示 `1 passed`。
+
+**四个进程的职责**:
+
+- Local Dummy：分配 VMM device memory，填充 `0xAA`，导出共享句柄，并校验两次 READ 的结果。
+- Local Real：在同卡其他进程中导入并映射 Local Dummy 的分配，注册内存、建链并发起传输。
+- Remote Dummy：分配 VMM device memory，填充 `0xBB`，导出共享句柄，并校验 D2RD WRITE 的结果。
+- Remote Real：在同卡其他进程中导入并映射 Remote Dummy 的分配，注册 device 和 host memory，并校验 D2RH WRITE 的结果。
+
+所有进程使用同一组可见卡。以 `ASCEND_RT_VISIBLE_DEVICES=6,7` 为例，进程内逻辑设备 `0,1` 对应物理卡 `6,7`；两条连接分别为 Local Real 的卡 6 → Remote Real 的卡 7，以及卡 7 → 卡 6。
+共享句柄的导入发生在同一物理卡的不同进程间，跨卡数据由 HIXL 传输。
+
+**数据流与校验**:
+
+1. D2RD WRITE：Local device 的 `0xAA` 写入 Remote device，Remote Dummy 校验。
+2. Local Real 同步清零本地映射并确认零值，执行 D2RD READ，Local Dummy 校验读回 `0xAA`。
+3. D2RH WRITE：Local device 的 `0xAA` 写入 Remote host，Remote Real 校验。
+4. Local Real 再次同步清零并确认零值，执行 D2RH READ，Local Dummy 校验读回 `0xAA`。
+
+父进程逐阶段接收校验结果，确认成功后才允许下一阶段继续。最终还会检查四个进程的退出状态和清理结果；校验失败、VMM 释放失败或缺少结果均使测试失败。
+
+### 5. 大规模连接与重连 (`test_scale_reconnect.py`)
 
 测试大规模多链路传输和设备抖动重连。
 
@@ -135,10 +164,15 @@ python3 -m pytest tests/e2e/test_real_real.py -v -s
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `ASCEND_RT_VISIBLE_DEVICES` | `0,1,2,3` | 可见的 NPU 设备列表 |
+| `ASCEND_GLOBAL_RESOURCE_CONFIG` | 未配置，使用底层默认行为 | 完整 JSON 配置字符串，非空时由公共 `create_engine` 添加全局资源配置选项并原样传入，不进行协议合并。例如 `'{"comm_resource_config.protocol_desc":["ub_ctp:device"]}'` |
 | `HIXL_E2E_MIN_NPU` | `2` | 最少需要的 NPU 数量 |
 | `HIXL_E2E_LINKS_PER_DEV` | `250` | 每个设备的逻辑链路数（scale-reconnect） |
 | `HIXL_E2E_TRANSFER_SIZE` | `4096` | 每个链路的传输大小（scale-reconnect） |
 | `HIXL_E2E_REGISTER_SIZE` | `268435456` (256MB) | 注册的内存大小（scale-reconnect） |
+
+未设置或设置为空字符串时，E2E 公共工具函数 `create_engine` 不传全局资源配置选项，由底层按设备平台、拓扑和能力处理默认通信资源，测试工具不指定默认协议列表。因此，未指定协议时不保证使用某一条通信路径；验证 VMM + Device UB 时，应按下方示例显式配置 `ub_ctp:device`。
+
+显式传入 `options` 的用例使用其传入配置，不使用该环境变量覆盖。
 
 ### 示例
 
@@ -146,6 +180,11 @@ python3 -m pytest tests/e2e/test_real_real.py -v -s
 # 使用 4 张卡运行测试
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 python3 -m pytest tests/e2e/ -v
+
+# 在支持 VMM 和 Device UB 的环境中使用两张卡运行完整 VMM 用例
+ASCEND_RT_VISIBLE_DEVICES=6,7 \
+ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["ub_ctp:device"]}' \
+python3 -m pytest tests/e2e/test_dummy_real_shared_mem_vmm.py -v -s -rs
 
 # 自定义链路参数
 export HIXL_E2E_LINKS_PER_DEV=500
@@ -186,11 +225,15 @@ port = BASE_PORT + scenario_idx * 100 + role_offset + dev_id + engine_offset
 - **Device Memory**: 使用 `torch.zeros(..., device="npu")` 分配
 - **Host Memory**: 使用 `torch.empty(...).pin_memory()` 分配页对齐内存
 - **IPC 共享**: 使用 `acl.rt.ipc_mem_get_export_key` / `ipc_mem_import_by_key` 跨进程共享
+- **VMM 共享**: VMM 用例按分配粒度对齐物理内存大小，为其保留 VA、建立映射并设置访问权限，通过可共享句柄在同卡其他进程中导入；注册和传输使用的有效数据大小仍为每块 64 KiB
 
 ### 资源清理顺序
 
 1. **Client 端**: `disconnect` → `deregister` → `finalize`
 2. **Server 端**: `deregister` → `finalize`
+
+VMM 用例先停止 Local Real，再停止 Remote Real，最后通知两个 Dummy 释放资源。
+Real 在解除注册并结束引擎后释放导入的 VMM 映射，Dummy 随后释放原始分配；每个 VMM 分配按解除映射 → 释放 VA → 释放物理内存句柄的顺序清理。
 
 ## 调试技巧
 
@@ -253,6 +296,7 @@ tests/e2e/
 ├── test_real_real.py                # Real-Real 模式测试
 ├── test_standalone_same_host.py     # Standalone 同主机模式测试
 ├── test_dummy_real_shared_mem.py    # Dummy-Real 共享内存模式测试
+├── test_dummy_real_shared_mem_vmm.py # Dummy-Real VMM 共享内存模式测试
 ├── test_scale_reconnect.py          # 大规模连接与重连测试
 └── README.md                        # 本文档
 

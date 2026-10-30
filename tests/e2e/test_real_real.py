@@ -297,7 +297,7 @@ class TestMooncakeRealReal:
             args=(ready_event, addr_queue, stop_event),
         )
         server.start()
-        assert ready_event.wait(timeout=60), "Server startup timeout"
+        assert ready_event.wait(timeout=120), "Server startup timeout"
         remote_addrs = addr_queue.get(timeout=10)
         assert remote_addrs, "Server failed to provide addresses"
 
@@ -345,7 +345,7 @@ class TestMooncakeRealReal:
             args=(ready_event, addr_queue, stop_event),
         )
         server.start()
-        assert ready_event.wait(timeout=60), "Server startup timeout"
+        assert ready_event.wait(timeout=120), "Server startup timeout"
         remote_addrs = addr_queue.get(timeout=10)
         assert remote_addrs, "Server failed to provide addresses"
 

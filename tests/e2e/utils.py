@@ -137,10 +137,10 @@ def create_engine(device_id, endpoint, options=None):
     set_device(device_id)
     engine = hixl.Hixl()
     if options is None:
-        options = {
-            hixl.OPTION_AUTO_CONNECT: "1",
-            hixl.OPTION_GLOBAL_RESOURCE_CONFIG: '{"comm_resource_config.protocol_desc": ["roce:device", "roce:host"]}',
-        }
+        options = {hixl.OPTION_AUTO_CONNECT: "1"}
+        env_config = os.environ.get("ASCEND_GLOBAL_RESOURCE_CONFIG")
+        if env_config:
+            options[hixl.OPTION_GLOBAL_RESOURCE_CONFIG] = env_config
     ret = engine.initialize(endpoint, options)
     if ret != hixl.SUCCESS:
         raise RuntimeError(

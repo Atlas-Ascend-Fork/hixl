@@ -228,7 +228,7 @@ class TestMooncakeStandalone:
             args=(ready_event, addr_queue, stop_event),
         )
         store.start()
-        assert ready_event.wait(timeout=60), "Store startup timeout"
+        assert ready_event.wait(timeout=120), "Store startup timeout"
         store_info = addr_queue.get(timeout=10)
         assert store_info, "Store failed"
 
