@@ -152,7 +152,7 @@ options[hixl::OPTION_ENABLE_USE_FABRIC_MEM] = "1";
   - 所有使用该配置的位置需填写相同的值。
   - 并发场景下建议增大 `${BUFFER_NUM}`。
   <!-- npu="A3,910b" id51 -->
-  - 配置为 `"0:0"` 且hcomm/toolkit版本大于等于9.1.0时，HIXL使用HixlCS能力进行建链，没有链路上限限制。
+  - 配置为 `"0:0"` 且hcomm/toolkit版本大于等于9.1.0时，HIXL使用HixlCS能力进行建链，默认不限制链路数，可通过 channel_pool.max_channel 限制本端作为 client 主动建出的链路数。
   - Atlas A2系列产品场景下，若不配置本选项，Server侧采用HCCS传输协议时仅支持D2D。
   <!-- end id51 -->
 - 示例：
@@ -224,7 +224,7 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
 | fabric_memory.enable_aicpu_unfold | 布尔 | 可选 | 是否由AICPU展开，详见 [fabric_memory](#grc_fabric_memory)。 |
 | connect_pool.thread_num | 数字或数字字符串 | 可选 | 连接池线程数量，详见 [connect_pool](#grc_connect_pool)。 |
 | connect_pool.task_queue_capacity | 数字或数字字符串 | 可选 | 连接池任务队列容量，详见 [connect_pool](#grc_connect_pool)。 |
-| channel_pool.max_channel | 数字或数字字符串 | 可选 | 最大链路个数，仅通信域模式，详见 [channel_pool](#grc_channel_pool)。 |
+| channel_pool.max_channel | 数字或数字字符串 | 可选 | 最大链路个数，详见 [channel_pool](#grc_channel_pool)。 |
 | channel_pool.high_waterline | 数字或数字字符串 | 可选 | 链路回收高水位阈值，仅通信域模式，详见 [channel_pool](#grc_channel_pool)。 |
 | channel_pool.low_waterline | 数字或数字字符串 | 可选 | 链路回收低水位阈值，仅通信域模式，详见 [channel_pool](#grc_channel_pool)。 |
 | tls_config.cert_file | 字符串 | TLS启用时必选 | 控制面TCP TLS证书文件路径，详见 [tls_config](#grc_tls_config)。 |
@@ -245,7 +245,7 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
 - `fabric_memory.*`：仅支持Atlas A3系列产品。
 <!-- end id64 -->
 <!-- npu="A3,910b" id65 -->
-- `channel_pool.*`：仅通信域模式下支持Atlas A2系列产品、Atlas A3系列产品。
+- `channel_pool.high_waterline`、`channel_pool.low_waterline`：仅通信域模式下支持Atlas A2系列产品、Atlas A3系列产品。
 <!-- end id65 -->
 
 **详细说明与使用示例**
@@ -411,15 +411,17 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
 }
 ```
 
-**链路池（`channel_pool.*`，仅通信域模式）**
+**链路池（`channel_pool.*`）**
 
 <a id="grc_channel_pool"></a>
 
-- **max_channel**：最大链路个数，取值范围：(0, 512]之间的整数，默认值512。
-- **high_waterline**：链路回收的高水位阈值，取值范围：(0, 1)之间的小数，需要和channel_pool.low_waterline同时配置。
-- **low_waterline**：链路回收的低水位阈值，即回收后保留的链路数比例，取值范围：(0, 1)之间的小数，需要小于高水位、与高水位同时配置。
+- **max_channel**：最大链路个数，取值范围：(0, 512]之间的整数，通信域模式下默认值512，HIXL_CS模式下不配置时不限制链路个数。
+- **high_waterline**：链路回收的高水位阈值，取值范围：(0, 1)之间的小数，需要和channel_pool.low_waterline同时配置，仅通信域模式。
+- **low_waterline**：链路回收的低水位阈值，即回收后保留的链路数比例，取值范围：(0, 1)之间的小数，需要小于高水位、与高水位同时配置，仅通信域模式。
 
-链路池工作时，当链路数达到高水位阈值，选取 (当前链路数 - 低水位阈值对应的链路数) 条链路进行销毁（其中正在传输的链路不会被销毁）。相关参数计算如下：
+HIXL_CS模式下只需配置max_channel，高低水位配置不生效。此时本端作为client最多保留max_channel条链路。已建立链路与在途建链合计达到max_channel时，建新链路前会销毁最久未使用的空闲链路（正在传输的链路不会被销毁）。如果池内链路全部在传输，或在途建链已占满名额，则本次建链返回RESOURCE_EXHAUSTED。显式 Connect 会重建已销毁的链路。
+
+通信域模式下链路池工作时，当链路数达到高水位阈值，选取 (当前链路数 - 低水位阈值对应的链路数) 条链路进行销毁（其中正在传输的链路不会被销毁）。相关参数计算如下：
 
 ```sh
 高水位线对应的链路数 = max(1, floor(channel_pool.max_channel × channel_pool.high_waterline))
@@ -428,7 +430,7 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
 
 在以下配置示例中，高水位对应的链路数=3，低水位对应的链路数=1。每次建链前检查当前链路数是否已达到3条，若已达到，则选取 (当前链路数 - 1) 条链路进行销毁（其中正在传输的链路不会被销毁）。
 
-使用示例：
+通信域模式使用示例：
 
 ```sh
 {
@@ -438,11 +440,18 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
 }
 ```
 
+HIXL_CS模式使用示例，本端最多与100个远端engine保持链路：
+
+```cpp
+options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel": "100"})";
+```
+
 - 链路池约束：
   - 启用链路池机制时，集群内所有HIXL Engine均需配置本选项。
-  - 调用transfer_sync或transfer_async接口时，若不存在可用链路，链路池会自动执行建链操作。
+  - 调用TransferSync或TransferAsync接口时，若不存在可用链路，链路池会自动执行建链操作。
   - 链路池机制会引入额外的传输与建链开销，可能导致性能下降。
-  - 链路池仅通信域模式下支持配置，HIXL_CS等其他模式下不支持。
+  - 高低水位回收仅通信域模式下支持配置，HIXL_CS等其他模式下只支持max_channel。
+  - HIXL_CS模式下链路池只约束本端作为client建立的链路，不约束本端作为server接受的链路。
 
 **本地通信资源文件（与 [LocalCommRes](#option_local_comm_res) 配套）**
 
@@ -509,7 +518,7 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
   <!-- npu="A3,910b" id62 -->
   - `"1.0"` 或 `"1.2"`（ranktable格式）：使用集合通信的通信域方式进行建链，建议单卡建链数量不超过512。仅需配置ranktable中当前llm datadist所使用的Device信息，无需配置 `server_count` 和 `rank_id` 字段。
   <!-- end id62 -->
-  - `"1.3"`（推荐）：使用HixlCS能力进行建链，没有链路上限限制。仅配置 `version` 字段即可，其余字段自动生成。需要HDK版本大于等于25.5.0且toolkit包版本大于等于9.1.0。
+  - `"1.3"`（推荐）：使用HixlCS能力进行建链，默认不限制链路数，可通过 channel_pool.max_channel 限制本端作为 client 主动建出的链路数。仅配置 `version` 字段即可，其余字段自动生成。需要HDK版本大于等于25.5.0且toolkit包版本大于等于9.1.0。
 
 自动生成的适用产品与限制：
 
@@ -832,7 +841,7 @@ Status Connect(const AscendString &remote_engine, int32_t timeout_in_millis = 10
   - Atlas A3系列产品
   <!-- end id17 -->
   <!-- end id15 -->
-- 当OPTION_LOCAL_COMM_RES配置version为"1.3"时（推荐使用，需要HDK版本大于等于25.5.0且toolkit包版本大于等于9.1.0），使用HixlCS能力进行建链，没有链路上限限制。
+- 当OPTION_LOCAL_COMM_RES配置version为"1.3"时（推荐使用，需要HDK版本大于等于25.5.0且toolkit包版本大于等于9.1.0），使用HixlCS能力进行建链，默认不限制链路数，可通过 channel_pool.max_channel 限制本端作为 client 主动建出的链路数。
 - 建议超时时间配置200ms以上。
 - 调用该接口前需提前注册所有本地以及远端内存，否则建链后注册不支持远端访问。
   <!-- npu="A3,910b" id18 -->

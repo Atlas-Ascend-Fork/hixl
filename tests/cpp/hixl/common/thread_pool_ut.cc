@@ -22,6 +22,13 @@ namespace {
 constexpr uint32_t kTestTimeoutMs = 400U;
 constexpr uint32_t kTaskDurationMs = 100U;
 
+// 两个线程可能同时读到旧的最大值，后写入的较小值会把较大值盖掉。
+void RecordMaxConcurrent(std::atomic<uint32_t> &max_concurrent, uint32_t current) {
+  uint32_t observed = max_concurrent.load();
+  while (current > observed && !max_concurrent.compare_exchange_weak(observed, current)) {
+  }
+}
+
 class ThreadPoolTest : public ::testing::Test {
  protected:
   struct BlockingTaskContext {
@@ -50,9 +57,7 @@ class ThreadPoolTest : public ::testing::Test {
   std::function<void()> CreateBlockingTask(BlockingTaskContext &ctx) {
     return [&ctx]() {
       uint32_t current = ctx.concurrent_count.fetch_add(1) + 1U;
-      if (current > ctx.max_concurrent.load()) {
-        ctx.max_concurrent.store(current);
-      }
+      RecordMaxConcurrent(ctx.max_concurrent, current);
       ctx.tasks_started.fetch_add(1);
       ctx.cv.notify_one();
 
@@ -152,9 +157,7 @@ TEST_F(ThreadPoolTest, TemporaryThreadExitsAfterTask) {
   std::atomic<uint32_t> max_concurrent{0};
   pool.commit([&ctx, &max_concurrent]() {
     uint32_t current = ctx.concurrent_count.fetch_add(1) + 1U;
-    if (current > max_concurrent.load()) {
-      max_concurrent.store(current);
-    }
+    RecordMaxConcurrent(max_concurrent, current);
     ctx.concurrent_count.fetch_sub(1);
   });
 
@@ -204,9 +207,7 @@ TEST_F(ThreadPoolTest, MultipleScaleUpEvents) {
 
   auto temp_task = [&ctx]() {
     uint32_t current = ctx.concurrent_count.fetch_add(1) + 1U;
-    if (current > ctx.max_concurrent.load()) {
-      ctx.max_concurrent.store(current);
-    }
+    RecordMaxConcurrent(ctx.max_concurrent, current);
     ctx.tasks_started.fetch_add(1);
     ctx.cv.notify_one();
     std::this_thread::sleep_for(std::chrono::milliseconds(30));

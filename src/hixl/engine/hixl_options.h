@@ -45,6 +45,7 @@ constexpr const char *kGlobalResCfgTaskStreamNum = "fabric_memory.task_stream_nu
 constexpr const char *kGlobalResCfgEnableAicpuUnfold = "fabric_memory.enable_aicpu_unfold";
 constexpr const char *kGlobalResCfgConnectPoolThreadNum = "connect_pool.thread_num";
 constexpr const char *kGlobalResCfgConnectPoolTaskQueueCapacity = "connect_pool.task_queue_capacity";
+constexpr const char *kGlobalResCfgChannelPoolMaxChannel = "channel_pool.max_channel";
 constexpr const char *kGlobalResCfgLocalCommResPath = "local_comm_res_path";
 constexpr const char *kGlobalResCfgTopoFilePath = "topo_file_path";
 constexpr const char *kGlobalResCfgNicTopoPath = "comm_resource_config.nic_topo_path";
@@ -52,6 +53,11 @@ constexpr const char *kGlobalResCfgNicTopoPath = "comm_resource_config.nic_topo_
 struct ConnectPoolConfig {
   std::optional<int32_t> thread_num;
   std::optional<int32_t> task_queue_capacity;
+};
+
+struct ChannelPoolConfig {
+  // Upper bound of the links a client keeps at the same time; unset means the link count is not capped.
+  std::optional<uint32_t> max_channel;
 };
 
 struct CommResourceConfigDesc {
@@ -72,6 +78,7 @@ struct TransferConfig {
 struct GlobalResourceConfig {
   UbMemoryConfig fabric_memory;
   ConnectPoolConfig connect_pool;
+  ChannelPoolConfig channel_pool;
   CommResourceConfigDesc comm_resource_config;
   TransferConfig transfer_config;
   TlsConfig tls_config;

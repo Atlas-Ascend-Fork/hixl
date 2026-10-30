@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <gtest/gtest.h>
@@ -527,6 +528,59 @@ TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigConnectPoolTaskQueueCapacityTy
   options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"connect_pool.task_queue_capacity":"invalid"})";
   HixlOptions result;
   EXPECT_EQ(HixlOptions::Parse(options, result), PARAM_INVALID);
+}
+
+TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigChannelPoolMaxChannel) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel":"100"})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.GlobalResourceCfg().has_value());
+  ASSERT_TRUE(result.GlobalResourceCfg()->channel_pool.max_channel.has_value());
+  EXPECT_EQ(*result.GlobalResourceCfg()->channel_pool.max_channel, 100U);
+}
+
+TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigChannelPoolMaxChannelNumericType) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel":100})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.GlobalResourceCfg().has_value());
+  EXPECT_EQ(*result.GlobalResourceCfg()->channel_pool.max_channel, 100U);
+}
+
+TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigChannelPoolMaxChannelBoundaries) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel":1})";
+  HixlOptions min_result;
+  EXPECT_EQ(HixlOptions::Parse(options, min_result), SUCCESS);
+  EXPECT_EQ(*min_result.GlobalResourceCfg()->channel_pool.max_channel, 1U);
+
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel":512})";
+  HixlOptions max_result;
+  EXPECT_EQ(HixlOptions::Parse(options, max_result), SUCCESS);
+  EXPECT_EQ(*max_result.GlobalResourceCfg()->channel_pool.max_channel, 512U);
+}
+
+TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigChannelPoolMaxChannelRejectsInvalidValues) {
+  const std::vector<std::string> invalid_configs = {
+      R"({"channel_pool.max_channel":0})", R"({"channel_pool.max_channel":513})",
+      R"({"channel_pool.max_channel":"-1"})", R"({"channel_pool.max_channel":"invalid"})"};
+  for (const auto &config : invalid_configs) {
+    std::map<AscendString, AscendString> options;
+    options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = AscendString(config.c_str());
+    HixlOptions result;
+    EXPECT_EQ(HixlOptions::Parse(options, result), PARAM_INVALID) << "config: " << config;
+  }
+}
+
+TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigWithoutChannelPoolKeepsMaxChannelUnset) {
+  std::map<AscendString, AscendString> options;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"connect_pool.thread_num":4})";
+  HixlOptions result;
+  EXPECT_EQ(HixlOptions::Parse(options, result), SUCCESS);
+  ASSERT_TRUE(result.GlobalResourceCfg().has_value());
+  EXPECT_FALSE(result.GlobalResourceCfg()->channel_pool.max_channel.has_value());
 }
 
 TEST_F(HixlOptionsUTest, ParseGlobalResourceConfigProtocolDesc) {

@@ -176,7 +176,9 @@ class HixlEngine : public hixl::Engine {
   void BuildClientConfig(const AscendString &remote_engine, ClientConfig &config, int32_t timeout_in_millis,
                          bool is_lazy) const;
   void CopyMemInfoListLocked(std::vector<MemHandleInfo> &mem_info_list) const;
-  Status AutoConnect(const AscendString &remote_engine, int32_t timeout_in_millis, ClientPtr &client_ptr);
+  // 已有链路是否占用由 ClientManager 按 max_channel 决定。
+  Status AutoConnect(const AscendString &remote_engine, int32_t timeout_in_millis, ClientPtr &client_ptr,
+                     bool &transfer_use);
   mutable std::shared_mutex mutex_;
 
   std::atomic<bool> is_initialized_;

@@ -11,6 +11,7 @@
 #ifndef CANN_HIXL_SRC_HIXL_ENGINE_HIXL_CLIENT_H_
 #define CANN_HIXL_SRC_HIXL_ENGINE_HIXL_CLIENT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -124,6 +125,22 @@ class HixlClient {
 
   Status CheckAlive();
 
+  /**
+   * @brief 本次传输占用这条链路。只在链路池开启时由 ClientManager 调用。
+   */
+  void AcquireUse();
+
+  /**
+   * @brief 本次传输结束，释放 AcquireUse 加上的占用。
+   */
+  void ReleaseUse();
+
+  /**
+   * @brief 判断链路是否正在传输，用于链路池回收时跳过繁忙链路
+   * @return 占用计数大于 0、有未完成的异步请求，或有其他线程正在操作该链路时返回 true
+   */
+  bool IsBusy() const;
+
   const std::string &GetRemoteEngine() const;
 
  private:
@@ -152,6 +169,8 @@ class HixlClient {
   std::unique_ptr<IClientHandler> client_handler_;
   std::vector<HandlerCreateArgs::EndpointPair> link_pairs_;
   mutable std::mutex mutex_;  // 所有方法串行执行，不支持并发调用
+  // 链路池开启时，一次传输从取到 client 到调用返回之间的占用。未开启时保持 0，不参与判断。
+  std::atomic<uint32_t> use_count_{0};
   std::map<TransferReq, TransferInfo> req_map_;
   GlobalResourceConfig global_config_;
 };

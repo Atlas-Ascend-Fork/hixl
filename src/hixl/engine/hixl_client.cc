@@ -274,6 +274,27 @@ void HixlClient::RemoveTransferReq(const TransferReq &req) {
   req_map_.erase(req);
 }
 
+void HixlClient::AcquireUse() {
+  use_count_.fetch_add(1U, std::memory_order_acq_rel);
+}
+
+void HixlClient::ReleaseUse() {
+  use_count_.fetch_sub(1U, std::memory_order_acq_rel);
+}
+
+bool HixlClient::IsBusy() const {
+  // 加一发生在 ClientManager 锁内。这里用 acquire，淘汰线程再次进这把锁后能看见本次传输已占用。
+  if (use_count_.load(std::memory_order_acquire) > 0U) {
+    return true;
+  }
+  // A locked mutex_ means another thread is running a transfer on this link, so do not wait for it here.
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return true;
+  }
+  return !req_map_.empty();
+}
+
 const std::string &HixlClient::GetRemoteEngine() const {
   return remote_engine_;
 }

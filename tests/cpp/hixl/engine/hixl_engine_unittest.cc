@@ -14,8 +14,11 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
@@ -669,6 +672,64 @@ TEST_F(HixlEngineTest, InitializeWithoutMaxActiveChannelsDoesNotSetConfig) {
   engine.BuildClientConfig(AscendString("127.0.0.1:26300"), config, kTimeOut, false);
   EXPECT_FALSE(config.global_config.comm_resource_config.max_active_channels.has_value());
   engine.Finalize();
+}
+
+TEST_F(HixlEngineTest, InitializeSetsChannelPoolMaxChannelFromGlobalResourceConfig) {
+  std::map<AscendString, AscendString> options = options1;
+  options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel":100})";
+  HixlEngine engine("127.0.0.1");
+  CreateAndInitEngine(engine, options);
+
+  ASSERT_TRUE(engine.client_manager_.max_channel_.has_value());
+  EXPECT_EQ(engine.client_manager_.max_channel_.value(), 100U);
+  engine.Finalize();
+}
+
+TEST_F(HixlEngineTest, InitializeWithoutChannelPoolDoesNotLimitChannelCount) {
+  HixlEngine engine("127.0.0.1");
+  CreateAndInitEngine(engine, options1);
+
+  EXPECT_FALSE(engine.client_manager_.max_channel_.has_value());
+  engine.Finalize();
+}
+
+TEST_F(HixlEngineTest, ChannelPoolEvictsIdleChannelAndRebuildsItOnTransfer) {
+  std::map<AscendString, AscendString> client_options = options1;
+  client_options[hixl::OPTION_AUTO_CONNECT] = "1";
+  client_options[hixl::OPTION_GLOBAL_RESOURCE_CONFIG] = R"({"channel_pool.max_channel":1})";
+  HixlEngine client_engine("127.0.0.1:26200");
+  CreateAndInitEngine(client_engine, client_options);
+  HixlEngine server1("127.0.0.1:26300");
+  CreateAndInitEngine(server1, options2);
+  HixlEngine server2("127.0.0.1:26304");
+  CreateAndInitEngine(server2, options2);
+
+  int32_t local_num = 1;
+  MemHandle local_handle = nullptr;
+  Register(client_engine, &local_num, local_handle);
+  int32_t remote_num = 2;
+  MemHandle remote_handle = nullptr;
+  Register(server1, &remote_num, remote_handle);
+
+  const AscendString server1_engine("127.0.0.1:26300");
+  EXPECT_EQ(client_engine.Connect(server1_engine, kTimeOut), SUCCESS);
+  EXPECT_EQ(client_engine.Connect(AscendString("127.0.0.1:26304"), kTimeOut), SUCCESS);
+
+  // max_channel=1，建立第二条链路前会淘汰第一条空闲链路
+  ASSERT_EQ(client_engine.client_manager_.GetClient(server1_engine.GetString()), nullptr);
+  EXPECT_NE(client_engine.client_manager_.GetClient("127.0.0.1:26304"), nullptr);
+
+  // 被淘汰的链路在下次传输时重新建立
+  TransferOpDesc desc{reinterpret_cast<uintptr_t>(&local_num), reinterpret_cast<uintptr_t>(&remote_num),
+                      sizeof(int32_t)};
+  EXPECT_EQ(client_engine.TransferSync(server1_engine, READ, {desc}, kTimeOut), SUCCESS);
+  EXPECT_EQ(local_num, 2);
+  EXPECT_NE(client_engine.client_manager_.GetClient(server1_engine.GetString()), nullptr);
+
+  client_engine.Disconnect();
+  client_engine.Finalize();
+  server1.Finalize();
+  server2.Finalize();
 }
 
 TEST_F(HixlEngineTest, TestHixl) {
@@ -1551,7 +1612,8 @@ TEST(HixlEngineLifecycleTest, AutoConnectRejectsWhenNotInitialized) {
   engine.is_initialized_ = false;
   engine.auto_connect_ = true;
   ClientPtr client_ptr = nullptr;
-  EXPECT_EQ(engine.AutoConnect(AscendString("127.0.0.1:26300"), kTimeOut, client_ptr), FAILED);
+  bool transfer_use = false;
+  EXPECT_EQ(engine.AutoConnect(AscendString("127.0.0.1:26300"), kTimeOut, client_ptr, transfer_use), FAILED);
   EXPECT_EQ(client_ptr, nullptr);
 }
 
@@ -1574,6 +1636,270 @@ TEST_F(ClientManagerTest, HeartbeatDestroysClientWithInvalidSocket) {
   manager.SendHeartbeat();
   EXPECT_EQ(manager.GetClient("127.0.0.1:26300"), nullptr);
   EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolEvictsLeastRecentlyUsedClientWhenFull) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, 2U), SUCCESS);
+  manager.clients_["127.0.0.1:26301"] = CreateMockClient();
+  manager.clients_["127.0.0.1:26302"] = CreateMockClient();
+  // 先访问 26301 再访问 26302，26301 成为最久未使用的链路
+  ASSERT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+  ASSERT_NE(manager.GetClient("127.0.0.1:26302"), nullptr);
+
+  {
+    std::unique_lock<std::mutex> client_lock;
+    bool reserved = false;
+    ClientPtr client = nullptr;
+    EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26303", client_lock, client, reserved), SUCCESS);
+    EXPECT_TRUE(reserved);
+    EXPECT_EQ(manager.creating_count_, 1U);
+    EXPECT_EQ(manager.GetClient("127.0.0.1:26301"), nullptr);
+    EXPECT_NE(manager.GetClient("127.0.0.1:26302"), nullptr);
+    manager.ReleaseChannelSlot();
+  }
+  EXPECT_EQ(manager.creating_count_, 0U);
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolSkipsTransferringClientWhenEvicting) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, 2U), SUCCESS);
+  auto transferring_client = CreateMockClient();
+  transferring_client->req_map_[reinterpret_cast<TransferReq>(0x1000)] = TransferInfo{nullptr, READ, AscendString()};
+  manager.clients_["127.0.0.1:26301"] = transferring_client;
+  manager.clients_["127.0.0.1:26302"] = CreateMockClient();
+  // 26301 最久未使用，但它正在传输，因此只能淘汰 26302
+  ASSERT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+  ASSERT_NE(manager.GetClient("127.0.0.1:26302"), nullptr);
+
+  {
+    std::unique_lock<std::mutex> client_lock;
+    bool reserved = false;
+    ClientPtr client = nullptr;
+    EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26303", client_lock, client, reserved), SUCCESS);
+    EXPECT_TRUE(reserved);
+    EXPECT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+    EXPECT_EQ(manager.GetClient("127.0.0.1:26302"), nullptr);
+    manager.ReleaseChannelSlot();
+  }
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolSkipsClientClaimedForTransfer) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, 1U), SUCCESS);
+  auto client = CreateMockClient();
+  manager.clients_["127.0.0.1:26301"] = client;
+  ASSERT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+  EXPECT_FALSE(client->IsBusy());
+
+  bool transfer_use = false;
+  ASSERT_NE(manager.GetClientForUse("127.0.0.1:26301", transfer_use), nullptr);
+  EXPECT_TRUE(transfer_use);
+  EXPECT_TRUE(client->IsBusy());
+
+  std::unique_lock<std::mutex> client_lock;
+  bool reserved = false;
+  ClientPtr created = nullptr;
+  EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26302", client_lock, created, reserved, &transfer_use),
+            RESOURCE_EXHAUSTED);
+  EXPECT_FALSE(reserved);
+  EXPECT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+
+  client->ReleaseUse();
+  EXPECT_FALSE(client->IsBusy());
+  EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26302", client_lock, created, reserved), SUCCESS);
+  EXPECT_TRUE(reserved);
+  EXPECT_EQ(manager.GetClient("127.0.0.1:26301"), nullptr);
+  manager.ReleaseChannelSlot();
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolDisabledDoesNotClaimTransferUse) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false), SUCCESS);
+  auto client = CreateMockClient();
+  manager.clients_["127.0.0.1:26301"] = client;
+  bool transfer_use = false;
+  manager.ClaimTransferUseLocked(client, transfer_use);
+  EXPECT_FALSE(transfer_use);
+  EXPECT_FALSE(client->IsBusy());
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolRejectsNewClientWhenAllClientsAreTransferring) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, 1U), SUCCESS);
+  auto transferring_client = CreateMockClient();
+  transferring_client->req_map_[reinterpret_cast<TransferReq>(0x1000)] = TransferInfo{nullptr, READ, AscendString()};
+  manager.clients_["127.0.0.1:26301"] = transferring_client;
+
+  std::unique_lock<std::mutex> client_lock;
+  bool reserved = false;
+  ClientPtr client = nullptr;
+  EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26302", client_lock, client, reserved), RESOURCE_EXHAUSTED);
+  EXPECT_FALSE(reserved);
+  EXPECT_EQ(manager.creating_count_, 0U);
+  EXPECT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolKeepsAllClientsForAlreadyConnectedEngine) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, 1U), SUCCESS);
+  auto client = CreateMockClient();
+  manager.clients_["127.0.0.1:26301"] = client;
+
+  {
+    std::unique_lock<std::mutex> client_lock;
+    bool reserved = false;
+    ClientPtr returned = nullptr;
+    EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26301", client_lock, returned, reserved), ALREADY_CONNECTED);
+    EXPECT_FALSE(reserved);
+    EXPECT_EQ(returned, client);
+    EXPECT_EQ(manager.creating_count_, 0U);
+  }
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolDisabledNeverEvictsClient) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false), SUCCESS);
+  manager.clients_["127.0.0.1:26301"] = CreateMockClient();
+  manager.clients_["127.0.0.1:26302"] = CreateMockClient();
+
+  {
+    std::unique_lock<std::mutex> client_lock;
+    bool reserved = false;
+    ClientPtr client = nullptr;
+    EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26303", client_lock, client, reserved), SUCCESS);
+    EXPECT_FALSE(reserved);
+    EXPECT_EQ(manager.creating_count_, 0U);
+    EXPECT_NE(manager.GetClient("127.0.0.1:26301"), nullptr);
+    EXPECT_NE(manager.GetClient("127.0.0.1:26302"), nullptr);
+  }
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolReserveAfterEvictFinalizeFailureStillRespectsMax) {
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, 1U), SUCCESS);
+  auto failed_handler = std::make_unique<MockClientHandler>();
+  failed_handler->finalize_ret = FAILED;
+  manager.clients_["127.0.0.1:26301"] = CreateMockClient(std::move(failed_handler));
+
+  std::unique_lock<std::mutex> first_lock;
+  bool first_reserved = false;
+  ClientPtr first_client = nullptr;
+  EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26302", first_lock, first_client, first_reserved), SUCCESS);
+  EXPECT_TRUE(first_reserved);
+  EXPECT_EQ(manager.GetClient("127.0.0.1:26301"), nullptr);
+  EXPECT_EQ(manager.creating_count_, 1U);
+
+  std::unique_lock<std::mutex> second_lock;
+  bool second_reserved = false;
+  ClientPtr second_client = nullptr;
+  EXPECT_EQ(manager.ReserveChannelSlot("127.0.0.1:26303", second_lock, second_client, second_reserved),
+            RESOURCE_EXHAUSTED);
+  EXPECT_FALSE(second_reserved);
+  EXPECT_EQ(manager.creating_count_, 1U);
+
+  manager.ReleaseChannelSlot();
+  first_lock.unlock();
+  EXPECT_EQ(manager.creating_count_, 0U);
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST_F(ClientManagerTest, ChannelPoolConcurrentReserveDoesNotExceedMaxChannel) {
+  constexpr uint32_t kMaxChannel = 2U;
+  constexpr int32_t kThreadCount = 8;
+  ClientManager manager;
+  ASSERT_EQ(manager.Initialize(false, kMaxChannel), SUCCESS);
+  manager.clients_["127.0.0.1:26301"] = CreateMockClient();
+  manager.clients_["127.0.0.1:26302"] = CreateMockClient();
+
+  struct ReserveResult {
+    Status status = FAILED;
+    bool reserved = false;
+    std::unique_lock<std::mutex> client_lock;
+  };
+  std::vector<ReserveResult> results(static_cast<size_t>(kThreadCount));
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<size_t>(kThreadCount));
+  for (int32_t i = 0; i < kThreadCount; ++i) {
+    threads.emplace_back([&manager, &results, i]() {
+      ClientPtr client = nullptr;
+      const std::string remote_engine = "127.0.0.1:" + std::to_string(26400 + i);
+      results[static_cast<size_t>(i)].status = manager.ReserveChannelSlot(
+          remote_engine, results[static_cast<size_t>(i)].client_lock, client, results[static_cast<size_t>(i)].reserved);
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  int32_t reserved_count = 0;
+  int32_t exhausted_count = 0;
+  for (const auto &result : results) {
+    if (result.reserved) {
+      ++reserved_count;
+      EXPECT_EQ(result.status, SUCCESS);
+    } else {
+      ++exhausted_count;
+      EXPECT_EQ(result.status, RESOURCE_EXHAUSTED);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(manager.mutex_);
+    EXPECT_LE(manager.clients_.size() + manager.creating_count_, static_cast<size_t>(kMaxChannel));
+    EXPECT_EQ(manager.creating_count_, static_cast<size_t>(reserved_count));
+  }
+  EXPECT_EQ(reserved_count, static_cast<int32_t>(kMaxChannel));
+  EXPECT_EQ(exhausted_count, kThreadCount - static_cast<int32_t>(kMaxChannel));
+
+  for (auto &result : results) {
+    if (result.reserved) {
+      manager.ReleaseChannelSlot();
+    }
+    if (result.client_lock.owns_lock()) {
+      result.client_lock.unlock();
+    }
+  }
+  EXPECT_EQ(manager.creating_count_, 0U);
+  EXPECT_EQ(manager.Finalize(), SUCCESS);
+}
+
+TEST(HixlClientBusyTest, UseCountKeepsClientBusyUntilReleased) {
+  auto client = CreateMockClient();
+  EXPECT_FALSE(client->IsBusy());
+  client->AcquireUse();
+  EXPECT_TRUE(client->IsBusy());
+  client->AcquireUse();
+  client->ReleaseUse();
+  EXPECT_TRUE(client->IsBusy());
+  client->ReleaseUse();
+  EXPECT_FALSE(client->IsBusy());
+}
+
+TEST(HixlClientBusyTest, IsBusyWhenAnotherThreadHoldsTheClient) {
+  auto client = CreateMockClient();
+  EXPECT_FALSE(client->IsBusy());
+
+  std::promise<void> locked;
+  std::promise<void> release;
+  auto release_future = release.get_future();
+  std::thread holder([&client, &locked, &release_future]() {
+    std::lock_guard<std::mutex> lock(client->mutex_);
+    locked.set_value();
+    release_future.wait();
+  });
+  locked.get_future().wait();
+  EXPECT_TRUE(client->IsBusy());
+
+  release.set_value();
+  holder.join();
+  EXPECT_FALSE(client->IsBusy());
 }
 
 TEST_F(ClientManagerTest, TransferReqIndexKeepsSubmitOrderAndFindsClient) {

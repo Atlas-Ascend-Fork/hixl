@@ -41,6 +41,8 @@ constexpr int32_t kMinConnectPoolThreadNum = 1;
 constexpr int32_t kMaxConnectPoolThreadNum = 64;
 constexpr int32_t kMinConnectPoolTaskQueueCapacity = 1;
 constexpr int32_t kMaxConnectPoolTaskQueueCapacity = 65535;
+constexpr int32_t kMinChannelPoolMaxChannel = 1;
+constexpr int32_t kMaxChannelPoolMaxChannel = 512;
 constexpr int32_t kMinRdmaTrafficClass = 0;
 constexpr int32_t kMaxRdmaTrafficClass = 255;
 constexpr int32_t kRdmaTrafficClassAlign = 4;
@@ -199,6 +201,14 @@ Status ParseConnectPoolConfig(const nlohmann::json &json, ConnectPoolConfig &cfg
   return SUCCESS;
 }
 
+Status ParseChannelPoolConfig(const nlohmann::json &json, ChannelPoolConfig &cfg) {
+  IntegerFieldRange max_channel_range = {kGlobalResCfgChannelPoolMaxChannel, kMinChannelPoolMaxChannel,
+                                         kMaxChannelPoolMaxChannel, ""};
+  HIXL_CHK_STATUS_RET(ParseIntegerFieldInRange(json, max_channel_range, cfg.max_channel),
+                      "Failed to parse channel_pool.max_channel");
+  return SUCCESS;
+}
+
 Status ParseCommResourceConfig(const nlohmann::json &json, CommResourceConfigDesc &cfg) {
   if (json.contains(kGlobalResCfgProtocolDesc)) {
     const auto &protocol_desc = json.at(kGlobalResCfgProtocolDesc);
@@ -329,6 +339,7 @@ Status MaybeValidateNicTopoPath(const HixlOptions &opts) {
 Status ParseGlobalResourceConfigJson(const nlohmann::json &json, GlobalResourceConfig &cfg) {
   HIXL_CHK_STATUS_RET(ParseUbMemoryConfig(json, cfg.fabric_memory), "Failed to parse UbMemoryConfig");
   HIXL_CHK_STATUS_RET(ParseConnectPoolConfig(json, cfg.connect_pool), "Failed to parse ConnectPoolConfig");
+  HIXL_CHK_STATUS_RET(ParseChannelPoolConfig(json, cfg.channel_pool), "Failed to parse ChannelPoolConfig");
   HIXL_CHK_STATUS_RET(ParseCommResourceConfig(json, cfg.comm_resource_config), "Failed to parse CommResourceConfig");
   HIXL_CHK_STATUS_RET(ParseTransferConfig(json, cfg.transfer_config), "Failed to parse TransferConfig");
   HIXL_CHK_STATUS_RET(ParseLocalCommResPath(json, cfg), "Failed to parse local_comm_res_path");
