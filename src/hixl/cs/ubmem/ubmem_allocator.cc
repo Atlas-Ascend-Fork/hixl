@@ -18,12 +18,11 @@
 #include "common/hixl_checker.h"
 #include "common/hixl_log.h"
 #include "common/scope_guard.h"
+#include "common/soc_type.h"
 #include "cs/ubmem/ubmem_virtual_memory_manager.h"
 
 namespace hixl {
 namespace {
-constexpr int32_t kDevicesPerChip = 4;
-constexpr int32_t kNumaNodeStep = 2;
 // aclrtMemSetAccess count: number of aclrtMemAccessDesc entries.
 constexpr size_t kMemAccessDescCount = 1U;
 // aclsysGetVersionNum encodes runtime 9.2.0 as 90200000. From that version, the caller device id
@@ -206,27 +205,36 @@ Status UbMemAllocator::AllocatePhysicalMemory(MemType type, size_t total_size, i
     return SUCCESS;
   }
 
-  int32_t physical_device_id = 0;
-  HIXL_CHK_ACL_RET(aclrtGetPhyDevIdByLogicDevId(logic_device_id, &physical_device_id),
-                   "Get physical device id failed.");
-  prop.memAttr = ACL_MEM_P2P_HUGE1G;
-  prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
-  prop.location.id = (physical_device_id / kDevicesPerChip) * kNumaNodeStep;
-  HIXL_LOGI("Malloc host memory for numa:%d.", prop.location.id);
-  auto ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-  if (ret == ACL_ERROR_NONE) {
+  SocType soc_type = SocType::kDefault;
+  HIXL_CHK_STATUS_RET(SocTypeUtil::GetSocType(soc_type),
+                      "[UbMemAllocator] failed to get SoC type for host fabric memory.");
+  if (soc_type == SocType::kDefault) {
+    // A5 host fabric memory uses 2M pages from the common host memory (no HOST_NUMA placement).
+    // Request it exactly once: there is no placement or page-size fallback on this path.
+    prop.memAttr = ACL_MEM_P2P_HUGE;
+    prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
+    prop.location.id = 0;
+    HIXL_LOGI("[UbMemAllocator] allocate A5 host physical memory, size:%zu, page:2M", total_size);
+    HIXL_CHK_ACL_RET(aclrtMallocPhysical(&handle, total_size, &prop, 0),
+                     "[UbMemAllocator] allocate A5 host physical memory failed, size:%zu", total_size);
     return SUCCESS;
   }
-  HIXL_LOGI("Try common host allocation instead of numa:%d.", prop.location.id);
+
+  // A2/A3 host fabric memory always lives in the common host memory: try 1G pages first and fall
+  // back to 2M pages when the 1G request fails. No HOST_NUMA placement is requested.
+  prop.memAttr = ACL_MEM_P2P_HUGE1G;
   prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
   prop.location.id = 0;
-  ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-  if (ret == ACL_ERROR_NONE) {
+  HIXL_LOGI("[UbMemAllocator] allocate A2/A3 host physical memory, size:%zu, page:1G", total_size);
+  const aclError one_gig_ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+  if (one_gig_ret == ACL_ERROR_NONE) {
     return SUCCESS;
   }
-  HIXL_LOGI("Try smaller page instead of 1G page.");
+  HIXL_LOGI("[UbMemAllocator] 1G host page allocation failed, fall back to 2M page. size:%zu ret:%d", total_size,
+            static_cast<int32_t>(one_gig_ret));
   prop.memAttr = ACL_MEM_P2P_HUGE;
-  HIXL_CHK_ACL_RET(aclrtMallocPhysical(&handle, total_size, &prop, 0), "Allocate physical memory failed.");
+  HIXL_CHK_ACL_RET(aclrtMallocPhysical(&handle, total_size, &prop, 0),
+                   "[UbMemAllocator] allocate A2/A3 host physical memory failed, size:%zu", total_size);
   return SUCCESS;
 }
 

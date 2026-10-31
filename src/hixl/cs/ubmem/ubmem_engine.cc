@@ -47,8 +47,9 @@ uint32_t CalculateAicpuKernelCount(uint32_t desc_count, uint32_t batch_size) {
 }
 }  // namespace
 
-UbMemEngine::UbMemEngine(int32_t device_id, const GlobalConfig &global_config, Endpoint &local_endpoint)
-    : device_id_(device_id), global_config_(global_config), local_endpoint_(local_endpoint) {}
+UbMemEngine::UbMemEngine(int32_t device_id, const GlobalConfig &global_config, Endpoint &local_endpoint,
+                         UbMemStarsSqeFormat sqe_format)
+    : device_id_(device_id), global_config_(global_config), local_endpoint_(local_endpoint), sqe_format_(sqe_format) {}
 
 UbMemEngine::~UbMemEngine() {
   Finalize();
@@ -390,7 +391,7 @@ Status UbMemEngine::LaunchAicpuChunks(bool is_get, UbMemCompleteHandle &handle, 
     const bool need_notify_wait = batch_remaining == 0U || chunk_offset + chunk_list_num == handle.desc_count;
     UbMemAicpuKernelParam param{};
     HIXL_CHK_STATUS_RET(FillUbMemKernelParam(*handle.slot, handle.desc_buf, chunk_offset, chunk_list_num, is_get,
-                                             need_notify_wait, timeout_ms, param),
+                                             need_notify_wait, timeout_ms, sqe_format_, param),
                         "[UbMemEngine] FillUbMemKernelParam failed, chunk_offset=%u", chunk_offset);
     if (handle.status_buf != nullptr) {
       HIXL_CHK_BOOL_RET_STATUS(status_offset < handle.status_count, PARAM_INVALID,

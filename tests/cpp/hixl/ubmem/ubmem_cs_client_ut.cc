@@ -396,8 +396,29 @@ TEST_F(UbMemCsClientUt, DeviceLaunchUsesCsAclrtLaunchKernelWithConfig) {
   ASSERT_GE(acl_stub_->kernel_params_.size(), 1U);
   EXPECT_EQ(acl_stub_->kernel_params_[0U].timeout_ms, 1000U);
   EXPECT_NE(acl_stub_->kernel_params_[0U].status_addr, 0U);
+  EXPECT_EQ(acl_stub_->kernel_params_[0U].sqe_format, static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV1));
   EXPECT_GE(acl_stub_->wait_notify_count_, 1U);
   EXPECT_EQ(GetNbiCallCount(), 0U);
+}
+
+TEST_F(UbMemCsClientUt, DeviceA5ClientPropagatesStarsV2SqeFormat) {
+  acl_stub_->soc_name_ = "Ascend950A";
+  ASSERT_EQ(CreateClient(ENDPOINT_LOC_TYPE_DEVICE), SUCCESS);
+  uint8_t local_buf[8] = {1U};
+  uint8_t remote_buf[8] = {2U};
+  void *remote_addr = nullptr;
+  HixlOneSideOpDesc desc{};
+  desc.local_buf = local_buf;
+  desc.remote_buf = nullptr;
+  desc.len = sizeof(local_buf);
+
+  ASSERT_EQ(ImportOwnRemoteMem(remote_buf, sizeof(remote_buf), &remote_addr), SUCCESS);
+  desc.remote_buf = remote_addr;
+  ASSERT_EQ(cli_.mem_store_.RecordMemory(true, remote_addr, sizeof(remote_buf)), SUCCESS);
+  ASSERT_EQ(cli_.mem_store_.RecordMemory(false, local_buf, sizeof(local_buf)), SUCCESS);
+  ASSERT_EQ(cli_.BatchTransferSync(false, 1U, &desc, 1000U), SUCCESS);
+  ASSERT_GE(acl_stub_->kernel_params_.size(), 1U);
+  EXPECT_EQ(acl_stub_->kernel_params_[0U].sqe_format, static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2));
 }
 
 TEST_F(UbMemCsClientUt, DeviceAicpuStatusBufferMatchesSmallBatchLaunches) {

@@ -282,6 +282,34 @@ struct UbCtpAppendInput {
   const std::string &user_local_comm_res;
 };
 
+// Append a device ubmem endpoint when protocol_desc requests ubmem.
+// comm_id is the physical device id. net_instance_id always comes from the local SuperPoD, the
+// same contract the generated ScaleOut device endpoints follow; server_id is inherited from the
+// already generated list when it is not empty.
+Status AppendRequestedUbMemEndpoint(int32_t user_dev_id, int32_t phy_id, const std::vector<std::string> &protocol_desc,
+                                    std::vector<EndpointConfig> &endpoint_list) {
+  if (std::find(protocol_desc.begin(), protocol_desc.end(), kProtocolUbmem) == protocol_desc.end()) {
+    return SUCCESS;
+  }
+  int32_t logic_dev_id = 0;
+  HIXL_CHK_ACL_RET(aclrtGetLogicDevIdByUserDevId(user_dev_id, &logic_dev_id));
+  EndpointConfig ub{};
+  ub.protocol = kProtocolUbmem;
+  ub.placement = kPlacementDevice;
+  ub.comm_id = std::to_string(phy_id);
+  // Keep the device endpoint contract: resolve the local SuperPoD id instead of borrowing the
+  // value from endpoint_list.front(); server_id is still inherited for list consistency.
+  HIXL_CHK_STATUS_RET(GetScaleOutNetInstanceId(logic_dev_id, ub.net_instance_id),
+                      "[EndpointGeneratorV2] failed to resolve ubmem net_instance_id, logic_dev_id=%d", logic_dev_id);
+  if (!endpoint_list.empty()) {
+    ub.server_id = endpoint_list.front().server_id;
+  }
+  endpoint_list.emplace_back(std::move(ub));
+  HIXL_LOGI("[EndpointGeneratorV2] appended ubmem endpoint, comm_id=%s, net_instance_id=%s",
+            endpoint_list.back().comm_id.c_str(), endpoint_list.back().net_instance_id.c_str());
+  return SUCCESS;
+}
+
 // Generate ub_ctp endpoints on demand and merge them into endpoint_list.
 Status AppendUbCtpEndpoints(const UbCtpAppendInput &input, std::vector<EndpointConfig> &endpoint_list) {
   bool ub_needed = false;
@@ -316,14 +344,14 @@ Status EndpointGeneratorV2::AutoGen(const HixlOptions &options, const std::strin
   int32_t phy_id = 0;
   HIXL_CHK_ACL_RET(aclrtGetPhyDevIdByLogicDevId(device_id, &phy_id));
 
+  const std::vector<std::string> protocol_desc = options.GetProtocolDesc();
+  endpoint_list.clear();
   if (IsIntraRoceEnabled()) {
     HIXL_LOGI("[EndpointGeneratorV2] HCCL_INTRA_ROCE_ENABLE=1, skip ScaleOut and UB generation");
-    return SUCCESS;
+    return AppendRequestedUbMemEndpoint(device_id, phy_id, protocol_desc, endpoint_list);
   }
 
   HIXL_LOGI("[EndpointGeneratorV2] auto-generate: device_id=%d, phy_id=%d", device_id, phy_id);
-  endpoint_list.clear();
-  const std::vector<std::string> protocol_desc = options.GetProtocolDesc();
   const std::string topo_path = options.TopoFilePath().value_or("");
   const std::string user_local_comm_res = options.LocalCommRes().value_or("");
   UbCtpAppendInput ub_input{phy_id, topo_path, protocol_desc, user_local_comm_res};
@@ -335,7 +363,8 @@ Status EndpointGeneratorV2::AutoGen(const HixlOptions &options, const std::strin
     HIXL_CHK_STATUS_RET(HostRoceEndpointGenerator::GenerateHostRoceEndpoints(options, endpoint_list),
                         "[EndpointGeneratorV2] Host RoCE generation failed");
   }
-  // ubmem is not appended here: FabricMem is A3-only.
+  HIXL_CHK_STATUS_RET(AppendRequestedUbMemEndpoint(device_id, phy_id, protocol_desc, endpoint_list),
+                      "[EndpointGeneratorV2] ubmem endpoint generation failed");
   HIXL_CHK_STATUS_RET(EndpointGeneratorBase::FilterEndpointsByProtocolDescList(protocol_desc, endpoint_list),
                       "FilterEndpointsByProtocolDescList failed");
   return SUCCESS;

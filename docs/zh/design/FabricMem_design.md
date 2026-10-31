@@ -6,7 +6,7 @@
 
 旧实现为 FabricMem 单独做了一套 Engine、ControlServer、ChannelManager 和 SlotPool。这和 HIXL CS 的建链、注册、传输控制面重复。本需求把 FabricMem 收进 `HixlEngine` / `hixl_cs`：`ubmem` 只是一种传输后端，对外仍走现有 `Initialize` / `RegisterMem` / `Connect` / `TransferSync` / `TransferAsync`。
 
-HCCL 直传不支持 D2RH。A3 上的 Buffer 中转会占 HBM，干扰推理。FabricMem 用来补这两条短板。它只服务 Atlas A3 训练/推理系列，并且只在同一超节点内选路；跨超节点要在 `protocol_desc` 里同时给出 RoCE/UBOE 等协议。
+HCCL 直传不支持 D2RH。A3 上的 Buffer 中转会占 HBM，干扰推理。FabricMem 用来补这两条短板。它只在同一超节点内选路；跨超节点要在 `protocol_desc` 里同时给出 RoCE/UBOE 等协议。
 
 ### 假设与待确认
 
@@ -35,7 +35,7 @@ FabricMem 不再是旁路引擎。传输集成层就是 `Endpoint` / `Channel` �
 
 `EngineFactory` 看到 FabricMem 开启，就创建 `HixlEngine`。后面的 Listen、GetEndpointInfo、GetRemoteMem、Channel 控制面全部复用 CS。
 
-`EndpointGenerator` 给 endpoint 列表追加一条 `protocol=ubmem, placement=device` 的记录。A5 的自动生成不加这条记录，即使 `protocol_desc` 里带了 `ubmem`：FabricMem 只在 A3 可用，A5 上 `ubmem` 被按协议过滤掉。`fabric_memory.enable_aicpu_unfold` 只选择数据面展开方式，不改变 endpoint placement。这条 endpoint 不监听真实网卡端口。`EndpointGetListenPort` 返回不支持。`EndpointStore` 匹配 ubmem 时只看 Host/Device 位置，不看 `comm_id`。
+`EndpointGenerator` 给 endpoint 列表追加一条 `protocol=ubmem, placement=device` 的记录。A5 的自动生成默认不追加这条记录；当 `protocol_desc` 显式包含 `ubmem`（例如开启 `enable_fabric_mem` 后由 `ApplyUbMemEquivalence` 补齐）时才追加，此时按协议过滤不会再丢弃它。`fabric_memory.enable_aicpu_unfold` 只选择数据面展开方式，不改变 endpoint placement。这条 endpoint 不监听真实网卡端口。`EndpointGetListenPort` 返回不支持。`EndpointStore` 匹配 ubmem 时只看 Host/Device 位置，不看 `comm_id`。
 
 同超节点优先选 ubmem，再才是 UB 组、HCCS、UBOE、UB_RTP、RoCE。跨超节点规则里没有 ubmem。所以 `["ubmem","roce:device"]` 的效果是：超内走 FabricMem，跨超走 Device RoCE。
 
@@ -146,7 +146,7 @@ sequenceDiagram
 
 ### 内存申请、注册与共享句柄
 
-Host 内存在 HDK 25.5 不能 `aclrtMemRetainAllocationHandle`。这条路径必须走 ADXL 的 `AdxlEngine::MallocMem` / `FreeMem`，内部是 `UbMemAllocator`：预留 VA、申请 PA、`aclrtMapMem`。Host 在 Malloc 时 `aclrtMemSetAccess`，让 NPU 能访问这块 DRAM。同一块物理内存只允许 ACL export 一次，句柄缓存在 allocator 里。HDK 26.0 起可以用 ACL 自己申请，再 `RegisterMem`。
+Host 内存在 HDK 25.5 不能 `aclrtMemRetainAllocationHandle`。这条路径必须走 ADXL 的 `AdxlEngine::MallocMem` / `FreeMem`，内部是 `UbMemAllocator`：预留 VA、申请 PA、`aclrtMapMem`。A5 的 PA 从通用 Host 内存按 2M 页单次申请；A2/A3 先从通用 Host 内存申请 1G 页，失败再回退到 2M 页。Host 在 Malloc 时 `aclrtMemSetAccess`，让 NPU 能访问这块 DRAM。同一块物理内存只允许 ACL export 一次，句柄缓存在 allocator 里。HDK 26.0 起可以用 ACL 自己申请，再 `RegisterMem`。
 
 `HixlEngine::RegisterMem` 只打到 CS Server 的 endpoint。如果 `protocol_desc` 同时有 `ubmem` 和 `roce:device`，同一块用户内存会在两条 endpoint 上都注册，不再另做 `extra_mem_handle`。
 
@@ -219,7 +219,7 @@ CS client 的 endpoint 始终是 Device。`HixlCSClient` 只把 UB_MEM 传输分
 **AICPU（默认）**
 
 1. `BuildUbMemTransferDescs` 把每条 op 拆成 AICPU 描述符。单条长度超过 4 GiB 时按 `uint32` 上限切开，一条描述符对应一条 SDMA SQE。
-2. 描述符拷到 Device 后，launch `HixlUbMemBatchRead` / `HixlUbMemBatchWrite`。内核参数是 `UbMemAicpuKernelParam`：已翻译的 VA、worker RTSQ、可选 Notify、超时，以及 `transfer_ctx_key`——它直接取 slot 的 `thread`，和 hcomm AICPU 算子一样，没有第二个字段。内核不碰通信 Channel 对象。
+2. 描述符拷到 Device 后，launch `HixlUbMemBatchRead` / `HixlUbMemBatchWrite`。内核参数是 `UbMemAicpuKernelParam`：已翻译的 VA、worker RTSQ、可选 Notify、超时，以及 `transfer_ctx_key`——它直接取 slot 的 `thread`，和 hcomm AICPU 算子一样，没有第二个字段。内核按 Host 下发的 `sqe_format` 选择 STARS SQE 布局：A2/A3 用 stars v1，A5 用 stars v2（传输长度在 word 12、目的流 id 在 word 7），两种布局都由内核直接写入 worker RTSQ。内核不碰通信 Channel 对象。
 3. 单个 kernel 最多 128 条描述符。`max_transfer_count_per_batch` 是逻辑批次和 Notify 边界，kernel 不跨批次。STARS 队列深度仍按 2K 模型预留：在途 1920 + NotifyRecord + 环空一位。
 4. 同步传输 `aclrtSynchronizeStreamWithTimeout`。异步传输在 copy stream 上追加 host flag D2H，轮询 flag。传输失败（err flag 置位、超时或提交失败）时置位该 slot 的 err flag，并推迟到该 slot 最后一个在途请求释放时才 `TransferPool::Abort` 再回收，避免 abort 仍被其他 handle 共享的 slot；引擎本身不锁存失败，由 `HixlCSClient` 在状态查询或同步传输返回失败时统一 latch。
 
@@ -332,7 +332,7 @@ Status TransferOneBatch(UbMemEngine &engine, bool is_get, const HixlOneSideOpDes
 | 初始化冲突 | `UbMemEndpoint::EndpointCreate` | 后建的 endpoint 带与已生效容量不一致的配置时失败 |
 | Initialize/Finalize 配对 | `UbMemEndpoint` / `VirtualMemoryManager` | 每个 endpoint 成对占/放一个引用；最后一个 endpoint 销毁才拆全局 VA 池；本端注册表是 per-endpoint 的，由 endpoint 自己释放 |
 | 等价开关 | `HixlOptions::ApplyUbMemEquivalence` | `EnableUseFabricMem=1` 写入 `ubmem`；`task_stream_num` 与 `num_workers` 对齐；AICPU 且 workers>1 返回 `PARAM_INVALID` |
-| Endpoint 生成 | `AppendUbMemIfRequested` | 生成 device ubmem；A5 自动生成不追加 ubmem；`enable_aicpu_unfold` 只选择数据面展开方式；可与 `roce:device` 共存；`ubmem:host` 非法 |
+| Endpoint 生成 | `AppendUbMemIfRequested`（V1）/ `AppendRequestedUbMemEndpoint`（V2） | 生成 device ubmem；A5（V2）仅当 `protocol_desc` 显式包含 ubmem 时追加；`enable_aicpu_unfold` 只选择数据面展开方式；可与 `roce:device` 共存；`ubmem:host` 非法 |
 | Handler 选择 | `ClientHandlerFactory` | Device 保持单 client；memcpy 展开不切换 DirectMultiChannelHandler |
 | 注册/导出/导入 | `UbMemMemory` / `UbMemEndpoint` | 本端 export、对端 import 后 `TranslateRemoteDescs` 改写远端地址；空地址拒绝；重复区间复用 handle |
 | 自连判归属 | `UbMemMemory::Import` | 命中本 endpoint 或本进程的导出记录；伪造 handle 字节、同 handle 改 va/len 都不命中；恒等路径不 import、不 map，`Finalize` 不 unmap；伪造 handle 的 desc 仍走 import；导出随注册注销而失效 |
@@ -357,7 +357,7 @@ Status TransferOneBatch(UbMemEngine &engine, bool is_get, const HixlOneSideOpDes
 
 ### 上机集成测试
 
-必须在 Atlas A3 超节点、HDK ≥ 25.5、灵衢 ≥ 1.5.0、CANN ≥ 9.0 上跑。原因是 VMM share handle、HCCS SDMA、AICPU RTSQ 和真实带宽都依赖硬件与 CANN runtime，UT/ST stub 验证不了。
+必须在真实硬件环境中跑，HDK ≥ 25.5、灵衢 ≥ 1.5.0、CANN ≥ 9.0。原因是 VMM share handle、SDMA、AICPU RTSQ 和真实带宽都依赖硬件与 CANN runtime，UT/ST stub 验证不了。
 
 | 测试场景 | 测试功能 | 验证点 |
 | --- | --- | --- |

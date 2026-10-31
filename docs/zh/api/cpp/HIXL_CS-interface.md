@@ -141,7 +141,7 @@ Client配置示例：
 }
 ```
 
-UB_MEM配置示例（Server与Client均可使用，仅Atlas A3训练/推理系列产品支持）：
+UB_MEM配置示例（Server与Client均可使用，仅支持Atlas A3系列产品、Ascend 950PR&950DT系列产品）：
 
 ```json
 {

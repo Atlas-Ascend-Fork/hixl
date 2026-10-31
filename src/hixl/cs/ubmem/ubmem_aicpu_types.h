@@ -39,7 +39,17 @@ struct UbMemAicpuTransferDesc {
   uint64_t reserved[13] = {};
 };
 
-constexpr uint32_t kUbMemKernelParamVersion = 1U;
+// STARS SQE ABI the AICPU kernel must build for the worker RTSQ. Gen1/Gen2 SoCs (910B/910_93)
+// use the stars v1 layout; A5 (Ascend950) reuses several words of the 64-byte entry, so the
+// kernel cannot pick the layout itself and the host must pass it in.
+enum class UbMemStarsSqeFormat : uint32_t {
+  kStarsV1 = 0U,  // A2/A3
+  kStarsV2 = 1U,  // A5
+};
+
+// Version 2 adds sqe_format: a version-1 kernel would silently build stars v1 SQEs on A5, so the
+// ABI version is bumped to make a mixed host/kernel package fail explicitly.
+constexpr uint32_t kUbMemKernelParamVersion = 2U;
 
 struct UbMemAicpuKernelParam {
   uint64_t desc_addr = 0U;
@@ -61,7 +71,7 @@ struct UbMemAicpuKernelParam {
   // returning failure. Passed from the host so the kernel respects the same
   // deadline the caller requested instead of a hardcoded value.
   uint32_t timeout_ms = 0U;
-  // Runtime notify metadata for an optional trailing A3 NotifyRecord SQE.
+  // Runtime notify metadata for an optional trailing STARS NotifyRecord SQE.
   // emit_notify_record is a fixed-width ABI field; bool must not cross the
   // independently packaged host/AICPU binary boundary.
   uint32_t notify_id = 0U;
@@ -73,7 +83,10 @@ struct UbMemAicpuKernelParam {
   // this context for the duration of Submit so disconnect Sync DELETE can try_lock.
   uint64_t transfer_ctx_key = 0U;
   uint32_t version = 0U;
-  uint32_t reserved[15] = {};
+  // UbMemStarsSqeFormat selected by the host from the device SoC type. Appended after version so
+  // the existing fields keep their offsets.
+  uint32_t sqe_format = 0U;
+  uint32_t reserved[14] = {};
 };
 
 }  // namespace hixl

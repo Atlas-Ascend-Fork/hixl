@@ -27,6 +27,8 @@
 #include "common/scope_guard.h"
 #include "common/tls/tls_manager.h"
 #include "common/ctrl_msg_plugin.h"
+#include "common/soc_type.h"
+#include "cs/ubmem/ubmem_aicpu_types.h"
 #include "conn_msg_handler.h"
 #include "host_register_proxy.h"
 #include "mem_msg_handler.h"
@@ -183,6 +185,13 @@ hixl::Status ImportOneDesc(hixl::ImportCtx &ctx, uint32_t idx, hixl::HixlMemDesc
     return ret;
   }
   return AppendTagStorage(ctx.tag_storage, desc.tag);
+}
+
+// Gen1/Gen2 SoCs submit stars v1 SQEs from the UB_MEM AICPU kernel; A5 (and any newer device that
+// reports an unknown SoC name) uses stars v2.
+UbMemStarsSqeFormat SqeFormatFromSocType(SocType soc_type) {
+  return (soc_type == SocType::kGen1 || soc_type == SocType::kGen2) ? UbMemStarsSqeFormat::kStarsV1
+                                                                    : UbMemStarsSqeFormat::kStarsV2;
 }
 
 hixl::Status ImportAllDescs(hixl::ImportCtx &ctx, std::vector<hixl::HixlMemDesc> &desc_list) {
@@ -390,7 +399,11 @@ Status HixlCSClient::Create(const HixlClientDesc *client_desc, const HixlClientC
   HIXL_CHK_STATUS_RET(InitRdmaRetryConfig(), "[HixlClient] InitRdmaRetryConfig failed");
   HIXL_CHK_STATUS_RET(InitNotifyResources(*(client_desc->local_endpoint)), "[HixlClient] InitNotifyResources failed");
   if (IsDeviceEndpoint(*(client_desc->local_endpoint)) && IsUbMemProtocol(client_desc->local_endpoint->protocol)) {
-    ubmem_engine_ = MakeUnique<UbMemEngine>(device_id_, global_config_, *local_endpoint_);
+    SocType soc_type = SocType::kDefault;
+    HIXL_CHK_STATUS_RET(SocTypeUtil::GetSocType(soc_type), "[HixlClient] GetSocType for ubmem failed");
+    const UbMemStarsSqeFormat sqe_format = SqeFormatFromSocType(soc_type);
+    HIXL_LOGI("[HixlClient] ubmem AICPU SQE format resolved, sqe_format=%u", static_cast<uint32_t>(sqe_format));
+    ubmem_engine_ = MakeUnique<UbMemEngine>(device_id_, global_config_, *local_endpoint_, sqe_format);
     HIXL_CHECK_NOTNULL(ubmem_engine_);
   }
   HIXL_DISMISS_GUARD(pool_rollback);

@@ -24,7 +24,7 @@ Status BuildUbMemTransferDescs(bool is_get, const HixlOneSideOpDesc *src, uint32
                                std::vector<UbMemAicpuTransferDesc> &dst);
 Status FillUbMemKernelParam(const TransferPool::SlotHandle &slot, const void *desc_buf, uint32_t chunk_offset,
                             uint32_t chunk_count, bool is_get, bool emit_notify, uint32_t timeout_ms,
-                            UbMemAicpuKernelParam &param);
+                            UbMemStarsSqeFormat sqe_format, UbMemAicpuKernelParam &param);
 
 }  // namespace hixl
 

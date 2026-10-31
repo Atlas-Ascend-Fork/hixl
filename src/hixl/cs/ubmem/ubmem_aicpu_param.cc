@@ -103,7 +103,7 @@ Status BuildUbMemTransferDescs(bool is_get, const HixlOneSideOpDesc *src, uint32
 
 Status FillUbMemKernelParam(const TransferPool::SlotHandle &slot, const void *desc_buf, uint32_t chunk_offset,
                             uint32_t chunk_count, bool is_get, bool emit_notify, uint32_t timeout_ms,
-                            UbMemAicpuKernelParam &param) {
+                            UbMemStarsSqeFormat sqe_format, UbMemAicpuKernelParam &param) {
   HIXL_CHECK_NOTNULL(desc_buf);
   HIXL_CHK_BOOL_RET_STATUS(chunk_count > 0U, PARAM_INVALID, "[UbMemAicpuParam] chunk_count must be > 0");
   HIXL_CHK_BOOL_RET_STATUS(slot.thread != 0U, PARAM_INVALID,
@@ -120,6 +120,7 @@ Status FillUbMemKernelParam(const TransferPool::SlotHandle &slot, const void *de
   param.emit_notify_record = emit_notify ? 1U : 0U;
   param.transfer_ctx_key = static_cast<uint64_t>(slot.thread);
   param.version = kUbMemKernelParamVersion;
+  param.sqe_format = static_cast<uint32_t>(sqe_format);
   const uint32_t rtsq_task_count = chunk_count + (emit_notify ? 1U : 0U);
   HIXL_CHK_STATUS_RET(FillRtsqMeta(slot.ubmem_stream, rtsq_task_count, slot.device_id, param),
                       "[UbMemAicpuParam] Fill RTSQ metadata failed, slot:%u", slot.slot_index);

@@ -21,6 +21,7 @@
 #include "cs/endpoint.h"
 #include "cs/global_config.h"
 #include "cs/transfer_pool.h"
+#include "cs/ubmem/ubmem_aicpu_types.h"
 #include "hixl/hixl_types.h"
 
 namespace hixl {
@@ -29,7 +30,8 @@ namespace hixl {
 // provide the same external serialization before using this engine.
 class UbMemEngine {
  public:
-  UbMemEngine(int32_t device_id, const GlobalConfig &global_config, Endpoint &local_endpoint);
+  UbMemEngine(int32_t device_id, const GlobalConfig &global_config, Endpoint &local_endpoint,
+              UbMemStarsSqeFormat sqe_format);
   ~UbMemEngine();
   UbMemEngine(const UbMemEngine &) = delete;
   UbMemEngine &operator=(const UbMemEngine &) = delete;
@@ -81,6 +83,8 @@ class UbMemEngine {
   int32_t device_id_;
   const GlobalConfig &global_config_;
   Endpoint &local_endpoint_;
+  // STARS SQE ABI of the local SoC, resolved by the client from SocType at creation time.
+  UbMemStarsSqeFormat sqe_format_;
   std::shared_ptr<TransferPool::SlotHandle> active_slot_;
   std::unordered_set<UbMemCompleteHandle *> pending_handles_;
 };

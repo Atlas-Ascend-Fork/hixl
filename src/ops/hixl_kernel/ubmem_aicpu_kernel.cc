@@ -64,9 +64,9 @@ uint32_t ExecuteBatch(UbMemAicpuKernelParam *param, UbMemAicpuTransferDirection 
   }
   HIXL_LOGI(
       "[UbMem][AICPU] scheduled. direction=%u desc_count=%u device=%u sq=%u stream=%u logic_cq=%u notify=%u "
-      "emit_notify=%u",
+      "emit_notify=%u sqe_format=%u",
       param->direction, param->desc_count, param->device_id, param->rtsq_id, param->rtsq_stream_id,
-      param->rtsq_logic_cq_id, param->notify_id, param->emit_notify_record);
+      param->rtsq_logic_cq_id, param->notify_id, param->emit_notify_record, param->sqe_format);
   const auto *descs = reinterpret_cast<const UbMemAicpuTransferDesc *>(static_cast<uintptr_t>(param->desc_addr));
   const uint32_t result = UbMemStarsSdma::Submit(*param, descs) == kSuccess ? kSuccess : kFailed;
   write_status(param, result);

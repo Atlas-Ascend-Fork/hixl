@@ -56,14 +56,34 @@ bool QueryRtsqValues(uint32_t device_id, uint32_t sq_id, drvSqCqPropType_t prope
 bool QueryRtsqValue(uint32_t device_id, uint32_t sq_id, drvSqCqPropType_t property, uint32_t &value) {
   return ubmem_rtsq::QueryRtsqValue(device_id, sq_id, property, value, halSqCqQuery);
 }
+
+// The stars v1 (A3) and stars v2 (A5) SQE headers and src/dst address words share both their
+// field names and offsets; only format-specific words such as qos and length differ, so each
+// builder fills those itself.
+template <typename Sqe>
+void FillSqeHeader(Sqe &sqe, uint32_t type, uint32_t stream_id, uint32_t task_id) {
+  sqe.header.type = static_cast<uint8_t>(type);
+  sqe.header.wr_cqe = 0U;
+  sqe.header.rt_stream_id = static_cast<uint16_t>(stream_id);
+  sqe.header.task_id = static_cast<uint16_t>(task_id);
+}
+
+template <typename Sqe>
+void FillSdmaAddresses(Sqe &sqe, uint64_t source, uint64_t destination) {
+  sqe.src_addr_low = static_cast<uint32_t>(source);
+  sqe.src_addr_high = static_cast<uint32_t>(source >> 32U);
+  sqe.dst_addr_low = static_cast<uint32_t>(destination);
+  sqe.dst_addr_high = static_cast<uint32_t>(destination >> 32U);
+}
 }  // namespace
 
 uint32_t UbMemStarsSdma::Submit(const UbMemAicpuKernelParam &param, const UbMemAicpuTransferDesc *descs) {
-  if (!ValidateSubmitArgs(param, descs)) {
+  UbMemStarsSqeFormat format = UbMemStarsSqeFormat::kStarsV1;
+  if (!ValidateSubmitArgs(param, descs, format)) {
     return kFailed;
   }
   UbMemRtsqState state;
-  if (!InitializeRtsq(param, state)) {
+  if (!InitializeRtsq(param, format, state)) {
     HIXL_LOGE(FAILED, "[UbMem][AICPU] initialize RTSQ failed. host_dev=%u rtsq=%u stream=%u task=%u logic_cq=%u",
               param.device_id, param.rtsq_id, param.rtsq_stream_id, param.rtsq_task_id, param.rtsq_logic_cq_id);
     return kFailed;
@@ -83,15 +103,34 @@ uint32_t UbMemStarsSdma::Submit(const UbMemAicpuKernelParam &param, const UbMemA
   return (sdma_ok && notify_ok) ? kSuccess : kFailed;
 }
 
-bool UbMemStarsSdma::ValidateSubmitArgs(const UbMemAicpuKernelParam &param, const UbMemAicpuTransferDesc *descs) {
+bool UbMemStarsSdma::ValidateSubmitArgs(const UbMemAicpuKernelParam &param, const UbMemAicpuTransferDesc *descs,
+                                        UbMemStarsSqeFormat &format) {
   if (descs == nullptr || param.desc_count == 0U || param.emit_notify_record > 1U ||
-      (param.emit_notify_record != 0U && param.notify_id >= kUbMemA3NotifyIdLimit) ||
+      !ResolveSqeFormat(param.sqe_format, format) ||
+      (param.emit_notify_record != 0U && param.notify_id >= NotifyIdLimit(format)) ||
       !AreValidDescriptors(descs, param.desc_count)) {
-    HIXL_LOGE(PARAM_INVALID, "[UbMem][AICPU] invalid submit args. descs=%p desc_count=%u emit_notify=%u notify_id=%u",
-              descs, param.desc_count, param.emit_notify_record, param.notify_id);
+    HIXL_LOGE(PARAM_INVALID,
+              "[UbMem][AICPU] invalid submit args. descs=%p desc_count=%u emit_notify=%u notify_id=%u sqe_format=%u",
+              descs, param.desc_count, param.emit_notify_record, param.notify_id, param.sqe_format);
     return false;
   }
   return true;
+}
+
+bool UbMemStarsSdma::ResolveSqeFormat(uint32_t param_format, UbMemStarsSqeFormat &format) {
+  if (param_format == static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV1)) {
+    format = UbMemStarsSqeFormat::kStarsV1;
+    return true;
+  }
+  if (param_format == static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2)) {
+    format = UbMemStarsSqeFormat::kStarsV2;
+    return true;
+  }
+  return false;
+}
+
+uint32_t UbMemStarsSdma::NotifyIdLimit(UbMemStarsSqeFormat format) {
+  return format == UbMemStarsSqeFormat::kStarsV2 ? kUbMemA5NotifyIdLimit : kUbMemA3NotifyIdLimit;
 }
 
 bool UbMemStarsSdma::BuildSubmitDeadline(uint64_t timeout_ms, uint64_t &deadline) {
@@ -351,16 +390,17 @@ bool UbMemStarsSdma::LoadRtsqQueueState(UbMemRtsqState &state) {
   return true;
 }
 
-bool UbMemStarsSdma::InitializeRtsq(const UbMemAicpuKernelParam &param, UbMemRtsqState &state) {
-  // sq_id must fit the u16 sq_id field of the A3 logic CQE ABI; stream_id must fit the
-  // u16 rt_stream_id field of the A3 SQE header ABI. The driver query/config interfaces
+bool UbMemStarsSdma::InitializeRtsq(const UbMemAicpuKernelParam &param, UbMemStarsSqeFormat format,
+                                    UbMemRtsqState &state) {
+  // sq_id must fit the u16 sq_id field of the logic CQE ABI; stream_id must fit the u16
+  // rt_stream_id field of the STARS SQE header ABI. The driver query/config interfaces
   // themselves are u32, so out-of-range values are rejected here rather than truncated.
   if (param.rtsq_id > std::numeric_limits<uint16_t>::max()) {
-    HIXL_LOGE(PARAM_INVALID, "[UbMem][AICPU] rtsq_id out of A3 CQE u16 ABI range. sq=%u", param.rtsq_id);
+    HIXL_LOGE(PARAM_INVALID, "[UbMem][AICPU] rtsq_id out of logic CQE u16 ABI range. sq=%u", param.rtsq_id);
     return false;
   }
   if (param.rtsq_stream_id > std::numeric_limits<uint16_t>::max()) {
-    HIXL_LOGE(PARAM_INVALID, "[UbMem][AICPU] rtsq_stream_id out of A3 SQE u16 ABI range. stream=%u",
+    HIXL_LOGE(PARAM_INVALID, "[UbMem][AICPU] rtsq_stream_id out of STARS SQE u16 ABI range. stream=%u",
               param.rtsq_stream_id);
     return false;
   }
@@ -377,6 +417,9 @@ bool UbMemStarsSdma::InitializeRtsq(const UbMemAicpuKernelParam &param, UbMemRts
   state.stream_id = param.rtsq_stream_id;
   state.logic_cq_id = param.rtsq_logic_cq_id;
   state.next_task_id = param.rtsq_task_id;
+  state.format = format;
+  HIXL_LOGD("[UbMem][AICPU] RTSQ SQE format selected. sqe_format=%u sq=%u stream=%u", param.sqe_format, state.sq_id,
+            state.stream_id);
   return RestoreRtsqStream(state) && LoadRtsqQueueState(state);
 }
 
@@ -430,17 +473,22 @@ bool UbMemStarsSdma::EnsureRtsqCapacity(UbMemRtsqState &state, uint32_t count, u
   return false;
 }
 
-bool UbMemStarsSdma::BuildSdmaSqe(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
-                                  const UbMemRtsqState &state, UbMemA3SdmaSqe &sqe) {
+bool UbMemStarsSdma::BuildSdmaEntry(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
+                                    const UbMemRtsqState &state, UbMemRtsqEntry &entry) {
+  if (state.format == UbMemStarsSqeFormat::kStarsV2) {
+    return BuildA5SdmaSqe(source, destination, size, task_id, state, entry.a5_sdma);
+  }
+  return BuildA3SdmaSqe(source, destination, size, task_id, state, entry.sdma);
+}
+
+bool UbMemStarsSdma::BuildA3SdmaSqe(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
+                                    const UbMemRtsqState &state, UbMemA3SdmaSqe &sqe) {
   if (memset_s(&sqe, sizeof(sqe), 0, sizeof(sqe)) != EOK) {
     HIXL_LOGE(FAILED, "[UbMem][AICPU] memset SDMA SQE failed, device_id=%u, sq=%u, stream=%u", state.device_id,
               state.sq_id, state.stream_id);
     return false;
   }
-  sqe.header.type = kUbMemA3SdmaSqeType;
-  sqe.header.wr_cqe = 0U;
-  sqe.header.rt_stream_id = static_cast<uint16_t>(state.stream_id);
-  sqe.header.task_id = static_cast<uint16_t>(task_id);
+  FillSqeHeader(sqe, kUbMemA3SdmaSqeType, state.stream_id, task_id);
   sqe.kernel_credit = kUbMemA3SdmaKernelCredit;
   sqe.sssv = 1U;
   sqe.dssv = 1U;
@@ -448,25 +496,63 @@ bool UbMemStarsSdma::BuildSdmaSqe(uint64_t source, uint64_t destination, uint64_
   sqe.dns = 1U;
   sqe.qos = kUbMemA3SdmaQosDefault;
   sqe.length = static_cast<uint32_t>(size);
-  sqe.src_addr_low = static_cast<uint32_t>(source);
-  sqe.src_addr_high = static_cast<uint32_t>(source >> 32U);
-  sqe.dst_addr_low = static_cast<uint32_t>(destination);
-  sqe.dst_addr_high = static_cast<uint32_t>(destination >> 32U);
+  FillSdmaAddresses(sqe, source, destination);
   sqe.link_type = kUbMemA3SdmaLinkOnChip;
   return true;
 }
 
-bool UbMemStarsSdma::BuildNotifySqe(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
-                                    UbMemA3NotifySqe &sqe) {
+bool UbMemStarsSdma::BuildA5SdmaSqe(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
+                                    const UbMemRtsqState &state, UbMemA5SdmaSqe &sqe) {
+  if (memset_s(&sqe, sizeof(sqe), 0, sizeof(sqe)) != EOK) {
+    HIXL_LOGE(FAILED, "[UbMem][AICPU] memset A5 SDMA SQE failed, device_id=%u, sq=%u, stream=%u", state.device_id,
+              state.sq_id, state.stream_id);
+    return false;
+  }
+  // stars v2 carries a single 32-bit task id in word1; the low 16 bits land in the logic CQE's
+  // stream_id and the high 16 bits in its task_id.
+  FillSqeHeader(sqe, kUbMemA5SdmaSqeType, state.stream_id, task_id);
+  sqe.kernel_credit = kUbMemA5SdmaKernelCredit;
+  sqe.sssv = 1U;
+  sqe.dssv = 1U;
+  sqe.sns = 1U;
+  sqe.dns = 1U;
+  sqe.qos = kUbMemA5SdmaQosDefault;
+  // stars v2 keeps the transfer length in word 12; word 7 carries the destination stream ids.
+  sqe.length = static_cast<uint32_t>(size);
+  FillSdmaAddresses(sqe, source, destination);
+  return true;
+}
+
+bool UbMemStarsSdma::BuildNotifyEntry(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
+                                      UbMemRtsqEntry &entry) {
+  if (state.format == UbMemStarsSqeFormat::kStarsV2) {
+    return BuildA5NotifySqe(notify_id, task_id, state, entry.a5_notify);
+  }
+  return BuildA3NotifySqe(notify_id, task_id, state, entry.notify);
+}
+
+bool UbMemStarsSdma::BuildA5NotifySqe(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
+                                      UbMemA5NotifySqe &sqe) {
+  if (memset_s(&sqe, sizeof(sqe), 0, sizeof(sqe)) != EOK) {
+    HIXL_LOGE(FAILED, "[UbMem][AICPU] memset A5 NotifyRecord SQE failed, device_id=%u, sq=%u, stream=%u",
+              state.device_id, state.sq_id, state.stream_id);
+    return false;
+  }
+  FillSqeHeader(sqe, kUbMemA5NotifyRecordSqeType, state.stream_id, task_id);
+  sqe.notify_id = notify_id;
+  sqe.sub_type = kUbMemA5NotifySubTypeSingleRecord;
+  sqe.kernel_credit = kUbMemA5NotifyKernelCredit;
+  return true;
+}
+
+bool UbMemStarsSdma::BuildA3NotifySqe(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
+                                      UbMemA3NotifySqe &sqe) {
   if (memset_s(&sqe, sizeof(sqe), 0, sizeof(sqe)) != EOK) {
     HIXL_LOGE(FAILED, "[UbMem][AICPU] memset NotifyRecord SQE failed, device_id=%u, sq=%u, stream=%u", state.device_id,
               state.sq_id, state.stream_id);
     return false;
   }
-  sqe.header.type = kUbMemA3NotifyRecordSqeType;
-  sqe.header.wr_cqe = 0U;
-  sqe.header.rt_stream_id = static_cast<uint16_t>(state.stream_id);
-  sqe.header.task_id = static_cast<uint16_t>(task_id);
+  FillSqeHeader(sqe, kUbMemA3NotifyRecordSqeType, state.stream_id, task_id);
   sqe.notify_id = notify_id;
   sqe.kernel_credit = kUbMemA3NotifyKernelCredit;
   return true;
@@ -550,7 +636,7 @@ bool UbMemStarsSdma::AppendDescriptorTasks(const UbMemAicpuTransferDesc &desc, U
       return false;
     }
     const uint64_t block_size = std::min(remaining, kMaxSdmaTransferBytes);
-    if (!BuildSdmaSqe(source, destination, block_size, state.next_task_id++, state, batch.entries[batch.count].sdma)) {
+    if (!BuildSdmaEntry(source, destination, block_size, state.next_task_id++, state, batch.entries[batch.count])) {
       return false;
     }
     ++batch.count;
@@ -570,7 +656,7 @@ bool UbMemStarsSdma::AppendNotifyTask(uint32_t notify_id, UbMemRtsqState &state,
               state.device_id, state.sq_id, state.stream_id, notify_id, batch.count);
     return false;
   }
-  if (!BuildNotifySqe(notify_id, state.next_task_id++, state, batch.entries[batch.count].notify)) {
+  if (!BuildNotifyEntry(notify_id, state.next_task_id++, state, batch.entries[batch.count])) {
     return false;
   }
   ++batch.count;

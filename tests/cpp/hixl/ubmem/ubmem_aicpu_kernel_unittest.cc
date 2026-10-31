@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -17,7 +18,7 @@
 
 #include "ascend_hal_error.h"
 #include "cs/ubmem/ubmem_aicpu_types.h"
-#include "ubmem_a3_rtsq.h"
+#include "ubmem_stars_rtsq.h"
 #include "ubmem_rtsq_query.h"
 #include "ubmem_stars_sdma.h"
 #include "hal_pkg/trs_pkg.h"
@@ -68,9 +69,13 @@ struct CapturedNotifyTask {
   bool writes_cqe = false;
 };
 
-std::array<UbMemA3SdmaSqe, kRtsqDepth> g_rtsq{};
+std::array<UbMemRtsqEntry, kRtsqDepth> g_rtsq{};
+std::vector<UbMemRtsqEntry> g_raw_tasks;
 std::vector<CapturedSdmaTask> g_sdma_tasks;
 std::vector<CapturedNotifyTask> g_notify_tasks;
+// A3 golden decoding is disabled for stars v2 tests so the shared capture helper does not
+// reinterpret A5 entries through the A3 layout.
+bool g_decode_a3 = true;
 uint32_t g_rtsq_head = 0U;
 uint32_t g_rtsq_tail = 0U;
 uint32_t g_rtsq_depth = kRtsqDepth;
@@ -120,7 +125,11 @@ static_assert(kStubLogicCqeBytes >= sizeof(StubLogicCqeView), "Stub CQE stride s
 
 void CaptureTasks(uint32_t new_tail) {
   for (uint32_t index = g_rtsq_tail; index != new_tail; index = (index + 1U) % g_rtsq_depth) {
-    const auto &sqe = g_rtsq[index];
+    g_raw_tasks.push_back(g_rtsq[index]);
+    if (!g_decode_a3) {
+      continue;
+    }
+    const auto &sqe = g_rtsq[index].sdma;
     if (sqe.header.type == kUbMemA3NotifyRecordSqeType) {
       const auto &notify = *reinterpret_cast<const UbMemA3NotifySqe *>(&sqe);
       g_notify_tasks.push_back({notify.notify_id, notify.header.rt_stream_id, notify.header.task_id, notify.header.type,
@@ -137,9 +146,11 @@ void CaptureTasks(uint32_t new_tail) {
 }
 
 void ResetRtsqStub() {
-  g_rtsq.fill(UbMemA3SdmaSqe{});
+  g_rtsq.fill(UbMemRtsqEntry{});
+  g_raw_tasks.clear();
   g_sdma_tasks.clear();
   g_notify_tasks.clear();
+  g_decode_a3 = true;
   g_rtsq_head = 0U;
   g_rtsq_tail = 0U;
   g_rtsq_depth = kRtsqDepth;
@@ -170,6 +181,12 @@ void ResetRtsqStub() {
   SetStubRtStreamSqId(kRtsqId);
 }
 
+uint32_t RawWord(const UbMemRtsqEntry &entry, uint32_t word_index) {
+  uint32_t value = 0U;
+  std::memcpy(&value, entry.bytes + static_cast<size_t>(word_index) * sizeof(uint32_t), sizeof(value));
+  return value;
+}
+
 UbMemAicpuKernelParam MakeParam(const void *descs, uint32_t desc_count, UbMemAicpuTransferDirection direction) {
   UbMemAicpuKernelParam param;
   param.desc_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(descs));
@@ -182,6 +199,7 @@ UbMemAicpuKernelParam MakeParam(const void *descs, uint32_t desc_count, UbMemAic
   param.direction = static_cast<uint32_t>(direction);
   param.transfer_ctx_key = static_cast<uint64_t>(kTransferCtxKey);
   param.version = kUbMemKernelParamVersion;
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV1);
   return param;
 }
 
@@ -489,6 +507,137 @@ TEST_F(UbMemAicpuKernelUTest, BatchWriteBuildsHcommStyleA3SdmaSqes) {
   EXPECT_EQ(g_config_count, 1U);
   EXPECT_EQ(g_driver_device_id, kDriverDeviceId);
   EXPECT_EQ(g_sq_id, kRtsqId);
+}
+
+TEST_F(UbMemAicpuKernelUTest, BatchWriteBuildsA5SdmaSqes) {
+  std::vector<UbMemAicpuTransferDesc> descs = {
+      {0x1000U, 0x2000U, 16U},
+      {0x3000U, 0x4000U, 32U},
+  };
+  auto param = MakeParam(descs.data(), static_cast<uint32_t>(descs.size()), UbMemAicpuTransferDirection::kWrite);
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2);
+  g_decode_a3 = false;
+
+  EXPECT_EQ(HixlUbMemBatchWrite(&param), 0U);
+  ASSERT_EQ(g_raw_tasks.size(), 2U);
+  const auto &first = g_raw_tasks[0U].a5_sdma;
+  EXPECT_EQ(first.header.type, kUbMemA5SdmaSqeType);
+  EXPECT_EQ(first.header.wr_cqe, 0U);
+  EXPECT_EQ(first.header.rt_stream_id, kRtsqStreamId);
+  EXPECT_EQ(first.header.task_id, kInitialTaskId);
+  EXPECT_EQ(first.kernel_credit, kUbMemA5SdmaKernelCredit);
+  EXPECT_EQ(first.qos, kUbMemA5SdmaQosDefault);
+  EXPECT_EQ(first.opcode, 0U);
+  EXPECT_EQ(first.sssv, 1U);
+  EXPECT_EQ(first.dssv, 1U);
+  EXPECT_EQ(first.sns, 1U);
+  EXPECT_EQ(first.dns, 1U);
+  EXPECT_EQ(first.sro, 0U);
+  EXPECT_EQ(first.dro, 0U);
+  EXPECT_EQ(first.stride, 0U);
+  EXPECT_EQ(first.ie2, 0U);
+  EXPECT_EQ(first.comp_en, 0U);
+  EXPECT_EQ(first.src_stream_id, 0U);
+  EXPECT_EQ(first.src_substream_id, 0U);
+  EXPECT_EQ(first.dst_stream_id, 0U);
+  EXPECT_EQ(first.dst_substream_id, 0U);
+  EXPECT_EQ(first.src_addr_low, 0x1000U);
+  EXPECT_EQ(first.src_addr_high, 0U);
+  EXPECT_EQ(first.dst_addr_low, 0x2000U);
+  EXPECT_EQ(first.dst_addr_high, 0U);
+  EXPECT_EQ(first.length, 16U);
+  // stars v2 regression: word 7 carries the destination stream ids and word 12 the length.
+  // The stars v1 layout would put the length in word 7 and the link type in word 12.
+  EXPECT_EQ(RawWord(g_raw_tasks[0U], 7U), 0U);
+  EXPECT_EQ(RawWord(g_raw_tasks[0U], 12U), 16U);
+  EXPECT_EQ(g_raw_tasks[1U].a5_sdma.length, 32U);
+  EXPECT_EQ(g_raw_tasks[1U].a5_sdma.header.task_id, kInitialTaskId + 1U);
+  EXPECT_TRUE(g_notify_tasks.empty());
+  EXPECT_EQ(g_config_count, 1U);
+  EXPECT_EQ(g_sq_id, kRtsqId);
+}
+
+TEST_F(UbMemAicpuKernelUTest, BatchWriteBuildsA5NotifyRecordSqe) {
+  UbMemAicpuTransferDesc desc{0x1000U, 0x2000U, 16U};
+  auto param = MakeParam(&desc, 1U, UbMemAicpuTransferDirection::kWrite);
+  param.emit_notify_record = 1U;
+  param.notify_id = kNotifyId;
+  param.timeout_ms = 1000U;
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2);
+  g_decode_a3 = false;
+
+  EXPECT_EQ(HixlUbMemBatchWrite(&param), 0U);
+  ASSERT_EQ(g_raw_tasks.size(), 2U);
+  const auto &notify = g_raw_tasks[1U].a5_notify;
+  EXPECT_EQ(notify.header.type, kUbMemA5NotifyRecordSqeType);
+  EXPECT_EQ(notify.header.wr_cqe, 0U);
+  EXPECT_EQ(notify.header.rt_stream_id, kRtsqStreamId);
+  EXPECT_EQ(notify.header.task_id, kInitialTaskId + 1U);
+  EXPECT_EQ(notify.notify_id, kNotifyId);
+  EXPECT_EQ(notify.sub_type, kUbMemA5NotifySubTypeSingleRecord);
+  EXPECT_EQ(notify.kernel_credit, kUbMemA5NotifyKernelCredit);
+  EXPECT_EQ(notify.cnt_flag, 0U);
+  EXPECT_EQ(notify.clr_flag, 0U);
+  EXPECT_EQ(notify.timeout, 0U);
+  EXPECT_EQ(g_config_count, 2U);
+}
+
+TEST_F(UbMemAicpuKernelUTest, BatchWriteAcceptsA5NotifyIdBeyondA3Limit) {
+  UbMemAicpuTransferDesc desc{0x1000U, 0x2000U, 16U};
+  auto param = MakeParam(&desc, 1U, UbMemAicpuTransferDirection::kWrite);
+  param.emit_notify_record = 1U;
+  // Legal on A5 (17-bit notify id) although the stars v1 ABI rejects it at 13 bits.
+  param.notify_id = kUbMemA3NotifyIdLimit;
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2);
+  g_decode_a3 = false;
+
+  EXPECT_EQ(HixlUbMemBatchWrite(&param), 0U);
+  ASSERT_EQ(g_raw_tasks.size(), 2U);
+  EXPECT_EQ(g_raw_tasks[1U].a5_notify.notify_id, kUbMemA3NotifyIdLimit);
+}
+
+TEST_F(UbMemAicpuKernelUTest, BatchWriteRejectsA5NotifyIdBeyondA5Limit) {
+  UbMemAicpuTransferDesc desc{0x1000U, 0x2000U, 16U};
+  auto param = MakeParam(&desc, 1U, UbMemAicpuTransferDirection::kWrite);
+  param.emit_notify_record = 1U;
+  param.notify_id = kUbMemA5NotifyIdLimit;
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2);
+
+  EXPECT_EQ(HixlUbMemBatchWrite(&param), 1U);
+  EXPECT_EQ(g_query_count, 0U);
+  EXPECT_EQ(g_config_count, 0U);
+}
+
+TEST_F(UbMemAicpuKernelUTest, BatchWriteRejectsUnknownSqeFormat) {
+  UbMemAicpuTransferDesc desc{0x1000U, 0x2000U, 16U};
+  auto param = MakeParam(&desc, 1U, UbMemAicpuTransferDirection::kWrite);
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2) + 1U;
+
+  EXPECT_EQ(HixlUbMemBatchWrite(&param), 1U);
+  EXPECT_EQ(g_query_count, 0U);
+  EXPECT_EQ(g_config_count, 0U);
+}
+
+TEST_F(UbMemAicpuKernelUTest, BatchReadSplitsA5TransfersLargerThanOneSdmaTask) {
+  constexpr uint64_t kMaxSdmaLength = std::numeric_limits<uint32_t>::max();
+  std::vector<UbMemAicpuTransferDesc> descs = {
+      {0x1000U, 0x2000U, kMaxSdmaLength + 3U},
+  };
+  auto param = MakeParam(descs.data(), static_cast<uint32_t>(descs.size()), UbMemAicpuTransferDirection::kRead);
+  param.emit_notify_record = 1U;
+  param.notify_id = kNotifyId;
+  param.sqe_format = static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2);
+  g_decode_a3 = false;
+
+  EXPECT_EQ(HixlUbMemBatchRead(&param), 0U);
+  ASSERT_EQ(g_raw_tasks.size(), 3U);
+  EXPECT_EQ(g_raw_tasks[0U].a5_sdma.length, kMaxSdmaLength);
+  const uint64_t second_source =
+      (static_cast<uint64_t>(g_raw_tasks[1U].a5_sdma.src_addr_high) << 32U) | g_raw_tasks[1U].a5_sdma.src_addr_low;
+  EXPECT_EQ(second_source, 0x1000U + kMaxSdmaLength);
+  EXPECT_EQ(g_raw_tasks[1U].a5_sdma.length, 3U);
+  EXPECT_EQ(g_raw_tasks[2U].a5_notify.header.type, kUbMemA5NotifyRecordSqeType);
+  EXPECT_EQ(g_raw_tasks[2U].a5_notify.notify_id, kNotifyId);
 }
 
 TEST_F(UbMemAicpuKernelUTest, BatchWriteConvertsHostDeviceIdToLocalDriverId) {

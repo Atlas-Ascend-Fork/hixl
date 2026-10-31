@@ -114,7 +114,7 @@ Status Initialize(const AscendString &local_engine, const std::map<AscendString,
 - Atlas A3系列产品：`EnableUseFabricMem`、`BufferPool`、`RdmaTrafficClass`、`RdmaServiceLevel`、`AutoConnect`、`GlobalResourceConfig`、`LocalCommRes`。
 <!-- end id57 -->
 <!-- npu="950" id58 -->
-- Ascend 950PR&950DT系列产品：`RdmaTrafficClass`、`RdmaServiceLevel`、`AutoConnect`、`GlobalResourceConfig`、`LocalCommRes`。
+- Ascend 950PR&950DT系列产品：`EnableUseFabricMem`、`RdmaTrafficClass`、`RdmaServiceLevel`、`AutoConnect`、`GlobalResourceConfig`、`LocalCommRes`。
 <!-- end id58 -->
 
 > 说明：`RdmaTrafficClass`、`RdmaServiceLevel` 仅适用于RoCE场景。
@@ -241,8 +241,8 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
 <!-- npu="950" id69 -->
 - `comm_resource_config.nic_topo_path`：仅支持Ascend 950PR&950DT系列产品。
 <!-- end id69 -->
-<!-- npu="A3" id64 -->
-- `fabric_memory.*`：仅支持Atlas A3系列产品。
+<!-- npu="950,A3" id64 -->
+- `fabric_memory.*`：仅支持Atlas A3系列产品、Ascend 950PR&950DT系列产品。
 <!-- end id64 -->
 <!-- npu="A3,910b" id65 -->
 - `channel_pool.high_waterline`、`channel_pool.low_waterline`：仅通信域模式下支持Atlas A2系列产品、Atlas A3系列产品。
@@ -258,11 +258,11 @@ options[hixl::OPTION_AUTO_CONNECT] = "1";
   - 支持值：`"ub_ctp"`、`"ubmem"`、`"roce:device"`、`"hccs:device"`、`"ub_ctp:device"`、`"ub_ctp:host"`、`"uboe:device"`、`"ub_rtp:device"`、`"roce:host"`。
   - 过滤行为：配置后会对 `LocalCommRes` 中显式配置的 `endpoint_list` 和自动生成的 `endpoint_list` 按该范围进行过滤；显式配置的 `LocalCommRes` 在未配置本字段时不进行额外过滤。
   <!-- npu="950" id59 -->
-  - Ascend 950PR&950DT系列产品说明：未配置该字段或仅配置`"ub_ctp:device"`时，自动生成Device UB资源，Host内存通过UBMEM映射到Device地址后使用Device UB链路传输；同时配置`"ub_ctp:device"`和`"ub_ctp:host"`时，自动生成Device+Host UB资源并使用纯URMA路径；配置`"ub_ctp"`与上述组合等价；单独配置`"ub_ctp:host"`时仅保留Host UB CTP Endpoint。显式配置`"roce:host"`时，自动生成Host RoCE的endpoint_list。HDK版本不低于`26.2.RC1.B082`，1825版本不低于`SP560 1.0.1.1.B031`。
+  - Ascend 950PR&950DT系列产品说明：未配置该字段或仅配置`"ub_ctp:device"`时，自动生成Device UB资源，Host内存通过UBMEM映射到Device地址后使用Device UB链路传输；同时配置`"ub_ctp:device"`和`"ub_ctp:host"`时，自动生成Device+Host UB资源并使用纯URMA路径；配置`"ub_ctp"`与上述组合等价；单独配置`"ub_ctp:host"`时仅保留Host UB CTP Endpoint。显式配置`"roce:host"`时，自动生成Host RoCE的endpoint_list；显式配置`"ubmem"`时，自动生成Device ubmem endpoint。HDK版本不低于`26.2.RC1.B082`，1825版本不低于`SP560 1.0.1.1.B031`。
   <!-- end id59 -->
   - 手工配置 `LocalCommRes` 时，`"ub_ctp"` 要求同时提供Device和Host UB CTP Endpoint。
-  <!-- npu="A3" id63 -->
-  - `ubmem` 仅可单独书写，不支持 `ubmem:device`/`ubmem:host`；`ubmem` 仅支持超节点内传输，如果要使能跨超节点自动选择roce协议，需要同时配置为 `["ubmem", "roce:device"]`，仅支持Atlas A3系列产品。
+  <!-- npu="950,A3" id63 -->
+  - `ubmem` 仅支持超节点内传输，仅支持Atlas A3系列产品、Ascend 950PR&950DT系列产品（当前仅支持单server内），对于Atlas A3系列产品，如果要使能跨超节点自动选择roce协议，需要同时配置为 `["ubmem", "roce:device"]`；
   <!-- end id63 -->
 
 <a id="grc_listen_port"></a>

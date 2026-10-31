@@ -16,6 +16,7 @@
 
 #include "ascendcl_stub.h"
 #include "cs/ubmem/ubmem_aicpu_param.h"
+#include "cs/ubmem/ubmem_aicpu_types.h"
 #include "cs/transfer_pool.h"
 #include "depends/runtime/src/runtime_stub.h"
 #include "engine/endpoint_test_utils.h"
@@ -120,7 +121,8 @@ TEST_F(UbMemAicpuParamUt, FillKernelParamWritesRtsqAndNotify) {
   uint8_t desc_buf[sizeof(UbMemAicpuTransferDesc)] = {};
   const TransferPool::SlotHandle slot = MakeSlot();
   UbMemAicpuKernelParam param{};
-  ASSERT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, false, true, 1500U, param), SUCCESS);
+  ASSERT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, false, true, 1500U, UbMemStarsSqeFormat::kStarsV1, param),
+            SUCCESS);
   EXPECT_EQ(param.desc_count, 1U);
   EXPECT_EQ(param.direction, static_cast<uint32_t>(UbMemAicpuTransferDirection::kWrite));
   EXPECT_EQ(param.timeout_ms, 1500U);
@@ -128,6 +130,7 @@ TEST_F(UbMemAicpuParamUt, FillKernelParamWritesRtsqAndNotify) {
   EXPECT_EQ(param.emit_notify_record, 1U);
   EXPECT_EQ(param.transfer_ctx_key, 0xABCDEFULL);
   EXPECT_EQ(param.version, kUbMemKernelParamVersion);
+  EXPECT_EQ(param.sqe_format, static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV1));
   EXPECT_EQ(param.device_id, 5U);
   EXPECT_EQ(param.rtsq_id, 11U);
   EXPECT_EQ(param.rtsq_stream_id, 7U);
@@ -135,17 +138,28 @@ TEST_F(UbMemAicpuParamUt, FillKernelParamWritesRtsqAndNotify) {
   EXPECT_EQ(param.desc_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(desc_buf)));
 }
 
+TEST_F(UbMemAicpuParamUt, FillKernelParamPropagatesA5SqeFormat) {
+  uint8_t desc_buf[sizeof(UbMemAicpuTransferDesc)] = {};
+  UbMemAicpuKernelParam param{};
+  ASSERT_EQ(FillUbMemKernelParam(MakeSlot(), desc_buf, 0U, 1U, false, false, 10U, UbMemStarsSqeFormat::kStarsV2, param),
+            SUCCESS);
+  EXPECT_EQ(param.sqe_format, static_cast<uint32_t>(UbMemStarsSqeFormat::kStarsV2));
+  EXPECT_EQ(param.version, kUbMemKernelParamVersion);
+}
+
 TEST_F(UbMemAicpuParamUt, FillKernelParamReadOmitsNotifyAndAdvancesTaskId) {
   uint8_t desc_buf[sizeof(UbMemAicpuTransferDesc) * 2U] = {};
   const TransferPool::SlotHandle slot = MakeSlot();
   UbMemAicpuKernelParam first{};
-  ASSERT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, true, false, 10U, first), SUCCESS);
+  ASSERT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, true, false, 10U, UbMemStarsSqeFormat::kStarsV1, first),
+            SUCCESS);
   EXPECT_EQ(first.direction, static_cast<uint32_t>(UbMemAicpuTransferDirection::kRead));
   EXPECT_EQ(first.emit_notify_record, 0U);
   const uint32_t first_task_id = first.rtsq_task_id;
 
   UbMemAicpuKernelParam second{};
-  ASSERT_EQ(FillUbMemKernelParam(slot, desc_buf, 1U, 1U, true, true, 10U, second), SUCCESS);
+  ASSERT_EQ(FillUbMemKernelParam(slot, desc_buf, 1U, 1U, true, true, 10U, UbMemStarsSqeFormat::kStarsV1, second),
+            SUCCESS);
   EXPECT_EQ(second.rtsq_task_id, first_task_id + 1U);
   EXPECT_EQ(second.desc_addr,
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(desc_buf + sizeof(UbMemAicpuTransferDesc))));
@@ -155,19 +169,24 @@ TEST_F(UbMemAicpuParamUt, FillKernelParamRejectsMissingContextAndStream) {
   uint8_t desc_buf[8] = {};
   TransferPool::SlotHandle slot = MakeSlot();
   UbMemAicpuKernelParam param{};
-  EXPECT_EQ(FillUbMemKernelParam(slot, nullptr, 0U, 1U, false, false, 1U, param), PARAM_INVALID);
-  EXPECT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 0U, false, false, 1U, param), PARAM_INVALID);
+  EXPECT_EQ(FillUbMemKernelParam(slot, nullptr, 0U, 1U, false, false, 1U, UbMemStarsSqeFormat::kStarsV1, param),
+            PARAM_INVALID);
+  EXPECT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 0U, false, false, 1U, UbMemStarsSqeFormat::kStarsV1, param),
+            PARAM_INVALID);
   slot.thread = 0U;
-  EXPECT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, false, false, 1U, param), PARAM_INVALID);
+  EXPECT_EQ(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, false, false, 1U, UbMemStarsSqeFormat::kStarsV1, param),
+            PARAM_INVALID);
   slot.thread = 1U;
   slot.ubmem_stream = nullptr;
-  EXPECT_NE(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, false, false, 1U, param), SUCCESS);
+  EXPECT_NE(FillUbMemKernelParam(slot, desc_buf, 0U, 1U, false, false, 1U, UbMemStarsSqeFormat::kStarsV1, param),
+            SUCCESS);
 }
 
 TEST_F(UbMemAicpuParamUt, FillKernelParamFailsWhenPhyDevLookupFails) {
   uint8_t desc_buf[8] = {};
   acl_stub_->phy_dev_failed_ = true;
   UbMemAicpuKernelParam param{};
-  EXPECT_EQ(FillUbMemKernelParam(MakeSlot(), desc_buf, 0U, 1U, false, false, 1U, param), UNSUPPORTED);
+  EXPECT_EQ(FillUbMemKernelParam(MakeSlot(), desc_buf, 0U, 1U, false, false, 1U, UbMemStarsSqeFormat::kStarsV1, param),
+            UNSUPPORTED);
 }
 }  // namespace hixl

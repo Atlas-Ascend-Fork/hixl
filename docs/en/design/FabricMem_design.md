@@ -6,7 +6,7 @@ KV Cache in LLM inference is often larger than the model weights. Intra-SuperPoD
 
 The previous implementation owned a separate Engine, ControlServer, ChannelManager, and SlotPool. That duplicated HIXL CS connection, registration, and transfer control. This requirement folds FabricMem into `HixlEngine` / `hixl_cs`. `ubmem` is one transport backend. Callers still use `Initialize`, `RegisterMem`, `Connect`, `TransferSync`, and `TransferAsync`.
 
-HCCL direct transfer cannot do D2RH. Buffer relay on A3 burns HBM bandwidth and hurts inference. FabricMem covers those two gaps. It is limited to Atlas A3 training and inference products, and matching only selects it inside one SuperPoD. Cross-SuperPoD traffic needs RoCE, UBOE, or another protocol in `protocol_desc`.
+HCCL direct transfer cannot do D2RH. Buffer relay on A3 burns HBM bandwidth and hurts inference. FabricMem covers those two gaps. Matching only selects it inside one SuperPoD. Cross-SuperPoD traffic needs RoCE, UBOE, or another protocol in `protocol_desc`.
 
 ### Assumptions and open items
 
@@ -35,7 +35,7 @@ Callers have two equivalent switches after parse:
 
 `EngineFactory` creates `HixlEngine` when FabricMem is on. Listen, GetEndpointInfo, GetRemoteMem, and channel control stay on CS.
 
-`EndpointGenerator` appends one `protocol=ubmem, placement=device` endpoint. A5 auto generation does not append it even when `protocol_desc` carries the `ubmem` token: FabricMem is available on A3 only, so the filter drops `ubmem` on A5. `fabric_memory.enable_aicpu_unfold` selects only the data-plane submission mode and never changes endpoint placement. This endpoint does not listen on a NIC port. `EndpointGetListenPort` returns not supported. `EndpointStore` matches ubmem by Host/Device location only, not by `comm_id`.
+`EndpointGenerator` appends one `protocol=ubmem, placement=device` endpoint. A5 auto generation does not append it by default; it appends one only when `protocol_desc` explicitly carries the `ubmem` token (for example after `enable_fabric_mem` makes `ApplyUbMemEquivalence` add it), and the protocol filter then keeps it. `fabric_memory.enable_aicpu_unfold` selects only the data-plane submission mode and never changes endpoint placement. This endpoint does not listen on a NIC port. `EndpointGetListenPort` returns not supported. `EndpointStore` matches ubmem by Host/Device location only, not by `comm_id`.
 
 `HixlOptions::ApplyUbMemEquivalence()` sets `enable_fabric_mem` to true and ensures `protocol_desc` contains `ubmem`. `fabric_memory.task_stream_num` and `multi_channel.num_workers` are aligned: one copies to the other; both set must match. AICPU unfolding allows `num_workers=1` only.
 
@@ -142,7 +142,7 @@ sequenceDiagram
 
 ### Allocation, registration, and share handles
 
-Host memory on HDK 25.5 cannot call `aclrtMemRetainAllocationHandle`. That path must use ADXL `AdxlEngine::MallocMem` / `FreeMem`, which is `UbMemAllocator`: reserve VA, allocate PA, `aclrtMapMem`. Host `MallocMem` calls `aclrtMemSetAccess` so the NPU can reach that DRAM. ACL export is allowed once per physical allocation; the handle is cached in the allocator. From HDK 26.0, callers may allocate with ACL and then `RegisterMem`.
+Host memory on HDK 25.5 cannot call `aclrtMemRetainAllocationHandle`. That path must use ADXL `AdxlEngine::MallocMem` / `FreeMem`, which is `UbMemAllocator`: reserve VA, allocate PA, `aclrtMapMem`. On A5 the PA is a single 2M-page request from common Host memory; A2/A3 request 1G pages from common Host memory first and fall back to 2M pages when that fails. Host `MallocMem` calls `aclrtMemSetAccess` so the NPU can reach that DRAM. ACL export is allowed once per physical allocation; the handle is cached in the allocator. From HDK 26.0, callers may allocate with ACL and then `RegisterMem`.
 
 `HixlEngine::RegisterMem` goes only to CS Server endpoints. If `protocol_desc` contains both `ubmem` and `roce:device`, the same user buffer is registered on both endpoints. There is no extra `extra_mem_handle` path.
 
@@ -215,7 +215,7 @@ An empty result means nothing was rewritten, so the caller's original array is s
 **AICPU (default)**
 
 1. `BuildUbMemTransferDescs` splits each op into AICPU descriptors. A copy larger than 4 GiB is cut at the `uint32` max so one descriptor is one SDMA SQE.
-2. Descriptors are copied to Device, then `HixlUbMemBatchRead` / `HixlUbMemBatchWrite` launches. `UbMemAicpuKernelParam` carries translated VA ranges, the worker RTSQ, optional Notify, timeout, and `transfer_ctx_key` — which reuses the slot's `thread`, exactly as the Hcomm AICPU kernels do, instead of minting a second key. The kernel must not take communication channel objects.
+2. Descriptors are copied to Device, then `HixlUbMemBatchRead` / `HixlUbMemBatchWrite` launches. `UbMemAicpuKernelParam` carries translated VA ranges, the worker RTSQ, optional Notify, timeout, and `transfer_ctx_key` — which reuses the slot's `thread`, exactly as the Hcomm AICPU kernels do, instead of minting a second key. The kernel picks the STARS SQE layout from the host-provided `sqe_format`: stars v1 on A2/A3 and stars v2 on A5 (transfer length in word 12, destination stream ids in word 7); either layout is written directly into the worker RTSQ. The kernel must not take communication channel objects.
 3. One kernel accepts at most 128 descriptors. `max_transfer_count_per_batch` is the logical batch and Notify boundary. A kernel never crosses a batch. STARS queue depth still follows the 2K model: 1920 in-flight entries, plus NotifyRecord, plus one ring slot left empty.
 4. Sync transfer uses `aclrtSynchronizeStreamWithTimeout`. Async transfer appends a host-flag D2H on the copy stream and polls the flag. On transfer failure (err flag set, timeout, or submission failure), the slot's err flag is set and `TransferPool::Abort` runs only when the last in-flight handle of that slot is released, so a slot still shared by other handles is not aborted early; the engine itself does not latch failures, and `HixlCSClient` latches once when status query or a sync transfer returns failure.
 
@@ -336,7 +336,7 @@ Status TransferOneBatch(UbMemEngine &engine, bool is_get, const HixlOneSideOpDes
 | Runtime init conflict | `UbMemEndpoint::EndpointCreate` | an endpoint configured with a capacity that disagrees with the applied one fails |
 | Process-wide VA pool lifetime | `VirtualMemoryManager` | endpoint teardown does not release the global VA pool; the singleton destructor releases it after process-wide users are gone; local registrations are per endpoint |
 | Switch equivalence | `HixlOptions::ApplyUbMemEquivalence` | `EnableUseFabricMem=1` injects `ubmem`; `task_stream_num` aligns with `num_workers`; AICPU with workers>1 returns `PARAM_INVALID` |
-| Endpoint generation | `AppendUbMemIfRequested` | ubmem always emits device; A5 auto generation never appends ubmem; `enable_aicpu_unfold` changes submission mode only; can coexist with `roce:device`; `ubmem:host` is invalid |
+| Endpoint generation | `AppendUbMemIfRequested` (V1) / `AppendRequestedUbMemEndpoint` (V2) | ubmem always emits device; A5 (V2) appends ubmem only when `protocol_desc` explicitly contains it; `enable_aicpu_unfold` changes submission mode only; can coexist with `roce:device`; `ubmem:host` is invalid |
 | Handler selection | `ClientHandlerFactory` | ubmem uses one `DirectClientHandler` in AICPU and memcpy modes; UBOE/UBG still use `DirectMultiChannelHandler` with multiple workers |
 | Register/export/import | `UbMemMemory` / `UbMemEndpoint` | local export plus peer import rewrites peer addresses in `TranslateRemoteDescs`; null address rejected; overlapping ranges reuse a handle |
 | Loopback ownership | `UbMemMemory::Import` | the endpoint's or this process's export record matches; flipped handle bytes or a changed va/len do not; the identity path imports nothing and maps nothing, and `Finalize` unmaps nothing; a desc with flipped handle bytes still takes the import path; an export ends with the registration that holds it |
@@ -362,7 +362,7 @@ The old standalone `fabric_mem_st` left with the side engine. The CS path covers
 
 ### On-machine integration
 
-These cases need an Atlas A3 SuperPoD, HDK ≥ 25.5, LingQu ≥ 1.5.0, and CANN ≥ 9.0. VMM share handles, HCCS SDMA, AICPU RTSQ, and real bandwidth all depend on hardware and the CANN runtime. UT/ST stubs cannot prove them.
+These cases need real hardware environments with HDK ≥ 25.5, LingQu ≥ 1.5.0, and CANN ≥ 9.0. VMM share handles, SDMA, AICPU RTSQ, and real bandwidth all depend on hardware and the CANN runtime. UT/ST stubs cannot prove them.
 
 | Scenario | Function | Checks |
 | --- | --- | --- |

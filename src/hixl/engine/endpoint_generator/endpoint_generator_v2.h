@@ -21,8 +21,9 @@
 namespace hixl {
 
 // Default automatic endpoint generation: ScaleOut endpoint (ub_rtp/uboe selected by DSMI
-// InterconType), UB CTP endpoints derived from the topology, and Host RoCE when protocol_desc
-// contains roce:host. Used for SocType::kDefault.
+// InterconType), UB CTP endpoints derived from the topology, Host RoCE when protocol_desc
+// contains roce:host, and a device ubmem endpoint when protocol_desc contains ubmem.
+// Used for SocType::kDefault (A5).
 class EndpointGeneratorV2 : public EndpointGeneratorBase {
  public:
   Status AutoGen(const HixlOptions &options, const std::string &local_engine,

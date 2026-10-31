@@ -14,7 +14,7 @@
 #include <cstdint>
 
 #include "cs/ubmem/ubmem_aicpu_types.h"
-#include "ubmem_a3_rtsq.h"
+#include "ubmem_stars_rtsq.h"
 
 namespace hixl {
 
@@ -39,6 +39,7 @@ struct UbMemRtsqState {
   uint32_t depth = 0U;
   uint32_t head = 0U;
   uint32_t tail = 0U;
+  UbMemStarsSqeFormat format = UbMemStarsSqeFormat::kStarsV1;
 };
 
 // Leading fields of driver trs_logic_cqe / runtime rtLogicCqReport_t for logging.
@@ -52,9 +53,13 @@ struct __attribute__((packed)) UbMemLogicCqeView {
   uint16_t sq_head = 0U;
 };
 
+static_assert(kUbMemA3RtsqEntryBytes == kUbMemA5RtsqEntryBytes, "STARS RTSQ entry size must not change.");
+
 union UbMemRtsqEntry {
   UbMemA3SdmaSqe sdma;
   UbMemA3NotifySqe notify;
+  UbMemA5SdmaSqe a5_sdma;
+  UbMemA5NotifySqe a5_notify;
   uint8_t bytes[kUbMemA3RtsqEntryBytes];
 };
 
@@ -66,15 +71,16 @@ struct UbMemRtsqBatch {
 
 enum class UbMemLogicCqRecvResult { kEmpty, kReports, kError };
 
-// HIXL-owned A3 RTSQ submission wrapper. It mirrors HComm's A3 SDMA SQE
-// construction while consuming only UbMem VMM addresses and a HIXL-owned
-// worker RTSQ passed by the dispatcher.
+// HIXL-owned STARS RTSQ submission wrapper. It mirrors HComm's stars v1 (A2/A3) and
+// stars v2 (A5) SDMA/NotifyRecord SQE construction while consuming only UbMem VMM
+// addresses and a HIXL-owned worker RTSQ passed by the dispatcher.
 class UbMemStarsSdma {
  public:
   static uint32_t Submit(const UbMemAicpuKernelParam &param, const UbMemAicpuTransferDesc *descs);
 
  private:
-  static bool ValidateSubmitArgs(const UbMemAicpuKernelParam &param, const UbMemAicpuTransferDesc *descs);
+  static bool ValidateSubmitArgs(const UbMemAicpuKernelParam &param, const UbMemAicpuTransferDesc *descs,
+                                 UbMemStarsSqeFormat &format);
   static bool BuildSubmitDeadline(uint64_t timeout_ms, uint64_t &deadline);
   static bool AppendAndPublishSdmaTasks(const UbMemAicpuTransferDesc *descs, uint32_t desc_count, UbMemRtsqState &state,
                                         UbMemRtsqBatch &batch, uint64_t deadline);
@@ -94,12 +100,23 @@ class UbMemStarsSdma {
   static UbMemLogicCqRecvResult RecvLogicCqBatch(const UbMemRtsqState &state, uint8_t *reports, uint32_t &report_count);
   static bool PollLogicCqUntilEmpty(const UbMemRtsqState &state, uint64_t deadline);
   static bool LoadRtsqQueueState(UbMemRtsqState &state);
-  static bool InitializeRtsq(const UbMemAicpuKernelParam &param, UbMemRtsqState &state);
+  static bool InitializeRtsq(const UbMemAicpuKernelParam &param, UbMemStarsSqeFormat format, UbMemRtsqState &state);
   static bool HasRtsqCapacity(const UbMemRtsqState &state, uint32_t count);
   static bool EnsureRtsqCapacity(UbMemRtsqState &state, uint32_t count, uint64_t deadline);
-  static bool BuildSdmaSqe(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
-                           const UbMemRtsqState &state, UbMemA3SdmaSqe &sqe);
-  static bool BuildNotifySqe(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state, UbMemA3NotifySqe &sqe);
+  static bool ResolveSqeFormat(uint32_t param_format, UbMemStarsSqeFormat &format);
+  static uint32_t NotifyIdLimit(UbMemStarsSqeFormat format);
+  static bool BuildSdmaEntry(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
+                             const UbMemRtsqState &state, UbMemRtsqEntry &entry);
+  static bool BuildA3SdmaSqe(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
+                             const UbMemRtsqState &state, UbMemA3SdmaSqe &sqe);
+  static bool BuildA5SdmaSqe(uint64_t source, uint64_t destination, uint64_t size, uint32_t task_id,
+                             const UbMemRtsqState &state, UbMemA5SdmaSqe &sqe);
+  static bool BuildNotifyEntry(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
+                               UbMemRtsqEntry &entry);
+  static bool BuildA3NotifySqe(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
+                               UbMemA3NotifySqe &sqe);
+  static bool BuildA5NotifySqe(uint32_t notify_id, uint32_t task_id, const UbMemRtsqState &state,
+                               UbMemA5NotifySqe &sqe);
   static bool CopySqeBatchToRing(const UbMemRtsqState &state, const UbMemRtsqBatch &batch);
   static bool CommitRtsqTail(UbMemRtsqState &state, uint32_t new_tail, uint32_t batch_count);
   static bool PublishRtsqBatch(UbMemRtsqState &state, UbMemRtsqBatch &batch, uint64_t deadline);

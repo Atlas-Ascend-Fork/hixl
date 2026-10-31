@@ -18,6 +18,44 @@ namespace hixl {
 namespace {
 using namespace ubmem_test;
 
+// Reports a Gen2 (A3) SoC so the A2/A3 host-memory allocation branch stays covered.
+class Gen2SocRuntimeStub : public UbMemRuntimeStub {
+ public:
+  const char *aclrtGetSocName() override {
+    return "Ascend910_9391";
+  }
+};
+
+// Fails the 1G host page request once so the 2M fallback on A2/A3 can be exercised.
+class OneGigMallocFailsOnceStub : public Gen2SocRuntimeStub {
+ public:
+  aclError aclrtMallocPhysical(aclrtDrvMemHandle *handle, size_t size, const aclrtPhysicalMemProp *prop,
+                               uint64_t flags) override {
+    if (malloc_physical_count_ == 0U) {
+      ++malloc_physical_count_;
+      last_physical_mem_prop_ = *prop;
+      return ACL_ERROR_RT_INTERNAL_ERROR;
+    }
+    return Gen2SocRuntimeStub::aclrtMallocPhysical(handle, size, prop, flags);
+  }
+};
+
+// Makes the single A5 physical allocation fail so the "no retry / no fallback" contract is pinned.
+class FailingMallocPhysicalRuntimeStub : public UbMemRuntimeStub {
+ public:
+  aclError aclrtMallocPhysical(aclrtDrvMemHandle *handle, size_t size, const aclrtPhysicalMemProp *prop,
+                               uint64_t flags) override {
+    (void)size;
+    (void)prop;
+    (void)flags;
+    ++malloc_physical_count_;
+    if (handle != nullptr) {
+      *handle = nullptr;
+    }
+    return ACL_ERROR_RT_INTERNAL_ERROR;
+  }
+};
+
 void ExpectMallocRollsBackOnAclFailure(MemType type, const char *acl_api,
                                        const std::shared_ptr<UbMemRuntimeStub> &runtime) {
   llm::GetAclStubMock() = acl_api;
@@ -827,6 +865,62 @@ TEST_F(UbMemAllocatorUTest, MallocMemAndFreeMemHost) {
   EXPECT_EQ(UbMemAllocator::FreeMem(host_ptr), SUCCESS);
   VirtualMemoryManager::GetInstance().Finalize();
 }
+TEST_F(UbMemAllocatorUTest, MallocMemHostUses2MPagesOnA5) {
+  void *host_ptr = nullptr;
+  ASSERT_EQ(UbMemAllocator::MallocMem(MEM_HOST, kLen, &host_ptr), SUCCESS);
+  ASSERT_NE(host_ptr, nullptr);
+  // The default runtime stub reports Ascend950A: host memory is a single 2M HOST allocation, with
+  // no HOST_NUMA placement and no retry.
+  EXPECT_EQ(runtime_->malloc_physical_count_, 1U);
+  EXPECT_EQ(runtime_->last_physical_mem_prop_.memAttr, ACL_MEM_P2P_HUGE);
+  EXPECT_EQ(runtime_->last_physical_mem_prop_.location.type, ACL_MEM_LOCATION_TYPE_HOST);
+  EXPECT_EQ(runtime_->last_physical_mem_prop_.location.id, 0U);
+  EXPECT_EQ(UbMemAllocator::FreeMem(host_ptr), SUCCESS);
+}
+
+TEST_F(UbMemAllocatorUTest, MallocMemHostFailsWithoutRetryOnA5) {
+  auto runtime = std::make_shared<FailingMallocPhysicalRuntimeStub>();
+  llm::AclRuntimeStub::SetInstance(runtime);
+  void *host_ptr = nullptr;
+  EXPECT_NE(UbMemAllocator::MallocMem(MEM_HOST, kLen, &host_ptr), SUCCESS);
+  EXPECT_EQ(host_ptr, nullptr);
+  // A5 must not retry another placement or page size after the single physical allocation fails.
+  EXPECT_EQ(runtime->malloc_physical_count_, 1U);
+  EXPECT_EQ(runtime->free_physical_count_, 0U);
+  EXPECT_EQ(runtime->mem_set_access_count_, 0U);
+  llm::AclRuntimeStub::SetInstance(runtime_);
+}
+
+TEST_F(UbMemAllocatorUTest, MallocMemHostUses1GPageOnA3) {
+  auto runtime = std::make_shared<Gen2SocRuntimeStub>();
+  llm::AclRuntimeStub::SetInstance(runtime);
+  void *host_ptr = nullptr;
+  ASSERT_EQ(UbMemAllocator::MallocMem(MEM_HOST, kLen, &host_ptr), SUCCESS);
+  ASSERT_NE(host_ptr, nullptr);
+  // A2/A3 request 1G pages from common host memory; HOST_NUMA is no longer used.
+  EXPECT_EQ(runtime->malloc_physical_count_, 1U);
+  EXPECT_EQ(runtime->last_physical_mem_prop_.memAttr, ACL_MEM_P2P_HUGE1G);
+  EXPECT_EQ(runtime->last_physical_mem_prop_.location.type, ACL_MEM_LOCATION_TYPE_HOST);
+  EXPECT_EQ(runtime->last_physical_mem_prop_.location.id, 0U);
+  EXPECT_EQ(UbMemAllocator::FreeMem(host_ptr), SUCCESS);
+  llm::AclRuntimeStub::SetInstance(runtime_);
+}
+
+TEST_F(UbMemAllocatorUTest, MallocMemHostFallsBackTo2MPageOnA3) {
+  auto runtime = std::make_shared<OneGigMallocFailsOnceStub>();
+  llm::AclRuntimeStub::SetInstance(runtime);
+  void *host_ptr = nullptr;
+  ASSERT_EQ(UbMemAllocator::MallocMem(MEM_HOST, kLen, &host_ptr), SUCCESS);
+  ASSERT_NE(host_ptr, nullptr);
+  // The 1G request failed, so one 2M request follows and succeeds.
+  EXPECT_EQ(runtime->malloc_physical_count_, 2U);
+  EXPECT_EQ(runtime->last_physical_mem_prop_.memAttr, ACL_MEM_P2P_HUGE);
+  EXPECT_EQ(runtime->last_physical_mem_prop_.location.type, ACL_MEM_LOCATION_TYPE_HOST);
+  EXPECT_EQ(runtime->free_physical_count_, 0U);
+  EXPECT_EQ(UbMemAllocator::FreeMem(host_ptr), SUCCESS);
+  llm::AclRuntimeStub::SetInstance(runtime_);
+}
+
 TEST_F(UbMemAllocatorUTest, IsAllocatedByMallocMemTracksLifecycle) {
   VirtualMemoryManager::GetInstance().Finalize();
   ASSERT_EQ(VirtualMemoryManager::GetInstance().Initialize(), SUCCESS);
