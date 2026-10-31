@@ -86,13 +86,15 @@
 
 初始化LLM-DataDist。其中Server侧需要设置侦听的Host IP和port。
 
+以下地址示例以同机部署为例，Server侦听地址为`127.0.0.1:3000`。跨机部署时，请将本地IP和对端IP替换为各自实际可达的Host IP，并确保对端端口与Server侦听端口一致。
+
 ```cpp
 // Server侧
 LlmDataDist llm_data_dist(PROMPT_CLUSTER_ID, LlmRole::kPrompt);
 std::map<AscendString, AscendString> options;
 options[OPTION_DEVICE_ID] = "0";
 //替换成真实IP端口
-options[OPTION_LISTEN_IP_INFO] = "ip:port";
+options[OPTION_LISTEN_IP_INFO] = "127.0.0.1:3000";
 auto ret = llm_data_dist.Initialize(options);
 if (ret != LLM_SUCCESS) {
     printf("[ERROR] Initialize failed, ret = %u\n", ret);
@@ -117,12 +119,12 @@ std::vector<ClusterInfo> clusters;
 ClusterInfo cluster_info;
 IpInfo local_ip_info{};
 // 替换成本地真实IP
-local_ip_info.ip = "ip";
+local_ip_info.ip = "127.0.0.1";
 IpInfo remote_ip_info{};
 // 替换成对端真实IP
-remote_ip_info.ip = "ip";
+remote_ip_info.ip = "127.0.0.1";
 // 替换成Server侧初始化时的侦听端口
-remote_ip_info.port = "port";
+remote_ip_info.port = 3000;
 cluster_info.remote_cluster_id = PROMPT_CLUSTER_ID;
 cluster_info.local_ip_infos.emplace_back(std::move(local_ip_info));
 cluster_info.remote_ip_infos.emplace_back(std::move(remote_ip_info));
@@ -148,7 +150,7 @@ for (const auto &inner_ret : rets) {
 
 **功能介绍**
 
-调用UnLinkLlmClusters接口断开并清理PD之间的通信链路。
+调用UnlinkLlmClusters接口断开并清理PD之间的通信链路。
 
 **使用场景**
 
@@ -162,14 +164,14 @@ for (const auto &inner_ret : rets) {
 
 ```cpp
 // clusters同建链的clusters
-auto ret = llm_data_dist.UnLinkLlmClusters(clusters, rets);
+auto ret = llm_data_dist.UnlinkLlmClusters(clusters, rets);
 if (ret != LLM_SUCCESS) {
-    printf("[ERROR] UnLinkLlmClusters failed, ret = %u\n", ret);
+    printf("[ERROR] UnlinkLlmClusters failed, ret = %u\n", ret);
     return -1;
 }
 for (const auto &inner_ret : rets) {
     if (inner_ret != LLM_SUCCESS) {
-        printf("[ERROR] UnLinkLlmClusters failed, ret = %u\n", inner_ret);
+        printf("[ERROR] UnlinkLlmClusters failed, ret = %u\n", inner_ret);
         return -1;
     }
 }
@@ -184,24 +186,24 @@ std::vector<ClusterInfo> clusters;
 ClusterInfo cluster_info;
 IpInfo local_ip_info;
 // 替换成本地真实IP
-local_ip_info.ip = "ip";
+local_ip_info.ip = "127.0.0.1";
 IpInfo remote_ip_info;
 // 替换成对端真实IP
-remote_ip_info.ip = "ip";
+remote_ip_info.ip = "127.0.0.1";
 // 替换成Server侧初始化时的侦听端口
-remote_ip_info.port = "port";
+remote_ip_info.port = 3000;
 cluster_info.remote_cluster_id = PROMPT_CLUSTER_ID;
 cluster_info.local_ip_infos.emplace_back(std::move(local_ip_info)); // local_ip_infos的IP是本地的Host IP地址
 cluster_info.remote_ip_infos.emplace_back(std::move(remote_ip_info)); // remote_ip_infos的IP是对端的Host IP地址
 clusters.emplace_back(std::move(cluster_info));
-auto ret = llmDataDist.UnLinkLlmClusters(clusters, rets, 1000, true);
+auto ret = llm_data_dist.UnlinkLlmClusters(clusters, rets, 1000, true);
 if (ret != LLM_SUCCESS) {
-    printf("[ERROR] UnLinkLlmClusters failed, ret = %u\n", ret);
+    printf("[ERROR] UnlinkLlmClusters failed, ret = %u\n", ret);
     return -1;
 }
 for (const auto &inner_ret : rets) {
     if (inner_ret != LLM_SUCCESS) {
-        printf("[ERROR] UnLinkLlmClusters failed, ret = %u\n", inner_ret);
+        printf("[ERROR] UnlinkLlmClusters failed, ret = %u\n", inner_ret);
         return -1;
     }
 }
@@ -209,7 +211,7 @@ for (const auto &inner_ret : rets) {
 
 **异常处理**
 
-当调用UnLinkLlmClusters接口失败时，如果是网络故障场景，可改用强制断链方式。
+当调用UnlinkLlmClusters接口失败时，如果是网络故障场景，可改用强制断链方式。
 
 ### KV Cache管理
 
@@ -242,7 +244,7 @@ KV Cache管理涉及的主要接口及功能如下：
     void OnError(LlmDataDist &llm_data_dist, int64_t cache_id)
     {
         if (cache_id > 0) {
-            (void) llmDataDist.UnregisterKvCache(cache_id);
+            (void) llm_data_dist.UnregisterKvCache(cache_id);
         }
         llm_data_dist.Finalize();
     }
@@ -307,7 +309,7 @@ KV Cache管理涉及的主要接口及功能如下：
     void OnError(LlmDataDist &llm_data_dist, int64_t cache_id)
     {
         if (cache_id > 0) {
-            (void) llmDataDist.UnregisterKvCache(cache_id);
+            (void) llm_data_dist.UnregisterKvCache(cache_id);
         }
         llm_data_dist.Finalize();
     }
@@ -404,8 +406,8 @@ KV Cache管理涉及的主要接口及功能如下：
     ```cpp
     std::map<AscendString, AscendString> options;
     //替换成真实IP端口
-    options[OPTION_LISTEN_IP_INFO] = "ip:port";
-    llmDataDist.SetRole(LlmRole::kPrompt, options);
+    options[OPTION_LISTEN_IP_INFO] = "127.0.0.1:3000";
+    llm_data_dist.SetRole(LlmRole::kPrompt, options);
     ```
 
 **异常处理**
